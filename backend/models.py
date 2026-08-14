@@ -23,6 +23,9 @@ class OcrBlock:
     text: str = ""
     caption: str = ""
     conf: Optional[float] = None
+    # Interactive per-block font-size gain for the debug tool (1.0 = auto).
+    # When set, the embedded font size is derived font size * font_scale.
+    font_scale: float = 1.0
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -34,16 +37,24 @@ class OcrBlock:
             d["caption"] = self.caption
         if self.conf is not None:
             d["conf"] = self.conf
+        if self.font_scale != 1.0:
+            d["font_scale"] = self.font_scale
         return d
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "OcrBlock":
+        fs = data.get("font_scale")
+        try:
+            font_scale = float(fs) if fs is not None else 1.0
+        except (TypeError, ValueError):
+            font_scale = 1.0
         return cls(
             kind=data.get("kind", "text"),
             bbox=list(data.get("bbox", [0, 0, 0, 0])),
             text=data.get("text", ""),
             caption=data.get("caption", ""),
             conf=data.get("conf"),
+            font_scale=font_scale,
         )
 
 

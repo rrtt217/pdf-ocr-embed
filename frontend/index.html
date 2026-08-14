@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PDF OCR Embed</title>
-  <link rel="stylesheet" href="/static/style.css?v=4" />
+  <link rel="stylesheet" href="/static/style.css?v=6" />
 </head>
 <body>
   <header>
@@ -79,9 +79,22 @@
         </div>
       </div>
       <div class="embed-bar">
+        <label class="inline-label" title="System font used for the embedded text layer and preview">Embed font
+          <select id="embed-font">
+            <option value="">Auto (default)</option>
+          </select>
+        </label>
+        <button id="btn-preview" class="small" title="Draw the placed text visibly so you can judge font size">Preview overlay</button>
         <button id="btn-embed" class="primary" disabled>Embed invisible text</button>
         <a id="download-link" class="hidden" download>Download embedded PDF</a>
         <span id="embed-status"></span>
+        <span class="spacer"></span>
+        <button id="btn-dataset" class="small" title="Download the per-block font-scale dataset (JSON)">Download dataset (JSON)</button>
+      </div>
+      <div class="embed-hint" id="embed-hint">
+        Use each block's <em>font size</em> slider (below) to fine-tune — bigger/smaller —
+        then <strong>Preview overlay</strong> to see the placed text on the page, and
+        <strong>Embed</strong> to bake your chosen sizes in.
       </div>
     </section>
   </main>
@@ -132,6 +145,6 @@
     <pre id="log-box"></pre>
   </section>
 
-  <script src="/static/app.js?v=4"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

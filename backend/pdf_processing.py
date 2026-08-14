@@ -20,6 +20,19 @@ import fitz  # PyMuPDF
 
 from backend.models import OcrBlock, OcrPage
 
+# The system font selected for embedding (a backend.fonts.FontSpec).  Set before
+# an embed / preview call via set_embed_font().  When set, all width measurement,
+# font-size derivation and text insertion use this real font (narrow ASCII
+# spaces, correct digit widths) instead of the built-in Base-14 placeholders.
+ACTIVE_FONT = None
+
+
+def set_embed_font(font_spec) -> None:
+    """Set the active system font used for embedding (or None for built-ins)."""
+    global ACTIVE_FONT
+    ACTIVE_FONT = font_spec
+
+
 log = logging.getLogger(__name__)
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -87,54 +100,75 @@ def pixel_to_pdf(point: Tuple[float, float], page: fitz.Page,
 # Rendering metrics calibrated from real PyMuPDF output (see _derive_fontsize).
 # Each entry:
 #   ink_fraction: what fraction of a 1pt fontsize the OCR ink-bbox height
-#     spans. Empirically ~0.95-0.97 for mixed-case Latin, ~0.90 for CJK
-#     (a CJK glyph nearly fills the em square), ~0.80 for all-caps Latin.
-#     The old hardcoded 0.75 sat *below every script*, so text never filled
-#     the bbox (it embedded at ~72% of true size).
+#     spans. Empirically ~0.87-0.90 for CJK and ~0.72-0.95 for Latin/mixed
+#     (a CJK glyph nearly fills the em square, so this is stable; Latin varies
+#     with ascenders/descenders).  The old hardcoded 0.75 sat *below every
+#     script*, so text never filled the bbox (it embedded at ~72% of true size).
 #   line_height: the font's natural line box in em units (ascender -
 #     descender). Replaces the old hardcoded 1.15 so multi-line leading
 #     matches real PDF typesetting instead of being packed too tight.
+#   ink_up: distance (in em) from the baseline up to the top of the glyph ink.
+#     @ fs such that ink height = box_h, setting the first line's baseline to
+#     bbox_top + ink_up*fs centres the ink vertically in the bbox (fixes the
+#     text sitting a few pt below the box).
 _FONT_METRICS = {
-    "helv":    {"ink_fraction": 0.95, "line_height": 1.374},
-    "china-s": {"ink_fraction": 0.90, "line_height": 1.309},
-    "japan":   {"ink_fraction": 0.90, "line_height": 1.309},
-    "korea":   {"ink_fraction": 0.90, "line_height": 1.309},
+    "helv":    {"ink_fraction": 0.90, "line_height": 1.374, "ink_up": 0.72},
+    "china-s": {"ink_fraction": 0.90, "line_height": 1.309, "ink_up": 0.80},
+    "japan":   {"ink_fraction": 0.90, "line_height": 1.309, "ink_up": 0.80},
+    "korea":   {"ink_fraction": 0.90, "line_height": 1.309, "ink_up": 0.80},
 }
 
 # Fallbacks for any font not in the table above / unknown.
-_DEFAULT_INK_FRACTION = 0.92
+_DEFAULT_INK_FRACTION = 0.90
 _DEFAULT_LINE_HEIGHT = 1.30
+_DEFAULT_INK_UP = 0.75
 
-# OCR bboxes are *tight* ink extents and measurably narrower than the true
-# typographic advance width of the text (measured ~0.4-7% on real renders;
-# CJK tightness is typically larger than Latin).  Without a tolerance, a
-# single OCR line that is a hair too wide for its bbox gets reflowed into
-# wrapped lines, and the code then treats the bbox *height* (the ink height
-# of ONE line) as the room for many lines — collapsing the font size and
-# wrecking the layout.  We allow a modest overfill so a near-fit line stays
-# on one line at its ink-filling font size.  Applied consistently in
-# _derive_fontsize and _wrap_to_width.
-_FILL_WIDTH_TOLERANCE = 1.15
+# OCR bboxes are *tight* ink extents, measurably narrower than the true
+# typographic advance width of the text (a few percent on real renders).  We
+# allow a *tiny* overfill (1.01 = 1%) to absorb sub-pixel OCR width rounding
+# and the natural tightness of ink-width measurement, so a well-formed single
+# line stays on one line.  Visible overflow is NOT acceptable — the font-size
+# derivation (see _derive_fontsize) constrains width so lines stay inside the
+# bbox.  Applied consistently in _derive_fontsize and _wrap_to_width.
+_FILL_WIDTH_TOLERANCE = 1.01
 
 
-def _font_metrics(fontname: str) -> Tuple[float, float]:
-    """Return (ink_fraction, line_height) for a built-in font name."""
+def _font_metrics(fontname: str) -> Tuple[float, float, float]:
+    """Return (ink_fraction, line_height, ink_up) for the active font.
+
+    When a system font is active (embed_font selected), its real metrics are
+    used to size and centre the text; otherwise the built-in table applies.
+    """
+    if ACTIVE_FONT is not None:
+        try:
+            fit_ = ACTIVE_FONT.fit()
+            asc = fit_.ascender or 1.0
+            desc = fit_.descender or -0.2
+            line_height = max(asc - desc, 0.5)
+            return (ACTIVE_FONT.ink_fraction, line_height, ACTIVE_FONT.ink_up)
+        except Exception:  # noqa: BLE001
+            pass
     m = _FONT_METRICS.get(fontname)
     if m:
-        return m["ink_fraction"], m["line_height"]
-    return _DEFAULT_INK_FRACTION, _DEFAULT_LINE_HEIGHT
+        return m["ink_fraction"], m["line_height"], m["ink_up"]
+    return (_DEFAULT_INK_FRACTION, _DEFAULT_LINE_HEIGHT, _DEFAULT_INK_UP)
 
 
 def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
-                         out_dir: Optional[Path] = None) -> Tuple[Path, Path]:
+                         out_dir: Optional[Path] = None,
+                         embed_font=None) -> Tuple[Path, Path]:
     """Embed editable OCR text into a copy of the PDF.
 
     Writes `<stem>_embedded.pdf`. Uses render_mode=3 so text is searchable /
     selectable but invisible. Returns (output_path, thumb_path).
 
-    Text blocks are placed into their bbox region with a fontsize measured so
-    glyphs fit the box height (approximately), clipped to the page.
+    ``embed_font`` is an optional backend.fonts.FontSpec; when given, the real
+    system font is embedded (subset, for a small file) and used for measuring
+    and placing the text.  Text blocks are placed into their bbox region with a
+    fontsize measured so glyphs fit the box height, clipped to the page.
     """
+    prev_font = ACTIVE_FONT
+    set_embed_font(embed_font)
     out_dir = out_dir or ensure_output_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -162,29 +196,25 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
             log.debug("embed page %d: %d blocks, scale=%.3fx%.3f",
                       pidx, len(page_cfg.blocks), w_scale, h_scale)
 
-            # Compute the page's left margin (min x1 of text blocks) so we can
-            # detect per-block indentation from bbox x1 position.
-            text_blocks = [b for b in page_cfg.blocks
-                           if b.kind not in ("image", "image_ref") and b.text.strip()]
-            if text_blocks:
-                page_left_margin_px = min(b.bbox[0] for b in text_blocks)
-                page_left_margin = page_left_margin_px * w_scale
-            else:
-                page_left_margin = 0.0
-            log.debug("page %d: left margin = %.1fpt (px=%.1f)",
-                      pidx, page_left_margin, page_left_margin_px)
+            # Indentation is preserved by the bbox start x (blob.x0) the text is
+            # placed at — no per-page left margin is needed here.
 
             for block in page_cfg.blocks:
                 if block.kind in ("image", "image_ref") or not block.text.strip():
                     continue
                 total_blocks += 1
                 try:
-                    _insert_block(page, block, rect, w_scale, h_scale,
-                                  page_left_margin)
+                    _insert_block(page, block, rect, w_scale, h_scale)
                 except Exception as exc:  # noqa: BLE001
                     skipped_blocks += 1
                     log.warning("embed: page %d block skipped: %s", pidx, exc)
 
+        # Subset embedded fonts to keep the output small (variable/full CJK
+        # fonts are megabytes; the used subset is tens of KB).
+        try:
+            doc.subset_fonts()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("font subsetting skipped: %s", exc)
         doc.save(str(out_file), garbage=4, deflate=True)
         log.info("embedded PDF saved: %s (%d pages, %d/%d blocks embedded)",
                  out_file, len(pages), total_blocks - skipped_blocks, total_blocks)
@@ -197,99 +227,200 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
             pix.save(str(thumb_file))
     finally:
         doc.close()
+        set_embed_font(prev_font)
 
     return out_file, thumb_file
 
 
+def _page_font_name(page: fitz.Page) -> str:
+    """Register the active system font on *page* once; return the resource name.
+
+    When no system font is active, returns None (callers use built-in names).
+    """
+    if ACTIVE_FONT is None:
+        return None
+    ctx = getattr(page, "_active_font_ctx", None)
+    if ctx and ctx[0] == ACTIVE_FONT.name:
+        return ctx[1]
+    res = page.insert_font(fontname=ACTIVE_FONT.fontname, fontfile=ACTIVE_FONT.path)
+    page._active_font_ctx = (ACTIVE_FONT.name, ACTIVE_FONT.fontname)
+    return ACTIVE_FONT.fontname
+
+
 def _insert_block(page: fitz.Page, block: OcrBlock, rect: fitz.Rect,
-                  w_scale: float, h_scale: float,
-                  page_left_margin: float = 0.0) -> None:
+                  w_scale: float, h_scale: float) -> None:
     """Embed one OCR block as invisible text that fills the bbox.
 
-    The OCR bbox encodes both the position AND the visual size of the text.
-    We derive the font size so the text fills the bbox:
-      - Single-line blocks: font_size = bbox_height / ink_fraction (calibrated
-        per script so the glyph ink spans the bbox height).
-      - Multi-line blocks: iteratively solve so wrapped lines fill bbox_width
-        and total height fills bbox_height, using the font's natural line box
-        (ascender - descender) as the leading.
+    Delegates geometry to the shared _compute_block_layout, then inserts each
+    line with render_mode=3 (invisible, searchable).
+    """
+    layout = _compute_block_layout(block, page, w_scale, h_scale,
+                                   font_scale=block.font_scale)
+    _page_font_name(page)  # ensure font resource is present if active
+    for x, y_base, line, fontsize, fontname in layout["lines"]:
+        if not line:
+            continue
+        page.insert_text(
+            fitz.Point(x, y_base), line,
+            fontsize=fontsize, fontname=fontname,
+            render_mode=3, overlay=True,
+        )
 
-    Leading-space / indentation analysis:
-      The raw OCR text has no leading spaces (the adapter strips them).  But
-      the bbox x1 encodes the left-edge position — if x1 > page_left_margin,
-      the block is indented.  We restore leading spaces proportional to the
-      indent so extracted text preserves the original formatting.
+
+def _compute_block_layout(block: OcrBlock, page: fitz.Page, w_scale: float,
+                          h_scale: float, font_scale: float = 1.0) -> dict:
+    """Compute the exact placed text geometry for one block.
+
+    Returns a dict:
+      {
+        "fontname": str,
+        "fontsize": float,          # derived size AFTER font_scale applied
+        "derived":  float,          # size before font_scale
+        "lines":    [(x, baseline_y, text, fontsize, fontname), ...],
+      }
+
+    The OCR bbox encodes both the position and the visual size of the text.
+    We derive the font size so the ink fills the bbox (see _derive_fontsize),
+    optionally scaled by ``font_scale`` (the interactive per-block debug gain).
+    First-line indentation is NOT reconstructed: OCR engines strip leading
+    spaces from the text, but the indent is already preserved by placing the
+    text at the bbox start x (blob.x0).
     """
     blob = _pixel_rect_to_pdf(block.bbox, page, w_scale, h_scale)
     text = block.text
-    fontname = _pick_fontname(text)
+    # Use the active system font's resource name when one is selected, else the
+    # built-in placeholder font.
+    fontname = ACTIVE_FONT.fontname if ACTIVE_FONT is not None else _pick_fontname(text)
     txt = _clip_text(text)
+    empty = {"fontname": fontname, "fontsize": 0.0, "derived": 0.0, "lines": []}
     if not txt.strip():
-        return
+        return empty
 
     box_w = blob.width
     box_h = blob.height
     max_w = page.rect.width - blob.x0 - 2
     box_w = min(box_w, max_w) if box_w > 0 else max_w
 
-    # --- 0. Detect indentation from bbox x1 vs page left margin ---
-    indent_pt = max(0.0, blob.x0 - page_left_margin)
     lines = txt.splitlines() or [""]
 
-    # --- 1. Derive the font size that fills the bbox ---
-    fontsize = _derive_fontsize(lines, box_w, box_h, fontname)
+    # NOTE: we intentionally do NOT reconstruct first-line indentation here.
+    # OCR engines (tesseract / unlimited) strip leading spaces from the *text*
+    # but the indent is already preserved by the bbox start x (blob.x0) we place
+    # the text at.  Some engines (unlimited) even include the indent region in
+    # the bbox but not in the text — trying to re-add spaces from x0 vs the page
+    # left margin is unreliable and caused spurious indentation.
 
-    # --- 2. Add leading-space indent for indented paragraph blocks ---
-    # Only `text` blocks get indent restoration; titles/headers may be centred
-    # (large x1) which is NOT indentation.  Cap at 2 full-width spaces — the
-    # standard Chinese paragraph first-line indent (2em).  The bbox x1 encodes
-    # the block's left edge; comparing with the page left margin reveals indent.
-    if indent_pt > fontsize * 0.5 and block.kind == "text":
-        n_indent = max(1, round(indent_pt / fontsize))
-        n_indent = min(n_indent, 2)  # cap at 2em (standard Chinese indent)
-        indent_str = "\u3000" * n_indent  # full-width space (ideographic space)
-        lines[0] = indent_str + lines[0]
-        log.debug("indent: block x0=%.1f margin=%.1f indent=%.1fpt -> %d full-width spaces",
-                  blob.x0, page_left_margin, indent_pt, n_indent)
+    # --- Derive the auto font size that fills the bbox ---
+    fontsize = _derive_fontsize(lines, box_w, box_h, fontname)
+    derived = fontsize
+
+    # --- 2b. Apply the interactive font_scale gain (debug tool) ---
+    try:
+        fs_gain = float(font_scale) if font_scale is not None else 1.0
+    except (TypeError, ValueError):
+        fs_gain = 1.0
+    if fs_gain <= 0:
+        fs_gain = 1.0
+    fontsize = max(fontsize * fs_gain, 0.5)
 
     # --- 3. Wrap each logical line to the bbox width ---
     wrapped = _wrap_to_width(lines, box_w, fontsize, fontname)
 
     # --- 4. If a genuine multi-line reflow overflows the bbox height, shrink ---
     # box_h is the *ink height of one line*, so a single line's natural line
-    # box (fontsize * line_height_em) is normally taller than box_h — and must
-    # NOT be shrunk, or the text stops filling the bbox.  We only shrink when
-    # the text actually reflowed onto multiple wrapped lines and overflows.
-    _, line_height_em = _font_metrics(fontname)
+    # box is normally taller than box_h and must NOT be shrunk.  We only shrink
+    # when the text actually reflowed onto multiple wrapped lines and overflows.
+    # When the user sets an explicit font_scale (interactive debug), that gain is
+    # authoritative — skip the height-shrink so the preview shows the true size.
+    _, line_height_em, ink_up = _font_metrics(fontname)
     line_height = fontsize * line_height_em
     total_h = len(wrapped) * line_height
-    if len(wrapped) > 1 and box_h > 0 and total_h > box_h * 1.1:
+    if fs_gain == 1.0 and len(wrapped) > 1 and box_h > 0 and total_h > box_h * 1.1:
         scale = box_h / total_h
         fontsize = max(fontsize * scale, 0.5)
         line_height = fontsize * line_height_em
         wrapped = _wrap_to_width(lines, box_w, fontsize, fontname)
 
-    # --- 5. Insert lines top-to-bottom, centred vertically in the bbox ---
-    total_h = len(wrapped) * line_height
-    if box_h > total_h and len(wrapped) > 1:
-        # Vertically centre the text block within the bbox
-        y_start = blob.y0 + (box_h - total_h) / 2 + fontsize
+    # --- 5. Compute baselines, vertically centring the text INK in the bbox ---
+    # ink fills box_h by construction (fs = box_h / ink_fraction), so we centre
+    # the (possibly multi-line) ink stack; a single line's ink top sits at the
+    # bbox top and its ink bottom at the bbox bottom => visually centred.
+    ink_fraction, line_height_em, ink_up = _font_metrics(fontname)
+    line_height = fontsize * line_height_em
+    n = len(wrapped)
+    if n > 1:
+        stack_ink = (n - 1) * line_height + ink_fraction * fontsize
+        y_start = blob.y0 + (box_h - stack_ink) / 2 + ink_up * fontsize
     else:
-        y_start = blob.y0 + fontsize
+        y_start = blob.y0 + (box_h - ink_fraction * fontsize) / 2 + ink_up * fontsize
+    out_lines = []
     y_cursor = y_start
     for line in wrapped:
-        if not line:
-            y_cursor += line_height
-            continue
-        page.insert_text(
-            fitz.Point(blob.x0, y_cursor),
-            line,
-            fontsize=fontsize,
-            fontname=fontname,
-            render_mode=3,
-            overlay=True,
-        )
+        out_lines.append((blob.x0, y_cursor, line, fontsize, fontname))
         y_cursor += line_height
+
+    return {
+        "fontname": fontname,
+        "fontsize": fontsize,
+        "derived": derived,
+        "lines": out_lines,
+    }
+
+
+def render_overlay(pdf_bytes_path: str, pages: List[OcrPage],
+                   page_index: int, out_dir: Optional[Path] = None,
+                   for_page: Optional[int] = None,
+                   embed_font=None) -> Path:
+    """Render one page's scan with the placed text drawn VISIBLY (red).
+
+    This is the interactive debug view: it shows exactly where/how big each
+    block's text would be embedded (honouring each block's ``font_scale``), so
+    the user can judge whether a line is too big or too small.  The placed text
+    uses the same geometry as the real invisible embed (shared layout function),
+    drawn with render_mode=0 and a red fill for visibility.
+
+    Returns the path to the rendered PNG.
+    """
+    prev_font = ACTIVE_FONT
+    set_embed_font(embed_font)
+    out_dir = out_dir or ensure_output_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    doc = fitz.open(pdf_bytes_path)
+    try:
+        # Page to render: the page a block lives on (for_page overrides).
+        target = for_page if for_page is not None else page_index
+        target = max(0, min(target, doc.page_count - 1))
+        page = doc[target]
+        rect = page.rect
+        _page_font_name(page)  # register the active system font if selected
+
+        page_cfg = next((p for p in pages if p.page_index == target), None)
+        if page_cfg is None:
+            raise ValueError(f"no OCR page data for page index {target}")
+        w_scale = rect.width / page_cfg.width if page_cfg.width else 1.0
+        h_scale = rect.height / page_cfg.height if page_cfg.height else 1.0
+
+        out_file = out_dir / f"overlay_{target:04d}.png"
+        for block in page_cfg.blocks:
+            if block.kind in ("image", "image_ref") or not block.text.strip():
+                continue
+            layout = _compute_block_layout(block, page, w_scale, h_scale,
+                                           font_scale=block.font_scale)
+            for x, y_base, line, fontsize, fontname in layout["lines"]:
+                if not line:
+                    continue
+                page.insert_text(
+                    fitz.Point(x, y_base), line,
+                    fontsize=fontsize, fontname=fontname,
+                    render_mode=0, overlay=True, color=(0.9, 0.1, 0.1),
+                )
+        pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
+        pix.save(str(out_file))
+        return out_file
+    finally:
+        doc.close()
+        set_embed_font(prev_font)
 
 
 def _derive_fontsize(lines: list, box_w: float, box_h: float,
@@ -313,7 +444,7 @@ def _derive_fontsize(lines: list, box_w: float, box_h: float,
     """
     import math
 
-    ink_fraction, line_height_em = _font_metrics(fontname)
+    ink_fraction, line_height_em, _ink_up = _font_metrics(fontname)
 
     if box_h <= 0:
         return 8.0
@@ -339,33 +470,55 @@ def _derive_fontsize(lines: list, box_w: float, box_h: float,
     if k <= 0:
         return max(box_h / ink_fraction, 1.0)
 
-    # Case 1: text fits on one line (within a small overfill tolerance — OCR
-    # bboxes are tight ink extents slightly narrower than the true advance
-    # width) at a font size whose ink fills box_h.
-    fs_single = box_h / ink_fraction
-    if _text_width(text, fs_single, fontname) <= box_w * _FILL_WIDTH_TOLERANCE:
-        return max(fs_single, 1.0)
+    # --- Single logical line ---
+    text = lines[0]
+    # Measure text width at 1pt to get the proportionality constant k
+    # (get_text_length is linear in fontsize for most fonts).
+    k = _text_width(text, 1.0, fontname)
+    if k <= 0:
+        return max(box_h / ink_fraction, 1.0)
 
-    # Case 2: text needs wrapping — solve fs² ≈ box_w * box_h / (k * line_height_em)
-    # This comes from: n = ceil(k*fs / box_w) and fs = box_h / (n * line_height_em)
-    # => k*fs / box_w ≈ box_h / (fs * line_height_em)
-    # => fs² ≈ box_w * box_h / (k * line_height_em)
+    fs_h = box_h / ink_fraction            # font size that makes one line's
+                                           # ink fill the bbox height
+    w_at_h = _text_width(text, fs_h, fontname)
+    # Case 1: the line fits within the bbox width (tiny tolerance only —
+    # OCR ink-width is a hair narrow) at the height-filling size.
+    if w_at_h <= box_w * _FILL_WIDTH_TOLERANCE:
+        return max(fs_h, 1.0)
+
+    # The line is too wide for the box at the height-filling size.  It is
+    # either (a) a single OCR line whose box is simply too narrow (shrink to
+    # fit the width, keep it on one line) or (b) a multi-line paragraph
+    # (wrap into lines that fill box_h).  Solve self-consistently:
+    #     n = ceil(text_width(fs) / box_w)   lines at font size fs
+    #     fs = box_h / (n * line_height_em)  n lines fill box_h
+    # If the iteration collapses to a single line (n == 1), it was a single
+    # line squeezed by a narrow box → shrink to fit the width, not wrap.
     fs = math.sqrt(box_w * box_h / (k * line_height_em))
-
-    # Refine with iteration (usually converges in 2-3 steps)
-    for _ in range(8):
-        text_w = _text_width(text, fs, fontname)
-        n = max(1, math.ceil(text_w / box_w - 1e-9))
+    for _ in range(12):
+        n = max(1, math.ceil(_text_width(text, fs, fontname) / box_w - 1e-9))
+        if n == 1:
+            # single line that must shrink to fit width
+            return max(fs_h * box_w / w_at_h, 0.5)
         fs_new = box_h / (n * line_height_em)
         if abs(fs_new - fs) < 0.2:
+            fs = fs_new
             break
         fs = fs_new
-
     return max(fs, 0.5)
 
 
 def _text_width(text: str, fontsize: float, fontname: str) -> float:
-    """Measure rendered text width in PDF points (with fallback)."""
+    """Measure rendered text width in PDF points (with fallback).
+
+    Uses the active system font's real advance when one is set (correct narrow
+    spaces / digit widths), otherwise the built-in font's get_text_length.
+    """
+    if ACTIVE_FONT is not None:
+        try:
+            return ACTIVE_FONT.fit().text_length(text, fontsize=fontsize)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
     except Exception:
@@ -373,16 +526,18 @@ def _text_width(text: str, fontsize: float, fontname: str) -> float:
 
 
 def _wrap_to_width(lines: list, box_w: float, fontsize: float,
-                   fontname: str) -> list:
+                   fontname: str, tol: float | None = None) -> list:
     """Wrap each line to fit within *box_w* (in PDF points).
 
     Breaks at character boundaries (works for CJK and Latin).  Keeps all
     wrapped sub-lines of a single block consecutive to preserve reading order.
-    A small overfill tolerance (*_FILL_WIDTH_TOLERANCE) keeps a single OCR
-    line that is a hair wider than its (tight) bbox from being reflowed into
-    multiple lines.
+    ``tol`` is a tiny multiplicative overfill allowance (1.0 = exact fit); it
+    exists to absorb sub-pixel OCR width rounding, not to permit visible
+    overflow.
     """
-    line_limit = box_w * _FILL_WIDTH_TOLERANCE
+    if tol is None:
+        tol = _FILL_WIDTH_TOLERANCE
+    line_limit = box_w * tol
     if box_w <= 0:
         return lines
     out = []
@@ -413,12 +568,16 @@ def _pick_fontname(text: str) -> str:
     The default 'helv' (Helvetica) only covers Latin-1.  For CJK text,
     Greek letters, or math symbols it silently produces dots — so we detect
     non-Latin Unicode ranges and pick 'china-s', which has much broader
-    coverage (Greek, math operators, arrows, etc.):
-      - CJK ideographs -> 'china-s'
-      - Greek letters  -> 'china-s'  (α β ε Σ etc.)
-      - Math symbols   -> 'china-s'  (≤ ≥ × ± ≠ ≈ ∞ ∫ √ → etc.)
-      - Japanese kana  -> 'japan'
-      - Korean hangul  -> 'korea'
+    coverage (Greek, math operators, arrows, dashes, etc.):
+      - CJK ideographs   -> 'china-s'
+      - Japanese kana    -> 'japan'
+      - Korean hangul    -> 'korea'
+      - Greek letters    -> 'china-s'  (α β ε Σ etc.)
+      - Math / arrows    -> 'china-s'  (≤ ≥ × ± ≠ ≈ ∞ ∫ √ → etc.)
+      - em/en dashes & any other char outside Latin-1 -> 'china-s'
+    The last is important: a stray `—` (U+2014), `−` (U+2212), superscript or
+    similar glyph that 'helv' cannot render must not silently become a dot —
+    it also makes get_text_length() mis-measure the width and overflow the box.
     """
     for ch in text:
         cp = ord(ch)
@@ -436,6 +595,10 @@ def _pick_fontname(text: str) -> str:
         if 0x2200 <= cp <= 0x22FF:  # Mathematical Operators block
             return "china-s"
         if 0x2190 <= cp <= 0x21FF:  # Arrows block
+            return "china-s"
+        # Helvetica (helv) is Latin-1 only.  Anything outside it (em/en dashes,
+        # superscripts, box-drawing, currency glyphs, ...) must not go to helv.
+        if cp > 0x00FF or 0x2013 <= cp <= 0x2015:
             return "china-s"
     return "helv"
 

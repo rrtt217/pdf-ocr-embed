@@ -470,11 +470,13 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
                                 "page_index": idx, "message": str(errmsg)})
 
 
-def embed_job(job_id: str, pages: List[dict], out_dir: Optional[Path] = None) -> Path:
+def embed_job(job_id: str, pages: List[dict], out_dir: Optional[Path] = None,
+              embed_font=None) -> Path:
     """Embed the (possibly edited) page list into an embedded copy.
 
     Pages that are None (not yet OCR'd / failed) are silently skipped so the
     user can always download a partial result from whatever pages succeeded.
+    ``embed_font`` is an optional backend.fonts.FontSpec used for the text layer.
     """
     job = get_job(job_id)
     if job is None:
@@ -485,10 +487,12 @@ def embed_job(job_id: str, pages: List[dict], out_dir: Optional[Path] = None) ->
     if not valid:
         raise ValueError("No completed pages to embed")
     ocr_pages = [dict_to_page(p) for p in valid]
-    log.info("job %s: embedding %d/%d pages (skipping %d incomplete)",
-             job_id, len(ocr_pages), len(pages), len(pages) - len(valid))
+    log.info("job %s: embedding %d/%d pages (skipping %d incomplete) font=%s",
+             job_id, len(ocr_pages), len(pages), len(pages) - len(valid),
+             getattr(embed_font, "name", "builtin"))
     out_file, thumb = pdf_processing.embed_invisible_text(
-        job["pdf_path"], ocr_pages, out_dir or pdf_processing.ensure_output_dir())
+        job["pdf_path"], ocr_pages, out_dir or pdf_processing.ensure_output_dir(),
+        embed_font=embed_font)
     _set(job, status="embedded", embedded_path=str(out_file), thumb_path=str(thumb))
     log.info("job %s: embedded -> %s", job_id, out_file)
     return Path(out_file)

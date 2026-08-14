@@ -15,6 +15,7 @@ const state = {
   zoom: 100,
   es: null,             // active EventSource
   logTimer: null,
+  embedFont: "",        // selected system font name for the text layer
 };
 
 /* ---------- helpers ---------- */
@@ -327,6 +328,7 @@ function renderPage() {
   });
 
   img.style.width = state.zoom + "%";
+  loadFontInfo();  // annotate each block with its derived / applied font size
 }
 
 function drawOverlay(page) {
@@ -353,6 +355,7 @@ function drawOverlay(page) {
 
 function buildBlockEditor(block, bi) {
   const wrapper = el("div", "block");
+  wrapper.dataset.bi = bi;
   const meta = el("div", "meta");
   meta.appendChild(el("span", "badge", block.kind));
   meta.appendChild(el("div", "coords", block.bbox.join(", ") + " px"));
@@ -376,8 +379,40 @@ function buildBlockEditor(block, bi) {
     renderPage();
   };
 
+  // ---- Interactive font-size control (debug: too big / too small) ----
+  if (block.font_scale == null) block.font_scale = 1.0;
+  const fsRow = el("div", "fs-row");
+  const fsLabel = el("span", "fs-label", "font size");
+  const fsSlider = document.createElement("input");
+  fsSlider.type = "range";
+  fsSlider.min = "0.5"; fsSlider.max = "1.5"; fsSlider.step = "0.05";
+  fsSlider.value = block.font_scale;
+  fsSlider.className = "fs-slider";
+  const fsVal = el("span", "fs-val", block.font_scale.toFixed(2) + "×");
+  fsSlider.oninput = () => {
+    block.font_scale = parseFloat(fsSlider.value);
+    fsVal.textContent = block.font_scale.toFixed(2) + "×";
+    state.embedded = false;
+    setStatus("dirty", "running");
+  };
+  // Reset to auto
+  const fsReset = el("button", "small", "auto");
+  fsReset.title = "Reset to auto (1.0)";
+  fsReset.onclick = () => {
+    block.font_scale = 1.0;
+    fsSlider.value = "1.0";
+    fsVal.textContent = "1.00×";
+    state.embedded = false; setStatus("dirty", "running");
+  };
+  fsRow.appendChild(fsLabel);
+  fsRow.appendChild(fsSlider);
+  fsRow.appendChild(fsVal);
+  fsRow.appendChild(fsReset);
+  fsRow.appendChild(el("span", "fs-der", ""));
+
   wrapper.appendChild(meta);
   wrapper.appendChild(textarea);
+  wrapper.appendChild(fsRow);
   wrapper.appendChild(del);
   return wrapper;
 }
@@ -391,7 +426,7 @@ async function embed() {
     const out = await api(`/api/embed/${state.jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: state.jobId, pages: state.pages }),
+      body: JSON.stringify({ job_id: state.jobId, pages: state.pages, embed_font: state.embedFont }),
     });
     state.embedded = true;
     setStatus("embedded", "done");
@@ -405,6 +440,66 @@ async function embed() {
   } finally {
     $("#btn-embed").disabled = false;
   }
+}
+
+/* ---------- interactive font-size debug ---------- */
+async function previewOverlay() {
+  const page = state.pages[state.pageIndex];
+  if (!page || !state.jobId) return;
+  $("#preview-img").classList.add("loading");
+  try {
+    // POST current pages (with font_scale) so the overlay reflects the sliders.
+    const resp = await fetch(`/api/preview/${state.jobId}/${page.page_index}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pages: state.pages, embed_font: state.embedFont }),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const img = $("#preview-img");
+    img.onload = () => { img.classList.remove("loading"); };
+    img.src = url;
+    setStatus("preview", "running");
+  } catch (e) {
+    setStatus("error", "error");
+    $("#embed-status").textContent = "Preview failed: " + e.message;
+  }
+}
+
+async function loadFontInfo() {
+  const page = state.pages[state.pageIndex];
+  if (!page || !state.jobId) return;
+  try {
+    const data = await api(`/api/fontinfo/${state.jobId}/${page.page_index}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pages: state.pages, embed_font: state.embedFont }),
+    });
+    // Refresh derived-fs annotations in the editor blocks.
+    (data.blocks || []).forEach((fi) => {
+      const row = document.querySelector(`.block[data-bi="${fi.index}"] .fs-der`);
+      if (row) row.textContent = `${fi.derived_fs}pt → ${fi.fs}pt (${fi.lines} ln)`;
+    });
+  } catch (e) { /* ignore */ }
+}
+
+function downloadDataset() {
+  if (!state.pages.length) return;
+  const ds = {
+    job_id: state.jobId,
+    generated_at: new Date().toISOString(),
+    adapter_font_scale_def: "font_scale multiplies the auto font size",
+    pages: state.pages,
+  };
+  const blob = new Blob([JSON.stringify(ds, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  const stem = (state.jobId || "job");
+  a.href = url;
+  a.download = `ocr_font_dataset_${stem}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 /* ---------- settings ---------- */
@@ -443,6 +538,23 @@ async function saveSettings() {
 }
 
 /* ---------- wire up ---------- */
+async function loadFonts() {
+  const sel = $("#embed-font");
+  if (!sel) return;
+  try {
+    const data = await api("/api/fonts");
+    const fonts = (data.fonts || []);
+    sel.innerHTML = '<option value="">Auto (default)</option>';
+    fonts.forEach((f) => {
+      const opt = document.createElement("option");
+      opt.value = f.name;
+      opt.textContent = f.name + (f.family ? " — " + f.family : "");
+      sel.appendChild(opt);
+    });
+    if (state.embedFont) sel.value = state.embedFont;
+  } catch (e) { /* fonts unavailable; keep Auto */ }
+}
+
 async function init() {
   // dropzone
   const drop = $("#drop-zone");
@@ -457,6 +569,8 @@ async function init() {
   $("#btn-next").onclick = () => { if (state.pageIndex < state.pages.length - 1) { state.pageIndex++; renderTabs(); renderPage(); } };
   $("#zoom").oninput = (e) => { state.zoom = parseFloat(e.target.value); renderPage(); };
   $("#btn-embed").onclick = embed;
+  $("#btn-preview").onclick = previewOverlay;
+  $("#btn-dataset").onclick = downloadDataset;
   $("#retry-btn").onclick = retryOcr;
   $("#stop-btn").onclick = stopOcr;
   $("#partial-btn").onclick = downloadPartial;
@@ -468,7 +582,13 @@ async function init() {
   $("#btn-settings-cancel").onclick = () => $("#settings-modal").classList.add("hidden");
   $("#settings-modal").onclick = (e) => { if (e.target === $("#settings-modal")) $("#settings-modal").classList.add("hidden"); };
   $("#adapter").onchange = updateAdapterUI;
+  $("#embed-font").onchange = (e) => {
+    state.embedFont = e.target.value;
+    state.embedded = false;
+    setStatus("dirty", "running");
+  };
   updateAdapterUI();
+  loadFonts();
 
   try { await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }

@@ -16,3 +16,5 @@ venv/
 # Logs / sample data
 opencode_run.log
 page15.pdf
+# Large sample book PDF (do not commit)
+数值计算*.pdf

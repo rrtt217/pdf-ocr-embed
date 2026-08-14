@@ -42,6 +42,8 @@ _FILE_KEYS = (
     "tessdata_dir", "tess_cmd",
     # generic_openai adapter knob
     "generic_prompt",
+    # embedded-text font (system font name / path used for the text layer)
+    "embed_font",
 )
 
 # Map environment variables -> resolved config field names.
@@ -53,6 +55,7 @@ _ENV_ALIASES = {
     "OCR_TESSDATA_DIR": "tessdata_dir",
     "OCR_TESS_CMD": "tess_cmd",
     "OCR_GENERIC_PROMPT": "generic_prompt",
+    "OCR_EMBED_FONT": "embed_font",
 }
 
 # In-memory overrides from the WebUI settings page (applied at runtime).

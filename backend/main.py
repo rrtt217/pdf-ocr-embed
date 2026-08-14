@@ -62,6 +62,7 @@ class EmbedModel(BaseModel):
     api_key: Optional[str] = None
     model: Optional[str] = None
     pages: Optional[list] = None
+    embed_font: Optional[str] = None   # system font name / path for the text layer
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -274,15 +275,110 @@ def page_image(job_id: str, page_index: int):
     return FileResponse(path, media_type="image/png")
 
 
+class PreviewModel(BaseModel):
+    pages: Optional[list] = None   # list of OcrPage dicts (with font_scale)
+    embed_font: Optional[str] = None
+
+
+def _resolve_embed_font(font_name: Optional[str]):
+    """Resolve a requested embed font name to a FontSpec (config as fallback)."""
+    from backend import fonts
+    if font_name:
+        return fonts.resolve_font(font_name)
+    cfg_font = config.resolve().get("embed_font")
+    if cfg_font:
+        return fonts.resolve_font(cfg_font)
+    return fonts.resolve_font(None)  # default (first registry font)
+
+
+@app.post("/api/preview/{job_id}/{page_index}")
+def preview_overlay(job_id: str, page_index: int, payload: PreviewModel):
+    """Render a page's scan with the placed text drawn VISIBLY (debug view).
+
+    The body carries the current (possibly edited) page dicts, so the overlay
+    reflects each block's interactive ``font_scale`` without syncing server job
+    state on every slider move.  Returns a PNG.
+    """
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pages = payload.pages
+    if not pages:
+        pages = ocr_service.get_pages(job_id)
+    import backend.pdf_processing as pdf_processing
+    from backend.models import dict_to_page
+    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
+    if not ocr_pages:
+        raise HTTPException(status_code=400, detail="No page data to preview")
+    embed_font = _resolve_embed_font(payload.embed_font)
+    try:
+        out = pdf_processing.render_overlay(
+            job["pdf_path"], ocr_pages, page_index,
+            pdf_processing.ensure_output_dir(), for_page=page_index,
+            embed_font=embed_font,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+    return FileResponse(str(out), media_type="image/png")
+
+
+@app.post("/api/fontinfo/{job_id}/{page_index}")
+def fontinfo(job_id: str, page_index: int, payload: PreviewModel):
+    """Return each block's derived / applied font size for the debug UI.
+
+    Body carries current page dicts (with font_scale).  Returns per-block:
+    {index, kind, derived_fs, fs (after font_scale), bbox}.
+    """
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pages = payload.pages or ocr_service.get_pages(job_id)
+    import backend.pdf_processing as pdf_processing
+    from backend.models import dict_to_page
+    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
+    cfg = next((p for p in ocr_pages if p.page_index == page_index), None)
+    if cfg is None:
+        return {"blocks": []}
+    embed_font = _resolve_embed_font(payload.embed_font)
+    pdf_processing.set_embed_font(embed_font)
+    try:
+        # Open the source doc to get page geometry for layout.
+        with pdf_processing.open_pdf(job["pdf_path"]) as doc:
+            target = max(0, min(page_index, doc.page_count - 1))
+            pg = doc[target]
+            rect = pg.rect
+            w_scale = rect.width / cfg.width if cfg.width else 1.0
+            h_scale = rect.height / cfg.height if cfg.height else 1.0
+            out = []
+            for bi, block in enumerate(cfg.blocks):
+                if block.kind in ("image", "image_ref") or not block.text.strip():
+                    continue
+                lay = pdf_processing._compute_block_layout(
+                    block, pg, w_scale, h_scale, font_scale=block.font_scale)
+                out.append({
+                    "index": bi,
+                    "kind": block.kind,
+                    "bbox": block.bbox,
+                    "derived_fs": round(lay["derived"], 2),
+                    "fs": round(lay["fontsize"], 2),
+                    "font_scale": block.font_scale,
+                    "lines": len(lay["lines"]),
+                })
+        return {"blocks": out}
+    finally:
+        pdf_processing.set_embed_font(None)
+
+
 @app.post("/api/embed/{job_id}")
 def embed(job_id: str, payload: EmbedModel):
     # Allow either the body pages or the server-side stored pages.
     pages = payload.pages
     if pages is None:
         pages = ocr_service.get_pages(job_id)
+    embed_font = _resolve_embed_font(payload.embed_font)
     # embed_job filters out None entries, so partial results work too.
     try:
-        out_path = ocr_service.embed_job(job_id, pages)
+        out_path = ocr_service.embed_job(job_id, pages, embed_font=embed_font)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -291,7 +387,14 @@ def embed(job_id: str, payload: EmbedModel):
         "status": "embedded",
         "filename": out_path.name,
         "url": f"/api/download/{job_id}.pdf",
+        "font": embed_font.name,
     }
+
+
+@app.get("/api/fonts")
+def fonts_available() -> dict:
+    from backend import fonts
+    return {"fonts": fonts.available_fonts()}
 
 
 @app.get("/api/download/{job_id}.pdf")
