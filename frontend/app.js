@@ -689,6 +689,88 @@ async function saveSettings() {
   }
 }
 
+/* ---------- temp-file cleanup ---------- */
+function fmtBytes(n) {
+  if (!n || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i];
+}
+
+function areaSummary(name, a) {
+  const line = el("div", "cleanup-line",
+    `${name}: <b>${a.ready_count}</b> ready (${fmtBytes(a.ready_bytes)}), ` +
+    `${a.unreferenced_count} unreferenced total (${fmtBytes(a.unreferenced_bytes)})` +
+    (a.referenced_count ? `, ${a.referenced_count} in use` : ""));
+  line.innerHTML = line.textContent; // allow the <b> markup above
+  return line;
+}
+
+async function openCleanup() {
+  $("#cleanup-modal").classList.remove("hidden");
+  const status = $("#cleanup-status");
+  status.textContent = "";
+  $("#cleanup-summary").innerHTML = "";
+  $("#cleanup-summary").appendChild(el("div", "", "Loading…"));
+  try {
+    const data = await api("/api/cleanup");
+    $("#cleanup-interval").textContent = String(Math.round(data.config.interval_hours));
+    const age = data.config.max_age_hours;
+    const box = $("#cleanup-max-age");
+    box.value = String(Math.round(age));
+    box.min = "1";
+
+    const sum = $("#cleanup-summary");
+    sum.innerHTML = "";
+    const t = data.totals || {};
+    sum.appendChild(el("div", "cleanup-total",
+      `${t.ready_count} file(s) ready to clean right now (older than ${Math.round(age)} h), ` +
+      `${fmtBytes(t.ready_bytes)}`));
+    ["work", "output", "uploads"].forEach((area) => {
+      if (data.areas && data.areas[area]) sum.appendChild(areaSummary(area, data.areas[area]));
+    });
+    if (!t.ready_count) {
+      sum.appendChild(el("div", "hint",
+        "No unreferenced files are old enough yet — " +
+        "lower the limit or use Preview to see younger candidates."));
+    }
+  } catch (e) {
+    status.textContent = "Failed to load cleanup info: " + e.message;
+  }
+}
+
+async function runCleanup(dryRun) {
+  const btnRun = $("#btn-cleanup-run");
+  const btnPrev = $("#btn-cleanup-preview");
+  const status = $("#cleanup-status");
+  const hours = parseFloat($("#cleanup-max-age").value) || 1;
+  btnRun.disabled = true;
+  btnPrev.disabled = true;
+  status.textContent = dryRun ? "Previewing…" : "Cleaning…";
+  try {
+    const data = await api("/api/cleanup/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ older_than_hours: hours, dry_run: dryRun, force: false }),
+    });
+    const kept = data.kept || {};
+    status.textContent = dryRun
+      ? `Preview: would delete ${data.deleted_count} file(s), freeing ${fmtBytes(data.freed_bytes)}. ` +
+        `${kept.referenced || 0} in use / ${kept.too_fresh || 0} too fresh kept.`
+      : `Deleted ${data.deleted_count} file(s), freed ${fmtBytes(data.freed_bytes)}. ` +
+        `${kept.referenced || 0} in use kept.`;
+    // Refresh the summary so the numbers reflect the cleanup just performed.
+    openCleanup();
+  } catch (e) {
+    status.textContent = "Cleanup failed: " + e.message;
+  } finally {
+    btnRun.disabled = false;
+    btnPrev.disabled = false;
+  }
+}
+
 /* ---------- debug logs ---------- */
 async function refreshLogs() {
   try {
@@ -762,6 +844,11 @@ async function init() {
   $("#btn-preview").onclick = previewOverlay;
   $("#btn-dataset").onclick = downloadDataset;
   $("#btn-settings").onclick = openSettings;
+  $("#btn-cleanup").onclick = openCleanup;
+  $("#btn-cleanup-preview").onclick = () => runCleanup(true);
+  $("#btn-cleanup-run").onclick = () => runCleanup(false);
+  $("#btn-cleanup-cancel").onclick = () => $("#cleanup-modal").classList.add("hidden");
+  $("#cleanup-modal").onclick = (e) => { if (e.target === $("#cleanup-modal")) $("#cleanup-modal").classList.add("hidden"); };
   $("#btn-logs").onclick = toggleLogs;
   $("#btn-refresh-logs").onclick = refreshLogs;
   $("#auto-log").onchange = (e) => { if (e.target.checked) startLogPolling(); else stopLogPolling(); };

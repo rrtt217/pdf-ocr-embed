@@ -124,6 +124,8 @@ uvicorn backend.main:app --port 8000
 | POST | `/api/pages/{job_id}/{i}` | 更新单个可编辑页 |
 | POST | `/api/embed/{job_id}` | 嵌入（可编辑后的）文字 → `*_embedded.pdf` |
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
+| GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
+| POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
 
 ---
 
@@ -182,4 +184,10 @@ pdf-ocr-embed/
   已完成的页保留，停止后可点 **Download partial** 下载部分嵌入的 PDF，或 **Retry remaining** 跑完剩余页。
 - **调试日志**：后端全链路 logging（`OCR_LOG_LEVEL` 环境变量控制级别，默认 INFO，设 DEBUG 看详细）。
   WebUI 右上角 **Logs** 按钮可实时查看后端日志，或调用 `GET /api/logs`。
+- **临时文件清理**：任务只在内存中保存——服务重启后 `work/<job_id>/`（源 PDF + 每页渲染图）
+  与 `output/`（嵌入结果、缩略图、overlay）会变成无人引用的孤儿文件，长期堆积占用磁盘。
+  后端在**启动时**与每 `OCR_CLEANUP_INTERVAL_HOURS`（默认 6h）自动删除
+  未被任何存活任务引用、且超过 `OCR_CLEANUP_MAX_AGE_HOURS`（默认 168h=7 天）的临时文件；
+  **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
+  清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
 - 运行时产物（`output/`、`work/`、`uploads/`、`ocr_config.json`、`.env`）均不应提交仓库。

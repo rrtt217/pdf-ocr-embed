@@ -44,6 +44,8 @@ _FILE_KEYS = (
     "generic_prompt",
     # embedded-text font (system font name / path used for the text layer)
     "embed_font",
+    # temp-file cleanup (see backend/cleanup.py)
+    "cleanup_max_age_hours", "cleanup_interval_hours",
 )
 
 # Map environment variables -> resolved config field names.
@@ -56,6 +58,8 @@ _ENV_ALIASES = {
     "OCR_TESS_CMD": "tess_cmd",
     "OCR_GENERIC_PROMPT": "generic_prompt",
     "OCR_EMBED_FONT": "embed_font",
+    "OCR_CLEANUP_MAX_AGE_HOURS": "cleanup_max_age_hours",
+    "OCR_CLEANUP_INTERVAL_HOURS": "cleanup_interval_hours",
 }
 
 # In-memory overrides from the WebUI settings page (applied at runtime).

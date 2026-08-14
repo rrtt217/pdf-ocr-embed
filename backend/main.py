@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from backend import cleanup as cleanup_mod
 from backend import config, ocr_service
 from backend.logging_config import recent_logs, setup_logging
 from backend.sources.factory import available_adapters
@@ -32,7 +34,17 @@ from backend.sources.factory import available_adapters
 setup_logging()
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="PDF OCR Embed", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Keep orphaned temp files from accumulating: periodically delete
+    # unreferenced files older than cleanup_max_age_hours.
+    cleanup_mod.start_background_cleanup()
+    yield
+    cleanup_mod.stop_background_cleanup()
+
+
+app = FastAPI(title="PDF OCR Embed", version="1.0.0", lifespan=lifespan)
 
 # Served frontend lives in ../frontend relative to this package dir.
 BACKEND_DIR = Path(__file__).resolve().parent
@@ -82,6 +94,40 @@ def health() -> dict:
 def get_logs(n: int = 200) -> dict:
     """Return recent backend log lines (for the WebUI debug panel)."""
     return {"lines": recent_logs(min(max(n, 1), 1000))}
+
+
+@app.get("/api/cleanup")
+def cleanup_status() -> dict:
+    """Inventory of unreferenced temp files + the current cleanup config.
+
+    Items become "ready" once they are unreferenced AND older than
+    ``max_age_hours``; files still used by a live job are always protected.
+    """
+    data = cleanup_mod.inventory()
+    return {
+        "config": {
+            "max_age_hours": cleanup_mod.max_age_hours(),
+            "interval_hours": cleanup_mod.interval_hours(),
+            "auto_cleanup_enabled": True,
+        },
+        **data,
+    }
+
+
+class CleanupModel(BaseModel):
+    older_than_hours: Optional[float] = None  # age limit; defaults to config
+    force: bool = False   # ignore the age rule (referenced files are still kept)
+    dry_run: bool = False  # preview what would be deleted, without deleting
+
+
+@app.post("/api/cleanup/run")
+def run_cleanup(payload: CleanupModel) -> dict:
+    """Delete unreferenced temp files (or preview them with ``dry_run``)."""
+    return cleanup_mod.cleanup(
+        age_limit=payload.older_than_hours,
+        force=payload.force,
+        dry_run=payload.dry_run,
+    )
 
 
 @app.get("/api/settings")

@@ -319,6 +319,21 @@ label input, label select {
   cursor: pointer;
 }
 #settings-status { font-size: 13px; color: var(--accent); }
+#cleanup-status { font-size: 13px; color: var(--accent); }
+.cleanup-summary {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 10px 12px;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cleanup-total { font-weight: 600; color: var(--text); }
+.cleanup-line { color: var(--muted); }
+.cleanup-line b { color: var(--text); }
+#cleanup-modal .modal-box { width: min(520px, 92vw); }
 
 @media (max-width: 820px) {
   #panes { grid-template-columns: 1fr; }

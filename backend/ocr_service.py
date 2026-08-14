@@ -106,6 +106,12 @@ def list_jobs() -> List[dict]:
         return jobs
 
 
+def all_jobs() -> List[dict]:
+    """Raw job dicts for every live job (used by temp-file cleanup)."""
+    with _jobs_lock:
+        return list(_JOBS.values())
+
+
 def clear_job(job_id: str) -> bool:
     """Fully remove a job: drop from memory AND delete its on-disk artifacts.
 

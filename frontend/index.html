@@ -11,6 +11,7 @@
     <h1>PDF OCR Embed</h1>
     <div class="header-actions">
       <span id="conn-status" class="pill">idle</span>
+      <button id="btn-cleanup" class="small" title="Delete orphaned/old working files and outputs">Cleanup</button>
       <button id="btn-logs" class="small">Logs</button>
       <button id="btn-settings">Settings</button>
     </div>
@@ -128,6 +129,31 @@
         <button id="btn-settings-cancel">Cancel</button>
       </div>
       <div id="settings-status"></div>
+    </div>
+  </div>
+
+  <!-- Temp-file cleanup modal -->
+  <div id="cleanup-modal" class="modal hidden">
+    <div class="modal-box">
+      <h2>Temporary file cleanup</h2>
+      <p class="hint">
+        Working files (<code>work/</code>), embedded PDFs and overlays
+        (<code>output/</code>) are only referenced while the server is running.
+        <strong>Unreferenced</strong> files older than the age limit are safe to
+        delete; anything a live job still uses is always kept. A background
+        task also removes them automatically every
+        <span id="cleanup-interval">—</span>&nbsp;h.
+      </p>
+      <div id="cleanup-summary" class="cleanup-summary">Loading…</div>
+      <label>Delete unreferenced files older than
+        <input id="cleanup-max-age" type="number" min="1" step="1" /> hours
+      </label>
+      <div class="modal-actions">
+        <button id="btn-cleanup-preview">Preview</button>
+        <button id="btn-cleanup-run" class="primary">Clean now</button>
+        <button id="btn-cleanup-cancel">Cancel</button>
+      </div>
+      <div id="cleanup-status"></div>
     </div>
   </div>
 
