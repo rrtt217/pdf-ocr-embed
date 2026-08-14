@@ -4,9 +4,8 @@
 做一个跨平台的桌面 GUI / WebUI 程序：输入纯图片 PDF（扫描件），通过 OCR 识别的文字
 按坐标**嵌入**到 PDF 内层（真正的可选中/可搜索文字层），保留原图作为背景。
 
-## 独立运行（不依赖 OpenClaw）
-- 本项目是**完全独立的程序**，不依赖 OpenClaw / OpenClaw 配置。
-- API key 与 provider 配置通过**外部方式**提供，绝不硬编码，也不读 OpenClaw 配置：
+## 独立运行
+- API key 与 provider 配置通过**外部方式**提供，代码里绝不硬编码：
   - 环境变量：`OCR_API_KEY`、`OCR_BASE_URL`、`OCR_MODEL`（可选 `OCR_PROVIDER`）。
   - 或项目本地配置文件 `ocr_config.json` / `.env`（用户自建，加入 .gitignore）。
   - 或 WebUI 设置页里填写保存。
@@ -98,7 +97,7 @@
 ## 质量要求
 - 代码可运行，README 写清依赖、配置方式（外部 key / provider）与启动命令。
 - 后端统一走 OcrSource 抽象，不能只写死 Unlimited-OCR。
-- 不依赖 OpenClaw；节点无 NVIDIA，别引入 CUDA。
+- 不引入 CUDA / NVIDIA 依赖（部署节点无 NVIDIA GPU）。
 
 ## 交付
 在 /home/david/vibe-arena/pdf-ocr-embed 下写完整个项目 + README。

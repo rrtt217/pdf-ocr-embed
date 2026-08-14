@@ -8,7 +8,7 @@ Priority (highest first):
   3. WebUI-saved default (the in-memory `saved` dict, persisted to
      ocr_config.json when the user saves via the WebUI).
 
-No OpenClaw dependency, no hardcoded keys.
+No hardcoded keys.
 """
 from __future__ import annotations
 
