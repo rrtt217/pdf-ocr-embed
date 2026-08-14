@@ -4,6 +4,9 @@
 做一个跨平台的桌面 GUI / WebUI 程序：输入纯图片 PDF（扫描件），通过 OCR 识别的文字
 按坐标**嵌入**到 PDF 内层（真正的可选中/可搜索文字层），保留原图作为背景。
 
+> **Vibe coding 提示**：本文档与整个项目均由 **DeepSeek V4 Flash** 通过 Vibe coding
+> 生成，属设计思路记录而非权威规范，实现以其对应代码为准。审阅代码时勿盲信 AI 输出。
+
 ## 独立运行
 - API key 与 provider 配置通过**外部方式**提供，代码里绝不硬编码：
   - 环境变量：`OCR_API_KEY`、`OCR_BASE_URL`、`OCR_MODEL`（可选 `OCR_PROVIDER`）。
