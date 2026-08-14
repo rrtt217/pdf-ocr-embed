@@ -327,6 +327,45 @@ label input, label select {
 #debug-panel { font-size: 12px; }
 #debug-panel h3 { margin: 0; font-size: 14px; }
 #debug-panel .row { align-items: center; }
+
+/* ---- jobs list ---- */
+#jobs-section .row { align-items: center; }
+#jobs-section h2 { margin: 0; font-size: 16px; }
+#jobs-list { display: flex; flex-direction: column; gap: 12px; }
+.job-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  background: var(--panel);
+}
+.job-card.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.job-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.job-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.job-filename {
+  font-weight: 600;
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.job-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.job-err { font-size: 12px; color: #a00; margin-top: 6px; word-break: break-word; }
+.job-actions { display: flex; align-items: center; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+#editing-job { color: var(--muted); font-size: 13px; font-weight: 600; }
 #log-box {
   max-height: 240px;
   overflow: auto;

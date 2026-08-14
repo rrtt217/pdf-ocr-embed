@@ -1,45 +1,50 @@
-/* PDF OCR Embed single-page WebUI */
+/* PDF OCR Embed single-page WebUI — multi-job.
+
+   The backend is the single source of truth for every OCR task: it holds them
+   all in memory, so this page simply asks "what jobs are there?" on load and
+   subscribes to live progress (SSE) per running job. No client-side job-id
+   persistence, no localStorage. Jobs survive closing the tab; several may run
+   in parallel and each is managed from its own card.
+*/
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-const state = {
-  jobId: null,
-  pages: [],            // normalized page dicts (only completed pages)
-  pageIndex: 0,
-  running: false,
-  embedded: false,
-  sourceW: 0,
-  sourceH: 0,
-  zoom: 100,
-  es: null,             // active EventSource
-  logTimer: null,
-  embedFont: "",        // selected system font name for the text layer
+const RUNNING_STATUSES = new Set(["uploaded", "running", "retrying"]);
+const STATUS_LABEL = {
+  uploaded: "starting",
+  running: "running",
+  retrying: "retrying",
+  stopped: "stopped",
+  done: "done",
+  error: "error",
+  embedded: "embedded",
 };
 
-/* Last job id is persisted so a tab reload restores the in-progress task
-   (jobs live server-side; only the id needs remembering). */
-const LS_JOB_KEY = "pdfocr.jobId.v1";
-function saveJobId() {
-  try {
-    if (state.jobId) localStorage.setItem(LS_JOB_KEY, state.jobId);
-    else localStorage.removeItem(LS_JOB_KEY);
-  } catch { /* storage unavailable — resumption simply won't work */ }
-}
+const state = {
+  jobs: [],     // job summaries: {id, filename, status, current, total, error, has_embedded, created, busy}
+  sel: null,    // editor session for the selected job: {jobId, pages, pageIndex, embedded}
+  zoom: 100,
+  es: {},       // jobId -> EventSource
+  logTimer: null,
+  embedFont: "",   // selected system font name for the text layer
+};
 
 /* ---------- helpers ---------- */
 function setStatus(text, cls) {
-  const el = $("#conn-status");
-  el.textContent = text;
-  el.className = "pill" + (cls ? " " + cls : "");
+  const elx = $("#conn-status");
+  elx.textContent = text;
+  elx.className = "pill" + (cls ? " " + cls : "");
 }
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
   if (!res.ok) {
     const body = await res.text().catch(() => "");
-    throw new Error(body || ("HTTP " + res.status));
+    const err = new Error(body || ("HTTP " + res.status));
+    err.status = res.status;
+    throw err;
   }
   const ct = res.headers.get("content-type") || "";
   return ct.includes("json") ? res.json() : res;
@@ -52,7 +57,21 @@ function el(tag, cls, text) {
   return node;
 }
 
-/* ---------- upload ---------- */
+function jobById(id) {
+  return state.jobs.find((j) => j.id === id);
+}
+
+function anyRunning() {
+  return state.jobs.some((j) => RUNNING_STATUSES.has(j.status));
+}
+
+function setGlobalStatus() {
+  if (state.jobs.length === 0) setStatus("idle", "");
+  else if (anyRunning()) setStatus("running", "running");
+  else setStatus("idle", "done");
+}
+
+/* ---------- upload (one of possibly many parallel jobs) ---------- */
 function updateAdapterUI() {
   const adapter = $("#adapter").value;
   const langRow = $("#tess-lang-row");
@@ -81,9 +100,11 @@ function currentAdapterCfg() {
 }
 
 async function handleFile(file) {
-  if (state.running) return;
+  const msg = $("#upload-msg");
+  if (msg) msg.textContent = "";
   if (!file || !file.name.toLowerCase().endsWith(".pdf")) {
-    alert("Please choose a PDF file.");
+    setStatus("error", "error");
+    if (msg) msg.textContent = "Please choose a PDF file.";
     return;
   }
   const fd = new FormData();
@@ -91,325 +112,345 @@ async function handleFile(file) {
   const cfg = currentAdapterCfg();
   fd.append("adapter", cfg.adapter);
   if (cfg.lang) fd.append("lang", cfg.lang);
-  const concurrencyInput = $("#concurrency");
-  const concurrency = Math.max(1, Math.min(32, parseInt(concurrencyInput.value || "1", 10)));
-  concurrencyInput.value = concurrency;
+  const concurrency = Math.max(1, Math.min(32, parseInt($("#concurrency").value || "1", 10)));
   fd.append("concurrency", String(concurrency));
 
   setStatus("uploading", "running");
-  $("#upload-zone").classList.add("hidden");
-  $("#progress-section").classList.remove("hidden");
-  $("#workspace").classList.add("hidden");
-  $("#retry-btn").classList.add("hidden");
-  $("#stop-btn").classList.add("hidden");
-  $("#partial-btn").classList.add("hidden");
-  $("#progress-fill").style.width = "2%";
-  $("#progress-label").textContent = "Uploading…";
-
   try {
     const data = await api("/api/ocr/upload", { method: "POST", body: fd });
-    state.jobId = data.job_id;
-    saveJobId();
-    state.pages = [];
-    state.pageIndex = 0;
-    state.embedded = false;
-    state.running = true;
+    state.jobs.unshift({
+      id: data.job_id,
+      filename: data.filename || file.name,
+      status: "running",
+      current: 0,
+      total: 0,
+      error: null,
+      has_embedded: false,
+      created: Date.now() / 1000,
+      busy: false,
+    });
+    renderJobs();
+    connectStream(data.job_id);
+    selectJob(data.job_id);
     setStatus("running", "running");
-    $("#stop-btn").classList.remove("hidden");
-    $("#retry-btn").classList.add("hidden");
-    $("#partial-btn").classList.add("hidden");
-    $("#clear-btn").classList.add("hidden");
-    $("#progress-label").textContent =
-      `OCR running (parallel: ${data.concurrency || 1}) …`;
-    connectStream(state.jobId);
+    if (msg) msg.textContent = "";
   } catch (e) {
     setStatus("error", "error");
-    $("#progress-label").textContent = "Upload failed: " + e.message;
+    if (msg) msg.textContent = "Upload failed: " + e.message;
   }
+}
+
+/* ---------- jobs: list + per-job SSE ---------- */
+async function loadJobs() {
+  try {
+    const data = await api("/api/jobs");
+    state.jobs = (data.jobs || []).map((j) => Object.assign(j, { busy: false }));
+    state.jobs.sort((a, b) => (b.created || 0) - (a.created || 0));
+    // Drop streams for jobs that no longer exist server-side.
+    Object.keys(state.es).forEach((id) => {
+      if (!jobById(id)) { state.es[id].close(); delete state.es[id]; }
+    });
+    renderJobs();
+    // Subscribe to every still-running job with its own EventSource.
+    state.jobs.forEach((j) => {
+      if (RUNNING_STATUSES.has(j.status)) connectStream(j.id);
+    });
+    setGlobalStatus();
+  } catch (e) {
+    setStatus("offline", "error");
+  }
+}
+
+function renderJobs() {
+  const section = $("#jobs-section");
+  const list = $("#jobs-list");
+  section.classList.toggle("hidden", state.jobs.length === 0);
+  list.innerHTML = "";
+  state.jobs.forEach((j) => list.appendChild(jobCard(j)));
+}
+
+function jobCard(job) {
+  const card = el("div", "job-card" + (state.sel && state.sel.jobId === job.id ? " selected" : ""));
+  card.dataset.jid = job.id;
+
+  const head = el("div", "job-head");
+  const title = el("div", "job-title");
+  title.appendChild(el("span", "job-filename", job.filename));
+  const pcls = RUNNING_STATUSES.has(job.status) ? "running"
+    : (job.status === "done" || job.status === "embedded") ? "done"
+    : job.status === "error" ? "error" : "";
+  title.appendChild(el("span", "pill" + (pcls ? " " + pcls : ""),
+                       STATUS_LABEL[job.status] || job.status));
+  head.appendChild(title);
+  head.appendChild(el("span", "job-count", `${job.current} / ${job.total || "?"}`));
+  card.appendChild(head);
+
+  const bar = el("div", "bar");
+  const fill = el("div", "fill");
+  fill.style.width = job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%";
+  bar.appendChild(fill);
+  card.appendChild(bar);
+
+  if (job.error) card.appendChild(el("div", "job-err", "✗ " + job.error));
+
+  const actions = el("div", "job-actions");
+  const active = RUNNING_STATUSES.has(job.status);
+
+  if (active) {
+    const stop = el("button", "warn", job.busy ? "Stopping…" : "Stop");
+    stop.disabled = !!job.busy;
+    stop.onclick = () => stopJob(job.id);
+    actions.appendChild(stop);
+  } else {
+    if (job.status === "error" || job.current > 0) {
+      const retry = el("button", "primary", job.current > 0 ? "Retry remaining" : "Retry");
+      retry.disabled = !!job.busy;
+      retry.onclick = () => retryJob(job.id);
+      actions.appendChild(retry);
+    }
+    if (job.current > 0) {
+      const partial = el("button", "primary", "Download partial");
+      partial.disabled = !!job.busy;
+      partial.onclick = () => partialJob(job.id);
+      actions.appendChild(partial);
+    }
+    const clear = el("button", "warn", "Clear");
+    clear.onclick = () => clearJob(job.id);
+    actions.appendChild(clear);
+  }
+
+  if (job.current > 0) {
+    const edit = el("button", "small", "Edit pages");
+    edit.onclick = () => selectJob(job.id);
+    actions.appendChild(edit);
+  }
+  if (job.has_embedded) {
+    const a = el("a", "download-link", "⬇ Embedded PDF");
+    a.href = `/api/download/${job.id}.pdf`;
+    a.download = "";
+    actions.appendChild(a);
+  }
+  card.appendChild(actions);
+  return card;
 }
 
 function connectStream(jobId) {
-  if (state.es) state.es.close();
+  if (state.es[jobId]) state.es[jobId].close();
   const es = new EventSource(`/api/ocr/stream/${jobId}`);
-  state.es = es;
+  state.es[jobId] = es;
   es.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "progress") {
-      $("#progress-fill").style.width = (msg.current / msg.total) * 100 + "%";
-      $("#progress-count").textContent = `${msg.current} / ${msg.total}`;
-      $("#progress-label").textContent = "OCR " + msg.message + "…";
-    } else if (msg.type === "warning") {
-      $("#progress-label").textContent = "Warning: " + msg.message;
-    } else if (msg.type === "error_page") {
-      $("#progress-label").textContent = `Page ${msg.page_index + 1} failed: ` + msg.message;
-    } else if (msg.type === "status" && msg.status === "done") {
-      $("#progress-fill").style.width = "100%";
-      $("#progress-label").textContent = "OCR complete";
-      if (msg.result) state.pages = msg.result.filter(p => p);
-      _stopRunning();
-      finishOcr();
-      es.close();
-      state.es = null;
-    } else if (msg.type === "status" && msg.status === "stopped") {
-      if (msg.result) state.pages = msg.result.filter(p => p);
-      _stopRunning();
-      showStopped(msg.message || "OCR stopped");
-    } else if (msg.type === "error") {
-      showOcrError(msg.message);
-    }
+    applyJobEvent(jobId, msg);
   };
-  es.onerror = () => { showOcrError("Connection to server lost"); };
+  // On connection trouble the browser auto-reconnects; the server re-synthesizes
+  // terminal events, so a reconnect always catches the job up. Do nothing here.
+  es.onerror = () => {};
 }
 
-function _stopRunning() {
-  state.running = false;
-  $("#stop-btn").classList.add("hidden");
-}
+function applyJobEvent(jobId, msg) {
+  const job = jobById(jobId);
+  if (!job) return;
+  const prevCurrent = job.current;
 
-function showOcrError(message) {
-  if (state.es) { state.es.close(); state.es = null; }
-  _stopRunning();
-  setStatus("error", "error");
-  $("#progress-label").textContent = "OCR error: " + message;
-  $("#retry-btn").classList.remove("hidden");
-  $("#partial-btn").classList.toggle("hidden", state.pages.length === 0);
-  $("#clear-btn").classList.remove("hidden");
-}
-
-function showStopped(message) {
-  if (state.es) { state.es.close(); state.es = null; }
-  _stopRunning();
-  setStatus("stopped", "error");
-  const done = state.pages.length;
-  $("#progress-label").textContent = `${message} (${done} page(s) completed)`;
-  $("#retry-btn").classList.remove("hidden");
-  $("#partial-btn").classList.toggle("hidden", done === 0);
-  $("#clear-btn").classList.remove("hidden");
-}
-
-/* ---------- job restore / clear ---------- */
-
-async function restoreJob() {
-  const jobId = localStorage.getItem(LS_JOB_KEY);
-  if (!jobId) return;
-  let data;
-  try {
-    data = await api(`/api/pages/${jobId}`);
-  } catch (e) {
-    // Job no longer exists server-side (e.g. server restarted) — drop stale id.
-    localStorage.removeItem(LS_JOB_KEY);
-    return;
+  if (msg.type === "progress") {
+    Object.assign(job, {
+      status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
+      current: msg.current,
+      total: msg.total,
+      error: null,
+    });
+  } else if (msg.type === "status") {
+    const done = (msg.result || []).filter(Boolean).length;
+    Object.assign(job, {
+      status: msg.status,
+      error: null,
+      current: (msg.status === "done" || msg.status === "stopped") ? done : (msg.result ? done : job.current),
+    });
+  } else if (msg.type === "error") {
+    Object.assign(job, { status: "error", error: msg.message });
+  } else {
+    return; // warning / error_page — cosmetic, nothing persisted
   }
-  state.jobId = jobId;
-  state.pages = (data.pages || []).filter(p => p);
-  const st = data.status;
 
-  if (st === "running" || st === "retrying" || st === "uploaded") {
-    // Still active — resume live progress over SSE.
-    state.running = true;
-    state.embedded = false;
-    setStatus(st, "running");
-    $("#progress-section").classList.remove("hidden");
-    $("#stop-btn").classList.remove("hidden");
-    $("#retry-btn").classList.add("hidden");
-    $("#partial-btn").classList.add("hidden");
-    $("#clear-btn").classList.add("hidden");
-    const total = data.total || state.pages.length;
-    const cur = state.pages.length;
-    $("#progress-fill").style.width = total ? (cur / total) * 100 + "%" : "2%";
-    $("#progress-count").textContent = `${cur} / ${total}`;
-    $("#progress-label").textContent =
-      `Restored job (${cur}/${total} pages done) — resuming…`;
-    connectStream(jobId);
-  } else if (st === "done" || st === "embedded") {
-    await finishOcr();  // hides progress, shows workspace with the completed pages
-    if (st === "embedded" && data.has_embedded) {
-      const link = $("#download-link");
-      link.classList.remove("hidden");
-      link.href = `/api/download/${jobId}.pdf`;
-      link.textContent = "Download embedded PDF";
-      state.embedded = true;
-      setStatus("embedded", "done");
+  const terminal = job.status === "done" || job.status === "stopped" || job.status === "error";
+  if (terminal && state.es[jobId]) {
+    state.es[jobId].close();
+    state.es[jobId] = null;
+  }
+  renderJobs();
+
+  // Keep the open editor in sync with its job (new pages appearing live).
+  if (state.sel && state.sel.jobId === jobId) {
+    if (msg.type === "status" || (msg.type === "progress" && msg.current !== prevCurrent)) {
+      refreshSelectedPages();
     }
-  } else if (st === "stopped") {
-    showStopped("OCR stopped earlier (recovered from last session)");
-  } else if (st === "error") {
-    showOcrError("OCR failed earlier");
   }
 }
 
-async function clearJob() {
-  if (!state.jobId) return;
-  if (!confirm("Delete this job entirely?\n\nThis removes the OCR results, "
-               + "the uploaded PDF's working files and any embedded PDF.")) {
-    return;
-  }
+/* ---------- per-job actions ---------- */
+async function stopJob(jobId) {
+  const job = jobById(jobId);
+  if (!job || job.busy || !RUNNING_STATUSES.has(job.status)) return;
+  job.busy = true;
+  renderJobs();
   try {
-    await api(`/api/ocr/clear/${state.jobId}`, { method: "POST" });
-  } catch (e) { /* job may already be gone — proceed to reset the UI */ }
-  if (state.es) { state.es.close(); state.es = null; }
-  state.jobId = null;
-  state.pages = [];
-  state.pageIndex = 0;
-  state.running = false;
-  state.embedded = false;
-  saveJobId();  // removes the stored id
-  setStatus("idle", "");
-  $("#progress-section").classList.add("hidden");
-  $("#workspace").classList.add("hidden");
-  $("#stop-btn").classList.add("hidden");
-  $("#retry-btn").classList.add("hidden");
-  $("#partial-btn").classList.add("hidden");
-  $("#clear-btn").classList.add("hidden");
-  $("#download-link").classList.add("hidden");
-  $("#btn-embed").disabled = true;
-  const drop = $("#drop-zone");
-  if (drop) drop.scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-async function stopOcr() {
-  if (!state.jobId || !state.running) return;
-  $("#stop-btn").disabled = true;
-  $("#progress-label").textContent = "Stopping…";
-  try {
-    await api(`/api/ocr/stop/${state.jobId}`, { method: "POST" });
-    // Fetch completed pages immediately from the server — don't wait for SSE.
-    const data = await api(`/api/pages/${state.jobId}`);
-    if (data.pages) state.pages = data.pages.filter(p => p);
-    _stopRunning();
-    setStatus("stopped", "error");
-    const done = state.pages.length;
-    $("#progress-label").textContent = `Stopped (${done} page(s) completed)`;
-    $("#retry-btn").classList.remove("hidden");
-    $("#partial-btn").classList.toggle("hidden", done === 0);
-    $("#clear-btn").classList.remove("hidden");
-    $("#stop-btn").disabled = false;
+    await api(`/api/ocr/stop/${jobId}`, { method: "POST" });
+    const data = await api(`/api/pages/${jobId}`);
+    Object.assign(job, {
+      status: "stopped",
+      current: (data.pages || []).filter(Boolean).length,
+      total: data.total || job.total,
+    });
   } catch (e) {
-    $("#stop-btn").disabled = false;
-    $("#progress-label").textContent = "Stop failed: " + e.message;
+    Object.assign(job, { status: "error", error: "Stop failed: " + e.message });
+  } finally {
+    job.busy = false;
+    renderJobs();
   }
 }
 
-async function retryOcr() {
-  if (!state.jobId || state.running) return;
-  setStatus("retrying", "running");
-  $("#retry-btn").classList.add("hidden");
-  $("#partial-btn").classList.add("hidden");
-  $("#clear-btn").classList.add("hidden");
-  $("#stop-btn").classList.remove("hidden");
-  $("#stop-btn").disabled = false;
-  $("#progress-label").textContent = "Retrying (only missing pages)…";
-  const concurrencyInput = $("#concurrency");
-  const concurrency = Math.max(1, Math.min(32, parseInt(concurrencyInput.value || "1", 10)));
+async function retryJob(jobId) {
+  const job = jobById(jobId);
+  if (!job || job.busy) return;
+  job.busy = true;
+  renderJobs();
   const fd = new FormData();
   const cfg = currentAdapterCfg();
   fd.append("adapter", cfg.adapter);
   if (cfg.lang) fd.append("lang", cfg.lang);
-  fd.append("concurrency", String(concurrency));
+  const c = Math.max(1, Math.min(32, parseInt($("#concurrency").value || "1", 10)));
+  fd.append("concurrency", String(c));
   try {
-    const data = await api(`/api/ocr/retry/${state.jobId}`, { method: "POST", body: fd });
-    state.running = true;
-    state.embedded = false;
-    // Keep state.pages (done pages preserved); backend only re-runs missing ones.
-    $("#progress-label").textContent =
-      `Retrying (parallel: ${data.concurrency || 1}) …`;
-    connectStream(state.jobId);
+    await api(`/api/ocr/retry/${jobId}`, { method: "POST", body: fd });
+    Object.assign(job, { status: "retrying", error: null });
+    renderJobs();
+    connectStream(jobId);
   } catch (e) {
-    _stopRunning();
-    setStatus("error", "error");
-    $("#progress-label").textContent = "Retry failed: " + e.message;
-    $("#retry-btn").classList.remove("hidden");
+    Object.assign(job, { status: "error", error: "Retry failed: " + e.message });
+    renderJobs();
+  } finally {
+    job.busy = false;
+    renderJobs();
   }
 }
 
-async function downloadPartial() {
-  if (!state.jobId || !state.pages.length) return;
-  $("#partial-btn").disabled = true;
-  $("#progress-label").textContent = "Embedding partial result…";
+async function partialJob(jobId) {
+  const job = jobById(jobId);
+  if (!job || job.busy) return;
+  job.busy = true;
+  renderJobs();
   try {
-    const out = await api(`/api/embed/${state.jobId}`, {
+    const data = await api(`/api/pages/${jobId}`);
+    const pages = (data.pages || []).filter(Boolean);
+    if (!pages.length) throw new Error("No completed pages");
+    const out = await api(`/api/embed/${jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: state.jobId, pages: state.pages }),
+      body: JSON.stringify({ job_id: jobId, pages }),
     });
-    $("#progress-label").textContent =
-      `Partial PDF ready (${state.pages.length} page(s) embedded).`;
     window.open(out.url, "_blank");
   } catch (e) {
-    $("#progress-label").textContent = "Partial embed failed: " + e.message;
+    Object.assign(job, { error: "Partial failed: " + e.message });
   } finally {
-    $("#partial-btn").disabled = false;
+    job.busy = false;
+    renderJobs();
   }
 }
 
-async function finishOcr() {
-  setStatus("done", "done");
-  $("#btn-embed").disabled = false;
+async function clearJob(jobId) {
+  const job = jobById(jobId);
+  if (!job) return;
+  if (!confirm(`Delete job "${job.filename}" entirely?\n\nThis removes its OCR results, working files and any embedded PDF.`)) {
+    return;
+  }
   try {
-    const data = await api(`/api/pages/${state.jobId}`);
-    if (data.pages && data.pages.length) state.pages = data.pages.filter(p => p);
-  } catch (e) { /* pages may already be in state from SSE */ }
-  $("#progress-section").classList.add("hidden");
+    await api(`/api/ocr/clear/${jobId}`, { method: "POST" });
+  } catch (e) { /* job may already be gone — still reset the UI */ }
+  if (state.es[jobId]) { state.es[jobId].close(); delete state.es[jobId]; }
+  state.jobs = state.jobs.filter((j) => j.id !== jobId);
+  if (state.sel && state.sel.jobId === jobId) setSelectedJob(null);
+  renderJobs();
+  setGlobalStatus();
+}
+
+/* ---------- selected-job editor ---------- */
+async function selectJob(jobId) {
+  state.sel = { jobId, pages: [], pageIndex: 0, embedded: false };
+  const job = jobById(jobId);
+  const label = $("#editing-job");
+  if (label) label.textContent = job ? `Editing: ${job.filename}` : "";
+  $("#download-link").classList.add("hidden");
+  $("#embed-status").textContent = "";
+  renderJobs();
   $("#workspace").classList.remove("hidden");
-  state.pageIndex = 0;
-  renderTabs();
-  renderPage();
-  $("#btn-embed").disabled = state.pages.length === 0;
+  await refreshSelectedPages();
 }
 
-/* ---------- debug logs ---------- */
-async function refreshLogs() {
+function setSelectedJob(sel) {
+  state.sel = sel;
+  $("#workspace").classList.toggle("hidden", !sel);
+  if (!sel) {
+    $("#editing-job").textContent = "";
+    $("#preview-img").removeAttribute("src");
+    $("#blocks").innerHTML = "";
+    $("#download-link").classList.add("hidden");
+    $("#embed-status").textContent = "";
+  }
+  renderJobs();
+}
+
+async function refreshSelectedPages() {
+  const sel = state.sel;
+  if (!sel) return;
   try {
-    const data = await api("/api/logs");
-    const box = $("#log-box");
-    box.textContent = (data.lines || []).join("\n");
-    box.scrollTop = box.scrollHeight;
-  } catch { /* ignore */ }
-}
-
-function toggleLogs() {
-  const panel = $("#debug-panel");
-  const hidden = panel.classList.contains("hidden");
-  panel.classList.toggle("hidden");
-  if (hidden) {
-    refreshLogs();
-    if ($("#auto-log").checked) startLogPolling();
-  } else {
-    stopLogPolling();
+    const data = await api(`/api/pages/${sel.jobId}`);
+    const pages = (data.pages || []).filter(Boolean);
+    sel.status = data.status;
+    sel.pages = pages;
+    const job = jobById(sel.jobId);
+    if (job) Object.assign(job, { current: pages.length, total: data.total || job.total });
+    $("#btn-embed").disabled = !pages.length;
+    if (!pages.length) {
+      $("#blocks").innerHTML = "";
+      $("#blocks").appendChild(
+        el("div", "embed-hint", "No pages OCR'd yet — they appear here as each page finishes."));
+      return;
+    }
+    if (sel.pageIndex >= pages.length) sel.pageIndex = pages.length - 1;
+    renderTabs();
+    renderPage();
+  } catch (e) {
+    // Only close the editor if the job is really gone; a transient network
+    // error shouldn't kick the user out of the workspace.
+    if (e && (e.status === 404 || /not found/i.test(String(e.message)))) {
+      setSelectedJob(null);
+    }
   }
 }
 
-function startLogPolling() {
-  stopLogPolling();
-  state.logTimer = setInterval(refreshLogs, 2000);
-}
-
-function stopLogPolling() {
-  if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
-}
-
-/* ---------- page tabs ---------- */
 function renderTabs() {
   const wrap = $("#page-tabs");
   wrap.innerHTML = "";
-  state.pages.forEach((_, i) => {
-    const tab = el("button", "page-tab" + (i === state.pageIndex ? " active" : ""), (i + 1));
-    tab.onclick = () => { state.pageIndex = i; renderTabs(); renderPage(); };
+  const sel = state.sel;
+  if (!sel) return;
+  sel.pages.forEach((_, i) => {
+    const tab = el("button", "page-tab" + (i === sel.pageIndex ? " active" : ""), String(i + 1));
+    tab.onclick = () => { sel.pageIndex = i; renderTabs(); renderPage(); };
     wrap.appendChild(tab);
   });
-  $("#btn-prev").disabled = state.pageIndex === 0;
-  $("#btn-next").disabled = state.pageIndex >= state.pages.length - 1;
+  $("#btn-prev").disabled = sel.pageIndex === 0;
+  $("#btn-next").disabled = sel.pageIndex >= sel.pages.length - 1;
 }
 
-/* ---------- page render ---------- */
 function renderPage() {
-  const page = state.pages[state.pageIndex];
+  const sel = state.sel;
+  if (!sel) return;
+  const page = sel.pages[sel.pageIndex];
   if (!page) return;
 
   const img = $("#preview-img");
-  const zoomed = state.pages.length === 1 ? false : true;
-  img.src = `/api/pages/${state.jobId}/${page.page_index}/image?ts=${Date.now()}`;
+  img.src = `/api/pages/${sel.jobId}/${page.page_index}/image?ts=${Date.now()}`;
   img.onload = () => drawOverlay(page);
   img.onerror = () => {};
 
@@ -464,17 +505,21 @@ function buildBlockEditor(block, bi) {
   textarea.placeholder = "Text…";
   textarea.oninput = (e) => {
     textarea.classList.add("edit");
-    const page = state.pages[state.pageIndex];
+    const sel = state.sel;
+    if (!sel) return;
+    const page = sel.pages[sel.pageIndex];
     const target = page.blocks[bi];
     if (target) target.text = e.target.value;
-    state.embedded = false;
+    sel.embedded = false;
     setStatus("dirty", "running");
   };
 
   const del = el("button", "del", "✕");
   del.title = "Remove block";
   del.onclick = () => {
-    state.pages[state.pageIndex].blocks.splice(bi, 1);
+    const sel = state.sel;
+    if (!sel) return;
+    sel.pages[sel.pageIndex].blocks.splice(bi, 1);
     renderPage();
   };
 
@@ -491,7 +536,7 @@ function buildBlockEditor(block, bi) {
   fsSlider.oninput = () => {
     block.font_scale = parseFloat(fsSlider.value);
     fsVal.textContent = block.font_scale.toFixed(2) + "×";
-    state.embedded = false;
+    if (state.sel) state.sel.embedded = false;
     setStatus("dirty", "running");
   };
   // Reset to auto
@@ -501,7 +546,8 @@ function buildBlockEditor(block, bi) {
     block.font_scale = 1.0;
     fsSlider.value = "1.0";
     fsVal.textContent = "1.00×";
-    state.embedded = false; setStatus("dirty", "running");
+    if (state.sel) state.sel.embedded = false;
+    setStatus("dirty", "running");
   };
   fsRow.appendChild(fsLabel);
   fsRow.appendChild(fsSlider);
@@ -516,24 +562,27 @@ function buildBlockEditor(block, bi) {
   return wrapper;
 }
 
-/* ---------- embed ---------- */
+/* ---------- embed (selected job) ---------- */
 async function embed() {
-  if (!state.jobId || !state.pages.length) return;
+  const sel = state.sel;
+  if (!sel || !sel.pages.length) return;
   $("#btn-embed").disabled = true;
   $("#embed-status").textContent = "Embedding…";
   try {
-    const out = await api(`/api/embed/${state.jobId}`, {
+    const out = await api(`/api/embed/${sel.jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: state.jobId, pages: state.pages, embed_font: state.embedFont }),
+      body: JSON.stringify({ job_id: sel.jobId, pages: sel.pages, embed_font: state.embedFont }),
     });
-    state.embedded = true;
+    sel.embedded = true;
     setStatus("embedded", "done");
     const link = $("#download-link");
     link.classList.remove("hidden");
     link.href = out.url;
     link.textContent = "Download " + out.filename;
     $("#embed-status").textContent = "Embedded. Text is now selectable/searchable.";
+    const job = jobById(sel.jobId);
+    if (job) { job.has_embedded = true; renderJobs(); }
   } catch (e) {
     $("#embed-status").textContent = "Embed failed: " + e.message;
   } finally {
@@ -543,15 +592,17 @@ async function embed() {
 
 /* ---------- interactive font-size debug ---------- */
 async function previewOverlay() {
-  const page = state.pages[state.pageIndex];
-  if (!page || !state.jobId) return;
+  const sel = state.sel;
+  if (!sel) return;
+  const page = sel.pages[sel.pageIndex];
+  if (!page) return;
   $("#preview-img").classList.add("loading");
   try {
     // POST current pages (with font_scale) so the overlay reflects the sliders.
-    const resp = await fetch(`/api/preview/${state.jobId}/${page.page_index}`, {
+    const resp = await fetch(`/api/preview/${sel.jobId}/${page.page_index}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pages: state.pages, embed_font: state.embedFont }),
+      body: JSON.stringify({ pages: sel.pages, embed_font: state.embedFont }),
     });
     if (!resp.ok) throw new Error(await resp.text());
     const blob = await resp.blob();
@@ -567,13 +618,15 @@ async function previewOverlay() {
 }
 
 async function loadFontInfo() {
-  const page = state.pages[state.pageIndex];
-  if (!page || !state.jobId) return;
+  const sel = state.sel;
+  if (!sel) return;
+  const page = sel.pages[sel.pageIndex];
+  if (!page) return;
   try {
-    const data = await api(`/api/fontinfo/${state.jobId}/${page.page_index}`, {
+    const data = await api(`/api/fontinfo/${sel.jobId}/${page.page_index}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pages: state.pages, embed_font: state.embedFont }),
+      body: JSON.stringify({ pages: sel.pages, embed_font: state.embedFont }),
     });
     // Refresh derived-fs annotations in the editor blocks.
     (data.blocks || []).forEach((fi) => {
@@ -584,19 +637,19 @@ async function loadFontInfo() {
 }
 
 function downloadDataset() {
-  if (!state.pages.length) return;
+  const sel = state.sel;
+  if (!sel || !sel.pages.length) return;
   const ds = {
-    job_id: state.jobId,
+    job_id: sel.jobId,
     generated_at: new Date().toISOString(),
     adapter_font_scale_def: "font_scale multiplies the auto font size",
-    pages: state.pages,
+    pages: sel.pages,
   };
   const blob = new Blob([JSON.stringify(ds, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  const stem = (state.jobId || "job");
   a.href = url;
-  a.download = `ocr_font_dataset_${stem}.json`;
+  a.download = `ocr_font_dataset_${sel.jobId}.json`;
   a.click();
   URL.revokeObjectURL(url);
 }
@@ -636,6 +689,37 @@ async function saveSettings() {
   }
 }
 
+/* ---------- debug logs ---------- */
+async function refreshLogs() {
+  try {
+    const data = await api("/api/logs");
+    const box = $("#log-box");
+    box.textContent = (data.lines || []).join("\n");
+    box.scrollTop = box.scrollHeight;
+  } catch { /* ignore */ }
+}
+
+function toggleLogs() {
+  const panel = $("#debug-panel");
+  const hidden = panel.classList.contains("hidden");
+  panel.classList.toggle("hidden");
+  if (hidden) {
+    refreshLogs();
+    if ($("#auto-log").checked) startLogPolling();
+  } else {
+    stopLogPolling();
+  }
+}
+
+function startLogPolling() {
+  stopLogPolling();
+  state.logTimer = setInterval(refreshLogs, 2000);
+}
+
+function stopLogPolling() {
+  if (state.logTimer) { clearInterval(state.logTimer); state.logTimer = null; }
+}
+
 /* ---------- wire up ---------- */
 async function loadFonts() {
   const sel = $("#embed-font");
@@ -655,16 +739,14 @@ async function loadFonts() {
 }
 
 async function init() {
-  // 任务（OCR / 重试）进行中关闭标签页 → 浏览器原生关闭确认提示。
-  // 使用原生 beforeunload，不引入自定义文案（新版浏览器会忽略 returnValue 文本，
-  // 显示各自固定的提示）。state.running 为 false 时不拦截。
+  // 有任务运行时关闭标签页 → 浏览器原生关闭确认提示（任意一个任务在跑都会提示）。
   window.addEventListener("beforeunload", (e) => {
-    if (!state.running) return;
+    if (!anyRunning()) return;
     e.preventDefault();
     e.returnValue = "";
   });
 
-  // dropzone
+  // dropzone（可随时上传，支持多任务并行）
   const drop = $("#drop-zone");
   ["dragenter", "dragover"].forEach((ev) =>
     drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("dragover"); }));
@@ -673,16 +755,12 @@ async function init() {
   drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
   $("#file-input").addEventListener("change", (e) => handleFile(e.target.files[0]));
 
-  $("#btn-prev").onclick = () => { if (state.pageIndex > 0) { state.pageIndex--; renderTabs(); renderPage(); } };
-  $("#btn-next").onclick = () => { if (state.pageIndex < state.pages.length - 1) { state.pageIndex++; renderTabs(); renderPage(); } };
+  $("#btn-prev").onclick = () => { const s = state.sel; if (s && s.pageIndex > 0) { s.pageIndex--; renderTabs(); renderPage(); } };
+  $("#btn-next").onclick = () => { const s = state.sel; if (s && s.pageIndex < s.pages.length - 1) { s.pageIndex++; renderTabs(); renderPage(); } };
   $("#zoom").oninput = (e) => { state.zoom = parseFloat(e.target.value); renderPage(); };
   $("#btn-embed").onclick = embed;
   $("#btn-preview").onclick = previewOverlay;
   $("#btn-dataset").onclick = downloadDataset;
-  $("#retry-btn").onclick = retryOcr;
-  $("#stop-btn").onclick = stopOcr;
-  $("#partial-btn").onclick = downloadPartial;
-  $("#clear-btn").onclick = clearJob;
   $("#btn-settings").onclick = openSettings;
   $("#btn-logs").onclick = toggleLogs;
   $("#btn-refresh-logs").onclick = refreshLogs;
@@ -693,7 +771,7 @@ async function init() {
   $("#adapter").onchange = updateAdapterUI;
   $("#embed-font").onchange = (e) => {
     state.embedFont = e.target.value;
-    state.embedded = false;
+    if (state.sel) state.sel.embedded = false;
     setStatus("dirty", "running");
   };
   updateAdapterUI();
@@ -702,8 +780,8 @@ async function init() {
   try { await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }
 
-  // Restore the previous session's OCR task, if any (resumes running jobs too).
-  restoreJob();
+  // The server knows all jobs — show every one of them (running ones get SSE).
+  loadJobs();
 }
 
 init();

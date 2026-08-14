@@ -198,6 +198,12 @@ def clear_ocr(job_id: str) -> dict:
     return {"ok": True, "job_id": job_id}
 
 
+@app.get("/api/jobs")
+def jobs_list() -> dict:
+    """List every OCR job on the server (running or finished), newest first."""
+    return {"jobs": ocr_service.list_jobs()}
+
+
 @app.get("/api/ocr/stream/{job_id}")
 async def stream(job_id: str):
     job = ocr_service.get_job(job_id)

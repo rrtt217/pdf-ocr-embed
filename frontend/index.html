@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PDF OCR Embed</title>
-  <link rel="stylesheet" href="/static/style.css?v=6" />
+  <link rel="stylesheet" href="/static/style.css?v=7" />
 </head>
 <body>
   <header>
@@ -39,27 +39,24 @@
           <input id="concurrency" type="number" min="1" max="32" value="1" />
         </label>
         <span class="hint" id="adapter-hint">Higher = faster on many pages, but more concurrent API calls.</span>
+        <span class="hint" id="upload-msg"></span>
       </div>
     </section>
 
-    <!-- Progress -->
-    <section id="progress-section" class="card hidden">
+    <!-- Jobs: everything the server knows about, running or finished.
+         Several jobs can run in parallel; each has its own card + live SSE. -->
+    <section id="jobs-section" class="card hidden">
       <div class="row">
-        <span id="progress-label">Starting…</span>
-        <span id="progress-count">0 / 0</span>
+        <h2>Jobs</h2>
+        <span class="hint">All tasks on the server — close this page and come back anytime, they survive.</span>
       </div>
-      <div class="bar"><div id="progress-fill" class="fill"></div></div>
-      <div class="row retry-row">
-        <button id="stop-btn" class="warn hidden">Stop</button>
-        <button id="retry-btn" class="primary hidden">Retry remaining</button>
-        <button id="partial-btn" class="primary hidden">Download partial</button>
-        <button id="clear-btn" class="warn hidden" title="Delete this job (results and files)">Clear job</button>
-      </div>
+      <div id="jobs-list"></div>
     </section>
 
     <!-- Page list + preview -->
     <section id="workspace" class="hidden">
       <div class="toolbar">
+        <span id="editing-job"></span>
         <button id="btn-prev">◀</button>
         <span id="page-tabs"></span>
         <button id="btn-next">▶</button>
@@ -146,6 +143,6 @@
     <pre id="log-box"></pre>
   </section>
 
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

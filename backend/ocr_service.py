@@ -83,6 +83,29 @@ def get_job(job_id: str) -> Optional[dict]:
         return _JOBS.get(job_id)
 
 
+def list_jobs() -> List[dict]:
+    """Summaries of every job currently held by the server (newest first).
+
+    The frontend fetches this on page load — the server is the single source
+    of truth for what tasks exist, so nothing needs to be remembered client-side.
+    """
+    with _jobs_lock:
+        jobs = []
+        for j in _JOBS.values():
+            jobs.append({
+                "id": j["id"],
+                "filename": j["filename"],
+                "status": j["status"],
+                "current": j["current"],
+                "total": j["num_pages"],
+                "error": j.get("error"),
+                "has_embedded": bool(j.get("embedded_path")),
+                "created": j["created"],
+            })
+        jobs.sort(key=lambda j: j["created"], reverse=True)
+        return jobs
+
+
 def clear_job(job_id: str) -> bool:
     """Fully remove a job: drop from memory AND delete its on-disk artifacts.
 
