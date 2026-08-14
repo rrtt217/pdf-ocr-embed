@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shutil
 import threading
 import time
 import uuid
@@ -80,6 +81,38 @@ def create_job(filename: str, file_bytes: bytes) -> dict:
 def get_job(job_id: str) -> Optional[dict]:
     with _jobs_lock:
         return _JOBS.get(job_id)
+
+
+def clear_job(job_id: str) -> bool:
+    """Fully remove a job: drop from memory AND delete its on-disk artifacts.
+
+    Safe to call for any job (running or not) — the cancel event is set first
+    so a still-running OCR thread stops respecting future work. Returns False
+    if the job does not exist.
+    """
+    job = get_job(job_id)
+    if job is None:
+        log.warning("clear: job %s not found", job_id)
+        return False
+    job["cancel_event"].set()
+    with _jobs_lock:
+        _JOBS.pop(job_id, None)
+    with _streams_lock:
+        _STREAMS.pop(job_id, None)
+    # Best-effort removal of the job's source PDF / page renders / embedded output.
+    try:
+        img_dir = job.get("img_dir")
+        if img_dir and Path(img_dir).exists():
+            shutil.rmtree(img_dir, ignore_errors=True)
+        for key in ("embedded_path", "thumb_path"):
+            p = job.get(key)
+            if p and Path(p).exists():
+                Path(p).unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        log.exception("clear_job %s: on-disk cleanup failed", job_id)
+    log.info("job %s cleared (status was %s, %d pages kept)",
+             job_id, job.get("status"), sum(1 for p in job.get("pages", []) if p))
+    return True
 
 
 def _set(job: dict, **kw) -> None:

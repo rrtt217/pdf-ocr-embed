@@ -190,6 +190,14 @@ def stop_ocr(job_id: str) -> dict:
             "current": job["current"], "total": job["num_pages"]}
 
 
+@app.post("/api/ocr/clear/{job_id}")
+def clear_ocr(job_id: str) -> dict:
+    """Fully remove a job: in-memory state, its work dir and embedded output."""
+    if not ocr_service.clear_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"ok": True, "job_id": job_id}
+
+
 @app.get("/api/ocr/stream/{job_id}")
 async def stream(job_id: str):
     job = ocr_service.get_job(job_id)
@@ -258,7 +266,8 @@ def get_pages(job_id: str) -> dict:
     # Filter out None (not-yet-done / failed) entries so the frontend gets a
     # compact list of completed pages keyed by their `page_index` field.
     pages = [p for p in ocr_service.get_pages(job_id) if p is not None]
-    return {"status": job["status"], "pages": pages, "total": job["num_pages"]}
+    return {"status": job["status"], "pages": pages, "total": job["num_pages"],
+            "has_embedded": bool(job.get("embedded_path"))}
 
 
 @app.post("/api/pages/{job_id}/{page_index}")

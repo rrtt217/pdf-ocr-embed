@@ -18,6 +18,16 @@ const state = {
   embedFont: "",        // selected system font name for the text layer
 };
 
+/* Last job id is persisted so a tab reload restores the in-progress task
+   (jobs live server-side; only the id needs remembering). */
+const LS_JOB_KEY = "pdfocr.jobId.v1";
+function saveJobId() {
+  try {
+    if (state.jobId) localStorage.setItem(LS_JOB_KEY, state.jobId);
+    else localStorage.removeItem(LS_JOB_KEY);
+  } catch { /* storage unavailable — resumption simply won't work */ }
+}
+
 /* ---------- helpers ---------- */
 function setStatus(text, cls) {
   const el = $("#conn-status");
@@ -99,12 +109,16 @@ async function handleFile(file) {
   try {
     const data = await api("/api/ocr/upload", { method: "POST", body: fd });
     state.jobId = data.job_id;
+    saveJobId();
     state.pages = [];
     state.pageIndex = 0;
     state.embedded = false;
     state.running = true;
     setStatus("running", "running");
     $("#stop-btn").classList.remove("hidden");
+    $("#retry-btn").classList.add("hidden");
+    $("#partial-btn").classList.add("hidden");
+    $("#clear-btn").classList.add("hidden");
     $("#progress-label").textContent =
       `OCR running (parallel: ${data.concurrency || 1}) …`;
     connectStream(state.jobId);
@@ -160,6 +174,7 @@ function showOcrError(message) {
   $("#progress-label").textContent = "OCR error: " + message;
   $("#retry-btn").classList.remove("hidden");
   $("#partial-btn").classList.toggle("hidden", state.pages.length === 0);
+  $("#clear-btn").classList.remove("hidden");
 }
 
 function showStopped(message) {
@@ -170,6 +185,87 @@ function showStopped(message) {
   $("#progress-label").textContent = `${message} (${done} page(s) completed)`;
   $("#retry-btn").classList.remove("hidden");
   $("#partial-btn").classList.toggle("hidden", done === 0);
+  $("#clear-btn").classList.remove("hidden");
+}
+
+/* ---------- job restore / clear ---------- */
+
+async function restoreJob() {
+  const jobId = localStorage.getItem(LS_JOB_KEY);
+  if (!jobId) return;
+  let data;
+  try {
+    data = await api(`/api/pages/${jobId}`);
+  } catch (e) {
+    // Job no longer exists server-side (e.g. server restarted) — drop stale id.
+    localStorage.removeItem(LS_JOB_KEY);
+    return;
+  }
+  state.jobId = jobId;
+  state.pages = (data.pages || []).filter(p => p);
+  const st = data.status;
+
+  if (st === "running" || st === "retrying" || st === "uploaded") {
+    // Still active — resume live progress over SSE.
+    state.running = true;
+    state.embedded = false;
+    setStatus(st, "running");
+    $("#progress-section").classList.remove("hidden");
+    $("#stop-btn").classList.remove("hidden");
+    $("#retry-btn").classList.add("hidden");
+    $("#partial-btn").classList.add("hidden");
+    $("#clear-btn").classList.add("hidden");
+    const total = data.total || state.pages.length;
+    const cur = state.pages.length;
+    $("#progress-fill").style.width = total ? (cur / total) * 100 + "%" : "2%";
+    $("#progress-count").textContent = `${cur} / ${total}`;
+    $("#progress-label").textContent =
+      `Restored job (${cur}/${total} pages done) — resuming…`;
+    connectStream(jobId);
+  } else if (st === "done" || st === "embedded") {
+    await finishOcr();  // hides progress, shows workspace with the completed pages
+    if (st === "embedded" && data.has_embedded) {
+      const link = $("#download-link");
+      link.classList.remove("hidden");
+      link.href = `/api/download/${jobId}.pdf`;
+      link.textContent = "Download embedded PDF";
+      state.embedded = true;
+      setStatus("embedded", "done");
+    }
+  } else if (st === "stopped") {
+    showStopped("OCR stopped earlier (recovered from last session)");
+  } else if (st === "error") {
+    showOcrError("OCR failed earlier");
+  }
+}
+
+async function clearJob() {
+  if (!state.jobId) return;
+  if (!confirm("Delete this job entirely?\n\nThis removes the OCR results, "
+               + "the uploaded PDF's working files and any embedded PDF.")) {
+    return;
+  }
+  try {
+    await api(`/api/ocr/clear/${state.jobId}`, { method: "POST" });
+  } catch (e) { /* job may already be gone — proceed to reset the UI */ }
+  if (state.es) { state.es.close(); state.es = null; }
+  state.jobId = null;
+  state.pages = [];
+  state.pageIndex = 0;
+  state.running = false;
+  state.embedded = false;
+  saveJobId();  // removes the stored id
+  setStatus("idle", "");
+  $("#progress-section").classList.add("hidden");
+  $("#workspace").classList.add("hidden");
+  $("#stop-btn").classList.add("hidden");
+  $("#retry-btn").classList.add("hidden");
+  $("#partial-btn").classList.add("hidden");
+  $("#clear-btn").classList.add("hidden");
+  $("#download-link").classList.add("hidden");
+  $("#btn-embed").disabled = true;
+  const drop = $("#drop-zone");
+  if (drop) drop.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 async function stopOcr() {
@@ -187,6 +283,8 @@ async function stopOcr() {
     $("#progress-label").textContent = `Stopped (${done} page(s) completed)`;
     $("#retry-btn").classList.remove("hidden");
     $("#partial-btn").classList.toggle("hidden", done === 0);
+    $("#clear-btn").classList.remove("hidden");
+    $("#stop-btn").disabled = false;
   } catch (e) {
     $("#stop-btn").disabled = false;
     $("#progress-label").textContent = "Stop failed: " + e.message;
@@ -198,6 +296,7 @@ async function retryOcr() {
   setStatus("retrying", "running");
   $("#retry-btn").classList.add("hidden");
   $("#partial-btn").classList.add("hidden");
+  $("#clear-btn").classList.add("hidden");
   $("#stop-btn").classList.remove("hidden");
   $("#stop-btn").disabled = false;
   $("#progress-label").textContent = "Retrying (only missing pages)…";
@@ -556,6 +655,15 @@ async function loadFonts() {
 }
 
 async function init() {
+  // 任务（OCR / 重试）进行中关闭标签页 → 浏览器原生关闭确认提示。
+  // 使用原生 beforeunload，不引入自定义文案（新版浏览器会忽略 returnValue 文本，
+  // 显示各自固定的提示）。state.running 为 false 时不拦截。
+  window.addEventListener("beforeunload", (e) => {
+    if (!state.running) return;
+    e.preventDefault();
+    e.returnValue = "";
+  });
+
   // dropzone
   const drop = $("#drop-zone");
   ["dragenter", "dragover"].forEach((ev) =>
@@ -574,6 +682,7 @@ async function init() {
   $("#retry-btn").onclick = retryOcr;
   $("#stop-btn").onclick = stopOcr;
   $("#partial-btn").onclick = downloadPartial;
+  $("#clear-btn").onclick = clearJob;
   $("#btn-settings").onclick = openSettings;
   $("#btn-logs").onclick = toggleLogs;
   $("#btn-refresh-logs").onclick = refreshLogs;
@@ -592,6 +701,9 @@ async function init() {
 
   try { await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }
+
+  // Restore the previous session's OCR task, if any (resumes running jobs too).
+  restoreJob();
 }
 
 init();
