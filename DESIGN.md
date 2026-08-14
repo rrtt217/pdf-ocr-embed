@@ -65,6 +65,7 @@
   - `unlimited_ocr_adapter`：解析 `<|det|>` 标记（默认）。
   - 预留接口：`tesseract_adapter` / `paddle_adapter` / `generic_openai_adapter`
     （把任意 OpenAI 兼容多模态模型的输出按 bbox 规范解析）。
+  - **编写新 adapter 的完整步骤与检查清单见 `AGENTS.md`（面向 AI 代理的权威指南）。**
 - bbox 坐标统一转换为**原始像素空间**（adapter 内完成 1000 画布 → 像素换算，
   换算所需原图宽高由调用方传入）。
 

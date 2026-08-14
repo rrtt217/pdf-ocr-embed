@@ -6,13 +6,14 @@
 
 本项目是**完全独立的程序**：API key 通过外部配置提供，代码里不硬编码任何密钥。
 
-> **AI / Vibe coding 提示**：本项目的代码、设计与其他文档全部由 **Vibe coding** 生成
-> （主要使用 DeepSeek V4 Flash 编写与迭代）。提交前请人工审视一遍代码，尤其注意
-> 安全性、边界条件与依赖版本；测试要充分，别盲目信任 AI 输出。
+> **AI / Vibe coding 提示**：本项目的代码、设计与其他文档由 **Vibe coding** 生成
+> （主要使用 DeepSeek V4 Flash 编写与迭代）。使用者请自行验证；二次开发时多审视
+> 安全性、边界条件与依赖版本，别盲目信任 AI 输出。
+>
+> **给 AI Agent 的快速入口**：`AGENTS.md` 是为 AI 编码代理编写的项目指南（架构、
+> 硬性约定，以及**如何编写新的 OCR adapter** 的完整步骤与检查清单）。改动前请先读它。
 
 ---
-
-## 特性
 
 - **通用 OCR 抽象（Adapter 模式）**：后端统一走 `OcrSource` 接口，每个 OCR 引擎
   一个 adapter，把各自的原始输出解析为归一化的 `OcrPage`（bbox 统一为**原始像素坐标**）。
@@ -151,6 +152,7 @@ pdf-ocr-embed/
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
+├── AGENTS.md     # 面向 AI 编码代理的项目指南（含如何编写 OCR adapter）
 └── DESIGN.md
 ```
 
