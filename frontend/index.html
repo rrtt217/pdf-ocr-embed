@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PDF OCR Embed</title>
+  <link rel="stylesheet" href="/static/style.css?v=4" />
+</head>
+<body>
+  <header>
+    <h1>PDF OCR Embed</h1>
+    <div class="header-actions">
+      <span id="conn-status" class="pill">idle</span>
+      <button id="btn-logs" class="small">Logs</button>
+      <button id="btn-settings">Settings</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Upload / landing -->
+    <section id="upload-zone" class="card">
+      <input type="file" id="file-input" accept="application/pdf" hidden />
+      <label id="drop-zone" for="file-input">
+        <strong>Drop a scanned PDF here</strong>
+        <span>or click to choose a file. Pages are rasterized, OCR'd, and made searchable.</span>
+      </label>
+      <div class="upload-opts">
+        <label class="inline-label">OCR engine
+          <select id="adapter">
+            <option value="unlimited">Unlimited OCR (API)</option>
+            <option value="tesseract">Tesseract (local)</option>
+            <option value="generic_openai">Generic OpenAI (API)</option>
+          </select>
+        </label>
+        <label class="inline-label" id="tess-lang-row">Tesseract language
+          <input id="tess-lang" type="text" placeholder="chi_sim" />
+        </label>
+        <label class="inline-label">Parallel OCR pages
+          <input id="concurrency" type="number" min="1" max="32" value="1" />
+        </label>
+        <span class="hint" id="adapter-hint">Higher = faster on many pages, but more concurrent API calls.</span>
+      </div>
+    </section>
+
+    <!-- Progress -->
+    <section id="progress-section" class="card hidden">
+      <div class="row">
+        <span id="progress-label">Starting…</span>
+        <span id="progress-count">0 / 0</span>
+      </div>
+      <div class="bar"><div id="progress-fill" class="fill"></div></div>
+      <div class="row retry-row">
+        <button id="stop-btn" class="warn hidden">Stop</button>
+        <button id="retry-btn" class="primary hidden">Retry remaining</button>
+        <button id="partial-btn" class="primary hidden">Download partial</button>
+      </div>
+    </section>
+
+    <!-- Page list + preview -->
+    <section id="workspace" class="hidden">
+      <div class="toolbar">
+        <button id="btn-prev">◀</button>
+        <span id="page-tabs"></span>
+        <button id="btn-next">▶</button>
+        <span id="zoom-label"></span>
+        <input id="zoom" type="range" min="50" max="200" value="100" />
+      </div>
+      <div id="panes">
+        <div id="editor-pane" class="pane">
+          <h3>Editable text blocks</h3>
+          <div id="blocks"></div>
+        </div>
+        <div id="preview-pane" class="pane">
+          <h3>Page preview</h3>
+          <div id="preview-wrap">
+            <img id="preview-img" alt="page preview" />
+            <canvas id="overlay-canvas"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="embed-bar">
+        <button id="btn-embed" class="primary" disabled>Embed invisible text</button>
+        <a id="download-link" class="hidden" download>Download embedded PDF</a>
+        <span id="embed-status"></span>
+      </div>
+    </section>
+  </main>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal hidden">
+    <div class="modal-box">
+      <h2>OCR Settings</h2>
+      <p class="hint">
+        Leave fields blank to fall back to environment variables (
+        <code>OCR_API_KEY</code> / <code>OCR_BASE_URL</code> / <code>OCR_MODEL</code>
+        / <code>OCR_PROVIDER</code>, <code>USTC_API_KEY</code> alias) or a local
+        <code>ocr_config.json</code>. A masked key means one is already configured.
+      </p>
+      <label>Provider preset
+        <select id="set-provider">
+          <option value="ustc">USTC (OpenAI-compatible)</option>
+          <option value="openai">OpenAI</option>
+          <option value="custom">Custom</option>
+        </select>
+      </label>
+      <label>Base URL
+        <input id="set-baseurl" type="url" placeholder="https://api.llm.ustc.edu.cn/v1" />
+      </label>
+      <label>Model
+        <input id="set-model" type="text" placeholder="glm-4v-flash" />
+      </label>
+      <label>API Key
+        <input id="set-apikey" type="password" placeholder="sk-… (masked if already set)" />
+      </label>
+      <div class="modal-actions">
+        <button id="btn-settings-save" class="primary">Save</button>
+        <button id="btn-settings-cancel">Cancel</button>
+      </div>
+      <div id="settings-status"></div>
+    </div>
+  </div>
+
+  <!-- Debug log panel -->
+  <section id="debug-panel" class="card hidden">
+    <div class="row">
+      <h3>Debug logs</h3>
+      <div>
+        <button id="btn-refresh-logs" class="small">Refresh</button>
+        <label class="inline-check"><input id="auto-log" type="checkbox" checked /> Auto</label>
+      </div>
+    </div>
+    <pre id="log-box"></pre>
+  </section>
+
+  <script src="/static/app.js?v=4"></script>
+</body>
+</html>
