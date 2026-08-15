@@ -222,7 +222,8 @@ pdf-ocr-embed/
 ├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # agent-oriented project guide (incl. how to write an OCR adapter)
-└── DESIGN.md
+├── DESIGN.md
+└── FEATURE_IDEAS.md  # brainstormed candidates for future features (not a schedule)
 ```
 
 ---
