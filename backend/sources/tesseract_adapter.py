@@ -8,16 +8,16 @@ height`` are pixel coordinates from the page image), so no canvas remapping
 is needed — unlike the normalized 1000x1000 canvas used by the
 ``unlimited_ocr_adapter``.
 
-Configuration (all optional, sensible defaults):
-    lang   -> OCR_TESS_LANG   env / ``tess_lang``   in ocr_config.json
-              e.g. "eng", "chi_sim", "chi_sim+eng"
-    psm    -> OCR_TESS_PSM    env / ``tess_psm``    (page segmentation mode)
-    oem    -> OCR_TESS_OEM    env / ``tess_oem``    (engine mode)
-    tessdata_dir -> OCR_TESSDATA_DIR env / ``tessdata_dir``
-    config / extra flags -> OCR_TESS_CONFIG env / ``tess_config``
+Configuration (all optional, sensible defaults, set in
+``backend/ocr_config.toml``):
+    lang   -> ``tess_lang``   e.g. "eng", "chi_sim", "chi_sim+eng"
+    psm    -> ``tess_psm``    (page segmentation mode)
+    oem    -> ``tess_oem``    (engine mode)
+    tessdata_dir -> ``tessdata_dir``
+    config / extra flags -> ``tess_config``
 
-If the ``tesseract`` binary is not on ``PATH``, set ``OCR_TESS_CMD`` (or
-``tess_cmd``) to its absolute path.
+If the ``tesseract`` binary is not on ``PATH``, set ``tess_cmd`` to its
+absolute path.
 """
 from __future__ import annotations
 
@@ -82,8 +82,7 @@ class TesseractAdapter(OcrSource):
         self.tessdata_dir = tessdata_dir or cfg.get("tessdata_dir") or None
         self.tess_cmd = tess_cmd or cfg.get("tess_cmd") or None
         self.min_line_fontsize = float(
-            min_line_fontsize if min_line_fontsize is not None
-            else os.environ.get("OCR_TESS_MIN_LINE_H") or "0")
+            min_line_fontsize if min_line_fontsize is not None else 0.0)
 
         if self.tessdata_dir:
             os.environ.setdefault("TESSDATA_PREFIX", self.tessdata_dir)
@@ -142,7 +141,8 @@ class TesseractAdapter(OcrSource):
             raise UnavailableError(
                 "Tesseract binary not found. Install Tesseract (e.g. "
                 "`apt install tesseract-ocr` / `dnf install tesseract`) and "
-                "ensure it is on PATH, or set OCR_TESS_CMD."
+                "ensure it is on PATH, or set `tess_cmd` in "
+                "backend/ocr_config.toml."
             ) from exc
         except Exception as exc:  # noqa: BLE001
             msg = str(exc)
@@ -151,7 +151,8 @@ class TesseractAdapter(OcrSource):
                 raise UnavailableError(
                     f"Language data unavailable for {self.lang}. Install the "
                     f"matching langpack (e.g. tesseract-ocr-chi-sim / "
-                    f"tesseract-langpack-chi_sim) or set OCR_TESSDATA_DIR."
+                    f"tesseract-langpack-chi_sim) or set `tessdata_dir` in "
+                    f"backend/ocr_config.toml."
                 ) from exc
             raise RuntimeError(f"Tesseract OCR failed: {msg}") from exc
 

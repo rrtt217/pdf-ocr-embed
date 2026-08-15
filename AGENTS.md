@@ -28,11 +28,17 @@ httpx. No CUDA/NVIDIA. **All coordinates are integers in raw pixel space**
   (e.g. a 1000×1000 normalized canvas) back to raw pixels *before* returning.
 - Adapters return a normalized `backend.models.OcrPage`; the rest of the backend
   must **never** depend on one engine's raw output format.
-- API keys/providers come only from external config — never hardcode. See
-  `backend/config.py::resolve()` (env > local `ocr_config.json`/.env > WebUI).
+- API keys/providers come only from external config — never hardcode. Base
+  config is TOML: `backend/config.py::resolve()` reads `backend/ocr_config.toml`
+  (the WebUI also persists there). `OCR_*` environment variables are read by
+  `resolve()` as **highest-priority overrides** (`_ENV_ALIASES` maps names), so
+  they can override file/WebUI values for the running process. Do not reintroduce
+  JSON / `.env` file config, and never read `os.environ` outside
+  `backend/config.py` — env-sourced values should reach the rest of the code
+  through `resolve()`.
 - `max_tokens` must stay `< 32768`.
-- Runtime artifacts (`output/`, `work/`, `uploads/`, `.venv/`, `.env`,
-  `ocr_config.json`) are gitignored. Never commit keys or large sample PDFs.
+- Runtime artifacts (`output/`, `work/`, `uploads/`, `.venv/`,
+  `backend/ocr_config.toml`) are gitignored. Never commit keys or large sample PDFs.
 
 ## Layout
 
@@ -51,7 +57,7 @@ backend/
     generic_openai_adapter.py    # generic OpenAI-compatible vision model
 frontend/                 # index.html / style.css / app.js (no build)
 requirements.txt
-AGENTS.md  README.md  DESIGN.md  .env.example  .gitignore
+AGENTS.md  README.md  DESIGN.md  config.example.toml  .gitignore
 ```
 
 ## How to write a new OCR adapter (the main extension point)
@@ -120,24 +126,26 @@ Return one `OcrPage(page_index, width, height, blocks=[...])` per page.
 
 4. **Handle missing deps / unavailable engine** by raising
    `backend.sources.base.UnavailableError` with a clear setup message (e.g. "pip
-   install X" or "set OCR_TESS_CMD") — the backend surfaces this to the user
-   gracefully. Raise `RuntimeError` for genuine OCR failures, and log via
-   `logging.getLogger(__name__)`.
+   install X" or "set `tess_cmd` in backend/ocr_config.toml") — the backend
+   surfaces this to the user gracefully. Raise `RuntimeError` for genuine OCR
+   failures, and log via `logging.getLogger(__name__)`.
 
 ### Config convention
 
 Pull engine settings from `backend.config.resolve()` (a dict) and/or explicit
-constructor args, and mirror them into env vars / `ocr_config.json` keys. Follow
-the existing naming: `OCR_<ENGINE>_<SETTING>` env var ↔ `<setting>` config key
-(e.g. `OCR_TESS_LANG` ↔ `tess_lang`, `OCR_GENERIC_PROMPT` ↔ `generic_prompt`).
-Resolve defaults in `__init__`, not in `recognize_pixels`.
+constructor args, and mirror them into `backend/ocr_config.toml` keys. Follow
+the existing flat naming: `<engine>_<setting>` config key (e.g. `tess_lang`,
+`tess_cmd`, `generic_prompt`). The legacy `OCR_<ENGINE>_<SETTING>` environment
+variables are handled centrally by `resolve()` (see `_ENV_ALIASES`) and
+override the TOML/WebUI values — adapters must go through `resolve()`, never
+`os.environ`. Resolve defaults in `__init__`, not in `recognize_pixels`.
 
 ### Editing checklist
 
 - [ ] `name` registered in `factory._REGISTRY`; class import added there.
 - [ ] Every returned bbox is integer raw-pixel `[x1,y1,x2,y2]`, `x1<=x2`,`y1<=y2`.
 - [ ] Missing optional dependency raises `UnavailableError`, not a traceback.
-- [ ] No hardcoded keys/URLs; settings come from `resolve()` / args.
+- [ ] No hardcoded keys/URLs; settings come from `resolve()` / args (TOML config).
 - [ ] `close()` releases long-lived resources (httpx client, subprocess).
 - [ ] Works via `get_adapter("<name>")` and shows in `/api/health`.
 

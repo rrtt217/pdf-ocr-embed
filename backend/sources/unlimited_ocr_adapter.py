@@ -102,8 +102,8 @@ class UnlimitedOcrAdapter(OcrSource):
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
             raise RuntimeError(
-                "No OCR_API_KEY configured. Set OCR_API_KEY / USTC_API_KEY env var, "
-                "create ocr_config.json, or fill in the WebUI settings page."
+                "No api_key configured. Set `api_key` in backend/ocr_config.toml, "
+                "or fill in the WebUI settings page."
             )
         headers = {
             "Authorization": f"Bearer {self.api_key}",

@@ -9,10 +9,11 @@
 
 ## 独立运行
 - API key 与 provider 配置通过**外部方式**提供，代码里绝不硬编码：
-  - 环境变量：`OCR_API_KEY`、`OCR_BASE_URL`、`OCR_MODEL`（可选 `OCR_PROVIDER`）。
-  - 或项目本地配置文件 `ocr_config.json` / `.env`（用户自建，加入 .gitignore）。
-  - 或 WebUI 设置页里填写保存。
-- 配置优先级：CLI/环境变量 > 本地配置文件 > WebUI 默认值。
+  - 项目本地 TOML 配置文件 `backend/ocr_config.toml`（由根目录 `config.example.toml`
+    复制而来，已加入 .gitignore）。
+  - 或 WebUI 设置页里填写保存（保存写入同一个 TOML 文件）。
+- 旧版 `OCR_*` 环境变量继续支持，作为**最高优先级覆盖**：
+  `环境变量 > WebUI 会话内值 > TOML 文件`；JSON / `.env` 文件配置已移除。
 - 默认只给 USTC 的 OpenAI 兼容端点示例（`https://api.llm.ustc.edu.cn/v1`），
   但必须支持任意 OpenAI 兼容端点（通过 base_url + api_key + model 配置即可切引擎）。
 
@@ -86,7 +87,7 @@
 5. 进度条（SSE / WebSocket 每页进度事件）。
 
 ## API 设计（FastAPI）
-- `POST /api/settings` 保存/读取 provider 配置（key 打码，不落明文偏好；或存本地）。
+- `POST /api/settings` 保存/读取 provider 配置（key 打码显示；保存时写入 `backend/ocr_config.toml`）。
 - `POST /api/ocr/upload` 上传 PDF → 转图 → 逐页 OCR → 返回页级 JSON；
   长任务用 SSE `/api/ocr/stream` 推进度。
 - `GET /api/pages/{i}/image` 拿页面预览图。

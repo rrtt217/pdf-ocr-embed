@@ -10,8 +10,9 @@ Unlike the unlimited adapter, this does not assume the model emits the special
 ``<|det|>`` tokens; it uses a plain, model-agnostic JSON request that works
 with typical OpenAI-compatible chat-vision endpoints.
 
-Configuration is identical to the unlimited adapter:
-    OCR_API_KEY / OCR_BASE_URL / OCR_MODEL (+ optional OCR_PROVIDER)
+Configuration is identical to the unlimited adapter, set in
+``backend/ocr_config.toml``: ``api_key`` / ``base_url`` / ``model`` (+ optional
+``provider`` preset).
 """
 from __future__ import annotations
 
@@ -102,8 +103,8 @@ class GenericOpenAiAdapter(OcrSource):
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
             raise RuntimeError(
-                "No OCR_API_KEY configured. Set OCR_API_KEY / USTC_API_KEY env "
-                "var, create ocr_config.json, or fill in the WebUI settings page."
+                "No api_key configured. Set `api_key` in backend/ocr_config.toml, "
+                "or fill in the WebUI settings page."
             )
         headers = {
             "Authorization": f"Bearer {self.api_key}",

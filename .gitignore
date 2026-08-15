@@ -1,5 +1,6 @@
 # Local config / secrets
-ocr_config.json
+ocr_config.toml
+config.toml
 .env
 *.key
 

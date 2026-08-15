@@ -1,0 +1,46 @@
+# PDF OCR Embed — example configuration (TOML).
+#
+# Copy this file to `backend/ocr_config.toml` and fill in your values:
+#   cp config.example.toml backend/ocr_config.toml
+#
+# `backend/ocr_config.toml` is gitignored — never commit real API keys.
+# Every key below is optional; the backend falls back to built-in defaults
+# when a key is absent.
+#
+# Optional environment overrides: any `OCR_*` environment variable has the
+# HIGHEST priority and overrides this file and WebUI-saved values, e.g.
+#   OCR_API_KEY=sk-xxx OCR_MODEL=m2 python -m backend.main
+# Full mapping (see README.md): OCR_API_KEY / USTC_API_KEY (alias) -> api_key,
+# OCR_BASE_URL -> base_url, OCR_MODEL -> model, OCR_PROVIDER -> provider,
+# OCR_TESS_LANG/PSM/OEM/CONFIG -> tess_*, OCR_TESSDATA_DIR -> tessdata_dir,
+# OCR_TESS_CMD -> tess_cmd, OCR_GENERIC_PROMPT -> generic_prompt,
+# OCR_EMBED_FONT -> embed_font, OCR_CLEANUP_MAX_AGE_HOURS ->
+# cleanup_max_age_hours, OCR_CLEANUP_INTERVAL_HOURS -> cleanup_interval_hours,
+# OCR_LOG_LEVEL -> log_level.
+
+# --- Primary (OpenAI-compatible) OCR engine -------------------------------
+provider = "ustc"                            # provider preset: "ustc" | "openai" | "custom"
+api_key = "your-key-here"                    # required for API-based OCR engines
+base_url = "https://api.llm.ustc.edu.cn/v1"  # any OpenAI-compatible endpoint
+model = "unlimited-ocr"                      # model / deployment name
+
+# --- Tesseract adapter (local OCR, no API key) ----------------------------
+tess_lang = "chi_sim"                        # e.g. "eng", "chi_sim", "chi_sim+eng"
+# tess_psm = 3                               # page segmentation mode (0-13)
+# tess_oem = 3                               # engine mode (0-3)
+# tess_config = ""                           # extra tesseract CLI flags
+# tessdata_dir = "/usr/share/tesseract/tessdata"  # if tessdata moved from the default location
+# tess_cmd = "/usr/bin/tesseract"                 # if the tesseract binary is not on PATH
+
+# --- Generic OpenAI adapter (any OpenAI-compatible vision model) ----------
+# generic_prompt = "..."                     # override the default bbox-JSON prompt
+
+# --- Embedded-text font ----------------------------------------------------
+# embed_font = "Noto Sans SC"                # system font name or path for the text layer
+
+# --- Temp-file cleanup (see backend/cleanup.py) ----------------------------
+cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days
+cleanup_interval_hours = 6                   # background cleanup re-run interval
+
+# --- Logging (see backend/logging_config.py) -------------------------------
+log_level = "INFO"                           # "DEBUG" | "INFO" | "WARNING" | "ERROR"

@@ -12,9 +12,9 @@ This module:
     live job still references,
   - re-runs automatically on a background daemon thread.
 
-Settings (via ``backend.config.resolve()``):
-  cleanup_max_age_hours   (env OCR_CLEANUP_MAX_AGE_HOURS)   default 168 (7d)
-  cleanup_interval_hours  (env OCR_CLEANUP_INTERVAL_HOURS)  default 6
+Settings (via ``backend.config.resolve()``, from ``backend/ocr_config.toml``):
+  cleanup_max_age_hours   default 168 (7d)
+  cleanup_interval_hours  default 6
 
 Deletion safety:
   - Every path referenced by a live job (`img_dir`, `pdf_path`,

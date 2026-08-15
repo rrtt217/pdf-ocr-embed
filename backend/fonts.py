@@ -9,7 +9,7 @@ widths, and can be embedded into the output PDF as searchable text.
 
 This module scans a curated set of known system font paths and exposes a
 name -> font-spec map.  The user can select a font by name in the WebUI, or set
-``OCR_EMBED_FONT`` / the ``embed_font`` config key to a name or an absolute
+the ``embed_font`` key in ``backend/ocr_config.toml`` to a name or an absolute
 path; ``resolve_font`` also accepts any existing .ttf/.otf/.ttc path directly.
 """
 from __future__ import annotations

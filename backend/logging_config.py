@@ -1,15 +1,16 @@
 """Logging configuration for the PDF OCR Embed backend.
 
-Log level is controlled by the `OCR_LOG_LEVEL` environment variable
-(default INFO; use DEBUG for verbose tracing). Recent log lines are also
-kept in an in-memory ring buffer so they can be inspected via the
-`GET /api/logs` endpoint without digging through server stdout.
+Log level comes from the ``log_level`` key in ``backend/ocr_config.toml``
+(default INFO; use DEBUG for verbose tracing).  Recent log lines are also kept
+in an in-memory ring buffer so they can be inspected via the
+``GET /api/logs`` endpoint without digging through server stdout.
 """
 from __future__ import annotations
 
 import logging
-import os
 from collections import deque
+
+from backend.config import resolve
 
 _LOG_BUFFER: deque[str] = deque(maxlen=1000)
 
@@ -26,7 +27,7 @@ class BufferHandler(logging.Handler):
 
 def setup_logging() -> None:
     """Configure root logging once (console + in-memory buffer)."""
-    level_name = os.environ.get("OCR_LOG_LEVEL", "INFO").upper()
+    level_name = str(resolve().get("log_level") or "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s [%(levelname)s] %(name)s: %(message)s",

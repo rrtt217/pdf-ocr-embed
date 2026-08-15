@@ -26,8 +26,10 @@
     text/heading/equation，中文需安装对应语言包（如 `chi_sim`）。
   - `generic_openai_adapter`（**完整实现**）：接任意 OpenAI 兼容视觉模型，用提示词
     让模型返回带 bbox 的结构化 JSON，同样映射回像素坐标。
-- **OCR 设置完全外部化**：环境变量 / 本地 `ocr_config.json` / WebUI 设置页。
-  配置优先级：**环境变量 > 本地配置文件 > WebUI 保存值**。
+- **OCR 设置完全外部化**：本地 TOML 配置 `backend/ocr_config.toml` + WebUI 设置页
+  （WebUI 保存时写入同一个 TOML 文件）。`OCR_*` **环境变量可选地覆盖**全部设置
+  （优先级最高：环境变量 > WebUI 会话内保存值 > TOML 文件）；JSON / .env 文件
+  配置已移除。
 - **PDF 处理**：PyMuPDF 每页转图 → 逐页 OCR → 用 `render_mode=3` 不可见嵌入文字，
   正确处理像素坐标 → PDF 坐标（y 轴翻转），保存为 `*_embedded.pdf`。
 - **进度流**：SSE 推送每页 OCR 进度。
@@ -54,39 +56,72 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## 配置 OCR（三选一，优先级从前到后）
+## 配置 OCR
 
-### 1) 环境变量
+所有 OCR 设置都集中在一个 **TOML 配置文件** `backend/ocr_config.toml` 中
+（文件已加入 `.gitignore`）。有两种填法：
+
+### 1) 本地 TOML 配置文件（推荐）
+
+从仓库根目录的示例文件复制一份再修改：
 
 ```bash
-export OCR_API_KEY="你的 key"                 # 或 USTC_API_KEY 别名
-export OCR_BASE_URL="https://api.llm.ustc.edu.cn/v1"   # 任意 OpenAI 兼容端点
-export OCR_MODEL="unlimited-ocr"
-export OCR_PROVIDER="ustc"                    # 可选：ustc | openai | custom
+cp config.example.toml backend/ocr_config.toml
+# 然后编辑 backend/ocr_config.toml 填入你的值
 ```
 
-任意 OpenAI 兼容端点均可，只需改 `OCR_BASE_URL` + `OCR_MODEL` 即可切换引擎。
+最小配置：
 
-### 2) 本地配置文件（建议放入 .gitignore）
-
-在 `backend/` 下创建 `ocr_config.json`：
-
-```json
-{
-  "provider": "ustc",
-  "api_key": "你的 key",
-  "base_url": "https://api.llm.ustc.edu.cn/v1",
-  "model": "unlimited-ocr"
-}
+```toml
+provider = "ustc"
+api_key = "你的 key"
+base_url = "https://api.llm.ustc.edu.cn/v1"
+model = "unlimited-ocr"
 ```
 
-或 `backend/.env`（格式 `KEY=value`）。
+任意 OpenAI 兼容端点均可，只需改 `base_url` + `model` 即可切换引擎。
+完整的可配置项（Tesseract、通用 OpenAI 提示词、嵌入字体、临时文件清理、
+日志级别等）见 `config.example.toml` 中的注释。
 
-### 3) WebUI 设置页
+### 2) WebUI 设置页
 
-启动后在网页右上角 **Settings** 填写保存（key 会被打码存储）。
+启动后在网页右上角 **Settings** 填写保存（key 会被打码存储）。设置页打开时会
+读取并预填 TOML 文件中的值，保存只回写 provider 相关的四项字段，不会改动文件
+中的其它配置（tesseract / cleanup / log_level 等）；把某字段清空再保存则会将其
+重置（随后回退到内置预设）。
 
 > 未配置任何 key 时调用 OCR 会返回明确错误提示，其它功能（上传、预览）不受影响。
+
+### 3) 环境变量覆盖（可选）
+
+任何一条 `OCR_*` 环境变量都会**覆盖** TOML 文件与 WebUI 会话内的同名字段
+（优先级：环境变量 > WebUI 保存值 > TOML 文件），适合临时切换 key/端点/引擎
+而无需动配置文件，例如：
+
+```bash
+OCR_API_KEY=sk-xxx OCR_BASE_URL=https://example.com/v1 python -m backend.main
+```
+
+`USTC_API_KEY` 是 `OCR_API_KEY` 的别名（仅当前者未设置时生效）。
+环境变量与 TOML 键的对应关系如下：
+
+| 环境变量 | TOML 键 |
+| ---- | ---- |
+| `OCR_API_KEY` / `USTC_API_KEY` | `api_key` |
+| `OCR_BASE_URL` | `base_url` |
+| `OCR_MODEL` | `model` |
+| `OCR_PROVIDER` | `provider` |
+| `OCR_TESS_LANG` | `tess_lang` |
+| `OCR_TESS_PSM` | `tess_psm` |
+| `OCR_TESS_OEM` | `tess_oem` |
+| `OCR_TESS_CONFIG` | `tess_config` |
+| `OCR_TESSDATA_DIR` | `tessdata_dir` |
+| `OCR_TESS_CMD` | `tess_cmd` |
+| `OCR_GENERIC_PROMPT` | `generic_prompt` |
+| `OCR_EMBED_FONT` | `embed_font` |
+| `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
+| `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
+| `OCR_LOG_LEVEL` | `log_level` |
 
 ---
 
@@ -112,7 +147,8 @@ WebUI 上传区可下拉选择三个引擎：
 命令行方式（tesseract 示例）：
 
 ```bash
-export OCR_TESS_LANG=chi_sim   # 或写到 backend/ocr_config.json 的 "tess_lang"
+# 把 chi_sim 写进 backend/ocr_config.toml（或 WebUI 上传区的 "Tesseract language"）
+echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
@@ -145,7 +181,7 @@ pdf-ocr-embed/
 ├── backend/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI 应用与全部路由
-│   ├── config.py               # 外部设置解析（env / 配置文件 / WebUI）
+│   ├── config.py               # 外部设置解析（TOML 配置文件 / WebUI）
 │   ├── models.py               # 归一化 OcrPage / OcrBlock 结构
 │   ├── pdf_processing.py       # PyMuPDF 转图 + 不可见文字嵌入
 │   ├── ocr_service.py          # OCR 编排 + 任务/进度状态
@@ -162,7 +198,7 @@ pdf-ocr-embed/
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
 ├── requirements.txt
-├── .env.example
+├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # 面向 AI 编码代理的项目指南（含如何编写 OCR adapter）
 └── DESIGN.md
@@ -176,14 +212,14 @@ pdf-ocr-embed/
 - `max_tokens` 已设为 16384（必须 < 32768，否则 API 400）。
 - 像素 → PDF 坐标做了 y 轴翻转（PDF 原点左下、像素原点左上），并用页面 rect 与渲染宽高比例缩放。
 - **Tesseract adapter（本地，无 key）**：
-  - 语言通过 `OCR_TESS_LANG`（或 `ocr_config.json` 的 `tess_lang`、WebUI 上传区）
-    配置，中文用 `chi_sim`，可组合 `chi_sim+eng`。
+  - 语言通过 `backend/ocr_config.toml` 的 `tess_lang`（或 WebUI 上传区）配置，
+    中文用 `chi_sim`，可组合 `chi_sim+eng`。
   - 需系统装有 `tesseract` 二进制 + 对应语言包（Fedora：`tesseract` +
-    `tesseract-langpack-chi_sim`）。二进制不在 PATH 时用 `OCR_TESS_CMD` 指定，
-    tessdata 不在默认位置时用 `OCR_TESSDATA_DIR`。
+    `tesseract-langpack-chi_sim`）。二进制不在 PATH 时用 `tess_cmd` 指定，
+    tessdata 不在默认位置时用 `tessdata_dir`。
   - 每行文本聚合成一个 block，自动识别 heading / equation / text，输出置信度。
 - **generic_openai adapter（任意 OpenAI 兼容视觉模型）**：与 unlimited 相同
-   的 key/base_url/model 配置，`OCR_GENERIC_PROMPT` 可覆盖默认的 bbox-JSON 提示词。
+   的 api_key/base_url/model 配置，`generic_prompt` 可覆盖默认的 bbox-JSON 提示词。
 - **并行数（concurrency）**：上传时可指定，WebUI 上传区有输入框，或调用
   `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。后端用线程池并发处理各页，
   `concurrency=1` 即顺序执行。注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。
@@ -192,12 +228,14 @@ pdf-ocr-embed/
   也可调用 `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。
 - **中途停止**：OCR 运行中可点击 **Stop** 按钮或调用 `POST /api/ocr/stop/{job_id}` 停止。
   已完成的页保留，停止后可点 **Download partial** 下载部分嵌入的 PDF，或 **Retry remaining** 跑完剩余页。
-- **调试日志**：后端全链路 logging（`OCR_LOG_LEVEL` 环境变量控制级别，默认 INFO，设 DEBUG 看详细）。
-  WebUI 右上角 **Logs** 按钮可实时查看后端日志，或调用 `GET /api/logs`。
+- **调试日志**：后端全链路 logging（`backend/ocr_config.toml` 的 `log_level` 控制级别，
+  默认 INFO，设 DEBUG 看详细）。WebUI 右上角 **Logs** 按钮可实时查看后端日志，
+  或调用 `GET /api/logs`。
 - **临时文件清理**：任务只在内存中保存——服务重启后 `work/<job_id>/`（源 PDF + 每页渲染图）
   与 `output/`（嵌入结果、缩略图、overlay）会变成无人引用的孤儿文件，长期堆积占用磁盘。
-  后端在**启动时**与每 `OCR_CLEANUP_INTERVAL_HOURS`（默认 6h）自动删除
-  未被任何存活任务引用、且超过 `OCR_CLEANUP_MAX_AGE_HOURS`（默认 168h=7 天）的临时文件；
+  后端在**启动时**与每 `cleanup_interval_hours`（默认 6h）自动删除
+  未被任何存活任务引用、且超过 `cleanup_max_age_hours`（默认 168h=7 天）的临时文件
+  （两个值都在 `backend/ocr_config.toml` 中配置）；
   **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
   清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
-- 运行时产物（`output/`、`work/`、`uploads/`、`ocr_config.json`、`.env`）均不应提交仓库。
+- 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。

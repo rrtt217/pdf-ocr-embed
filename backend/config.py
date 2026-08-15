@@ -1,25 +1,34 @@
-"""External OCR settings resolution.
+"""External OCR settings resolution (TOML config file).
 
 Priority (highest first):
-  1. CLI / environment variables (OCR_API_KEY, OCR_BASE_URL, OCR_MODEL,
-     optional OCR_PROVIDER).  USTC_API_KEY is accepted as an alias for
-     OCR_API_KEY when OCR_API_KEY is not set.
-  2. Local config file `ocr_config.json` / `.env` in the backend directory.
-  3. WebUI-saved default (the in-memory `saved` dict, persisted to
-     ocr_config.json when the user saves via the WebUI).
+  1. ``OCR_*`` environment variables (override everything below; see
+     ``_ENV_ALIASES`` for the full map).
+  2. In-memory values saved via the WebUI (`saved` dict, persisted by
+     ``save()`` to ``ocr_config.toml``).
+  3. Local config file ``ocr_config.toml`` in the backend directory.
+
+Base settings live in the TOML config file; ``OCR_*`` environment variables
+can override individual keys for the running process without editing the file.
 
 No hardcoded keys.
 """
 from __future__ import annotations
 
-import json
+import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    import tomli as tomllib
+
+log = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = BASE_DIR
-CONFIG_FILE = BACKEND_DIR / "ocr_config.json"
+CONFIG_FILE = BACKEND_DIR / "ocr_config.toml"
 
 # Provider presets (only a *default example* for USTC; any OpenAI-compatible
 # endpoint works via base_url + api_key + model).
@@ -34,7 +43,7 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Keys accepted in ocr_config.json (core provider fields + per-adapter knobs).
+# Keys accepted in ocr_config.toml (core provider fields + per-adapter knobs).
 _FILE_KEYS = (
     "api_key", "base_url", "model", "provider",
     # tesseract adapter knobs
@@ -46,9 +55,12 @@ _FILE_KEYS = (
     "embed_font",
     # temp-file cleanup (see backend/cleanup.py)
     "cleanup_max_age_hours", "cleanup_interval_hours",
+    # logging verbosity (see backend/logging_config.py)
+    "log_level",
 )
 
-# Map environment variables -> resolved config field names.
+# Map environment variables -> resolved config field names.  These restore the
+# legacy OCR_* names as highest-priority overrides for the running process.
 _ENV_ALIASES = {
     "OCR_TESS_LANG": "tess_lang",
     "OCR_TESS_PSM": "tess_psm",
@@ -60,6 +72,7 @@ _ENV_ALIASES = {
     "OCR_EMBED_FONT": "embed_font",
     "OCR_CLEANUP_MAX_AGE_HOURS": "cleanup_max_age_hours",
     "OCR_CLEANUP_INTERVAL_HOURS": "cleanup_interval_hours",
+    "OCR_LOG_LEVEL": "log_level",
 }
 
 # In-memory overrides from the WebUI settings page (applied at runtime).
@@ -67,47 +80,36 @@ _saved: Dict[str, str] = {}
 
 
 def _load_file_config() -> Dict[str, str]:
+    """Read the TOML config file (values are normalized to strings)."""
     cfg: Dict[str, str] = {}
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for key in _FILE_KEYS:
-                    val = data.get(key)
-                    if val is not None:
-                        cfg[str(key)] = str(val)
-        except Exception:
-            pass
-    # Also read a conventional .env next to the config file.
-    env_file = BACKEND_DIR / ".env"
-    if env_file.exists():
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key == "OCR_API_KEY":
-                cfg["api_key"] = cfg.get("api_key") or value
-            elif key == "OCR_BASE_URL":
-                cfg["base_url"] = cfg.get("base_url") or value
-            elif key == "OCR_MODEL":
-                cfg["model"] = cfg.get("model") or value
-            elif key == "OCR_PROVIDER":
-                cfg["provider"] = cfg.get("provider") or value
-            elif key == "USTC_API_KEY":
-                cfg["api_key"] = cfg.get("api_key") or value
-            elif key in _ENV_ALIASES:
-                cfg[_ENV_ALIASES[key]] = cfg.get(_ENV_ALIASES[key]) or value
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        data = tomllib.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("Failed to parse %s: %s", CONFIG_FILE, exc)
+        return cfg
+    if not isinstance(data, dict):
+        log.warning("Ignoring %s: top-level value is not a table", CONFIG_FILE)
+        return cfg
+    for key in _FILE_KEYS:
+        val = data.get(key)
+        if val is not None:
+            cfg[key] = _as_str(val)
     return cfg
 
 
+def _as_str(value: Any) -> str:
+    """Coerce a TOML scalar to the string form the rest of the backend expects."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
 def _load_env() -> Dict[str, str]:
+    """Read ``OCR_*`` environment variables (highest-priority overrides)."""
     cfg: Dict[str, str] = {}
-    api_key = os.environ.get("OCR_API_KEY")
-    if not api_key:
-        api_key = os.environ.get("USTC_API_KEY")  # alias
+    api_key = os.environ.get("OCR_API_KEY") or os.environ.get("USTC_API_KEY")  # alias
     if api_key:
         cfg["api_key"] = api_key
     if os.environ.get("OCR_BASE_URL"):
@@ -116,20 +118,20 @@ def _load_env() -> Dict[str, str]:
         cfg["model"] = os.environ["OCR_MODEL"]
     if os.environ.get("OCR_PROVIDER"):
         cfg["provider"] = os.environ["OCR_PROVIDER"]
-    # Extra per-adapter knobs (tesseract / generic_openai) read straight from env.
+    # Per-adapter knobs and other file keys read straight from env.
     for env_key, field in _ENV_ALIASES.items():
         val = os.environ.get(env_key)
         if val:
-            cfg[field] = cfg.get(field) or val
+            cfg[field] = val
     return cfg
 
 
 def resolve() -> Dict[str, str]:
-    """Merge all sources into a single effective config (env > file > saved)."""
+    """Merge all sources into a single effective config (env > saved > file)."""
     merged: Dict[str, str] = {}
-    merged.update(_saved)            # lowest: WebUI saved values
-    merged.update(_load_file_config())  # middle: local config file
-    merged.update(_load_env())       # highest: environment variables
+    merged.update(_load_file_config())
+    merged.update(_saved)            # WebUI-saved values win over the file
+    merged.update(_load_env())       # environment variables override both
 
     provider = merged.get("provider", "ustc")
     preset = PROVIDER_PRESETS.get(provider)
@@ -153,35 +155,39 @@ def get_effective_settings() -> Dict[str, Any]:
 
 
 def save(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Save settings from the WebUI to ocr_config.json (masked keys preserved).
+    """Save settings from the WebUI to ocr_config.toml (masked keys preserved).
 
     If 'api_key' looks masked (contains '*') it is treated as "unchanged" and
-    the previously configured key is kept.
+    the previously configured key is kept.  All other file settings (per-adapter
+    knobs, cleanup, log level) are preserved and only the editor-relevant
+    provider fields are updated.
     """
     prev = _load_file_config()
-    new: Dict[str, str] = {}
     api_key = str(settings.get("api_key", "")).strip()
     if api_key and _has_mask(api_key):
-        new["api_key"] = prev.get("api_key", _saved.get("api_key", ""))
-    else:
-        new["api_key"] = api_key
+        api_key = prev.get("api_key", _saved.get("api_key", ""))
 
-    new["base_url"] = str(settings.get("base_url", "")).strip().rstrip("/")
-    new["model"] = str(settings.get("model", "")).strip()
-    new["provider"] = str(settings.get("provider", "ustc")).strip()
+    # Start from the existing file so a WebUI save does not drop unrelated keys.
+    data: Dict[str, str] = dict(prev)
+    data["api_key"] = api_key
+    data["base_url"] = str(settings.get("base_url", "")).strip().rstrip("/")
+    data["model"] = str(settings.get("model", "")).strip()
+    data["provider"] = str(settings.get("provider", "ustc")).strip()
 
-    # Persist to local file.
-    data = {
-        "api_key": new["api_key"],
-        "base_url": new["base_url"],
-        "model": new["model"],
-        "provider": new["provider"],
-    }
-    CONFIG_FILE.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    _saved.update(new)
+    CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
+    _saved.update(data)
     return get_effective_settings()
+
+
+def _dump_toml(data: Dict[str, str]) -> str:
+    """Serialize the flat settings dict as TOML text."""
+    try:
+        import tomli_w  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "tomli-w is required to save settings (pip install tomli-w)"
+        ) from exc
+    return tomli_w.dumps(data)
 
 
 def _mask_key(key: str) -> str:

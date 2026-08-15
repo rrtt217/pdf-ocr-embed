@@ -115,7 +115,7 @@ const I18N_DICT = {
 
     // --- settings ---
     "settings.title": "OCR Settings",
-    "settings.hint": "Leave fields blank to fall back to environment variables (<code>OCR_API_KEY</code> / <code>OCR_BASE_URL</code> / <code>OCR_MODEL</code> / <code>OCR_PROVIDER</code>, <code>USTC_API_KEY</code> alias) or a local <code>ocr_config.json</code>. A masked key means one is already configured.",
+    "settings.hint": "Settings are read from the local <code>backend/ocr_config.toml</code>; saving writes back to that file. A masked key means one is already configured.",
     "settings.provider": "Provider preset",
     "settings.provider.ustc": "USTC (OpenAI-compatible)",
     "settings.provider.openai": "OpenAI",
@@ -264,7 +264,7 @@ const I18N_DICT = {
 
     // --- settings ---
     "settings.title": "OCR 设置",
-    "settings.hint": "留空则回退到环境变量（<code>OCR_API_KEY</code> / <code>OCR_BASE_URL</code> / <code>OCR_MODEL</code> / <code>OCR_PROVIDER</code>，<code>USTC_API_KEY</code> 别名）或本地 <code>ocr_config.json</code>。若显示掩码密钥，说明已配置。",
+    "settings.hint": "设置读取自本地 <code>backend/ocr_config.toml</code>，保存时写回该文件。若显示掩码密钥，说明已配置。",
     "settings.provider": "服务商预设",
     "settings.provider.ustc": "USTC（兼容 OpenAI）",
     "settings.provider.openai": "OpenAI",

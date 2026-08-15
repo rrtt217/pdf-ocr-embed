@@ -36,8 +36,11 @@ nothing is hardcoded in the code.
     text/heading/equation; Chinese needs a language pack such as `chi_sim`.
   - `generic_openai_adapter` (full implementation): any OpenAI-compatible vision
     model, prompted to return structured JSON with bboxes, mapped back to pixels.
-- **Fully externalized OCR settings** — env vars / local `ocr_config.json` / WebUI.
-  Priority: **env vars > local config file > WebUI saved values**.
+- **Fully externalized OCR settings** — local TOML config `backend/ocr_config.toml`
+  plus the WebUI settings page (the WebUI saves into the same TOML file). Any
+  `OCR_*` **environment variable optionally overrides** the corresponding key
+  (highest priority: env var > WebUI in-memory value > TOML file); JSON / `.env`
+  file config has been removed.
 - **PDF pipeline** — PyMuPDF renders each page to an image, OCR runs per page, and
   the text is embedded invisibly with `render_mode=3`; pixel→PDF coordinates are
   flipped correctly (y axis) and scaled by the page rect, saved as `*_embedded.pdf`.
@@ -71,42 +74,73 @@ pip install -r requirements.txt
 
 ## OCR Configuration
 
-Pick one; priority top-down:
+All OCR settings live in one TOML config file, `backend/ocr_config.toml`
+(already in `.gitignore`). There are two ways to provide them:
 
-### 1) Environment variables
+### 1) Local TOML config file (recommended)
+
+Copy the repo's example file and edit it:
 
 ```bash
-export OCR_API_KEY="your key"                              # or the USTC_API_KEY alias
-export OCR_BASE_URL="https://api.llm.ustc.edu.cn/v1"       # any OpenAI-compatible endpoint
-export OCR_MODEL="unlimited-ocr"
-export OCR_PROVIDER="ustc"                                 # optional: ustc | openai | custom
+cp config.example.toml backend/ocr_config.toml
+# then edit backend/ocr_config.toml and fill in your values
+```
+
+Minimal config:
+
+```toml
+provider = "ustc"
+api_key = "your key"
+base_url = "https://api.llm.ustc.edu.cn/v1"
+model = "unlimited-ocr"
 ```
 
 Any OpenAI-compatible endpoint works — switch engines by changing
-`OCR_BASE_URL` + `OCR_MODEL`.
+`base_url` + `model`. Every other option (Tesseract, the generic-OpenAI prompt,
+the embed font, temp-file cleanup, log level) is documented as a comment inside
+`config.example.toml`.
 
-### 2) Local config file (recommend gitignoring it)
-
-Create `ocr_config.json` under `backend/`:
-
-```json
-{
-  "provider": "ustc",
-  "api_key": "your key",
-  "base_url": "https://api.llm.ustc.edu.cn/v1",
-  "model": "unlimited-ocr"
-}
-```
-
-Or use `backend/.env` (lines of `KEY=value`).
-
-### 3) WebUI Settings page
+### 2) WebUI Settings page
 
 Fill in and save via the **Settings** button at the top-right of the page (the key
-is stored masked).
+is stored masked). The form is pre-filled from `backend/ocr_config.toml`, and saving
+writes the four provider fields back to that file without touching the rest
+(tesseract, cleanup, `log_level`, ...); clearing a field before saving resets it.
 
 > If no key is configured, OCR calls return a clear error; everything else
 > (upload, preview) keeps working.
+
+### 3) Environment-variable overrides (optional)
+
+Any `OCR_*` environment variable **overrides** the matching key in the TOML file
+and the WebUI in-memory value (priority: env var > WebUI saved value > TOML
+file). This is handy for temporarily switching key/endpoint/engine without
+editing the config file, e.g.:
+
+```bash
+OCR_API_KEY=sk-xxx OCR_BASE_URL=https://example.com/v1 python -m backend.main
+```
+
+`USTC_API_KEY` acts as an alias for `OCR_API_KEY` (only used when the latter
+is not set). The mapping from environment variables to TOML keys is:
+
+| Env var | TOML key |
+| ---- | ---- |
+| `OCR_API_KEY` / `USTC_API_KEY` | `api_key` |
+| `OCR_BASE_URL` | `base_url` |
+| `OCR_MODEL` | `model` |
+| `OCR_PROVIDER` | `provider` |
+| `OCR_TESS_LANG` | `tess_lang` |
+| `OCR_TESS_PSM` | `tess_psm` |
+| `OCR_TESS_OEM` | `tess_oem` |
+| `OCR_TESS_CONFIG` | `tess_config` |
+| `OCR_TESSDATA_DIR` | `tessdata_dir` |
+| `OCR_TESS_CMD` | `tess_cmd` |
+| `OCR_GENERIC_PROMPT` | `generic_prompt` |
+| `OCR_EMBED_FONT` | `embed_font` |
+| `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
+| `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
+| `OCR_LOG_LEVEL` | `log_level` |
 
 ---
 
@@ -134,7 +168,8 @@ The upload zone has a dropdown with three engines:
 Command line (tesseract example):
 
 ```bash
-export OCR_TESS_LANG=chi_sim   # or put "tess_lang" in backend/ocr_config.json
+# put this in backend/ocr_config.toml (or use the WebUI's "Tesseract language" field)
+echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
@@ -167,7 +202,7 @@ pdf-ocr-embed/
 ├── backend/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI app + all routes
-│   ├── config.py               # external setting resolution (env / config file / WebUI)
+│   ├── config.py               # external setting resolution (TOML config file / WebUI)
 │   ├── models.py               # normalized OcrPage / OcrBlock schema
 │   ├── pdf_processing.py       # page render → PNG + invisible text embedding
 │   ├── ocr_service.py          # OCR orchestration, jobs, progress, concurrency
@@ -184,7 +219,7 @@ pdf-ocr-embed/
 │   ├── app.js
 │   └── i18n.js                 # EN + 中文 UI strings
 ├── requirements.txt
-├── .env.example
+├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # agent-oriented project guide (incl. how to write an OCR adapter)
 └── DESIGN.md
@@ -200,15 +235,15 @@ pdf-ocr-embed/
 - Pixel → PDF coordinates are flipped along the y axis (PDF origin is bottom-left,
   pixel origin top-left) and scaled by the page rect / rendered size.
 - **Tesseract adapter (local, no key)**:
-  - Language is configured via `OCR_TESS_LANG` (or `tess_lang` in `ocr_config.json`,
-    or the WebUI upload zone): `chi_sim` for Chinese, combinable as `chi_sim+eng`.
+  - Language is configured via `tess_lang` in `backend/ocr_config.toml` (or the
+    WebUI upload zone): `chi_sim` for Chinese, combinable as `chi_sim+eng`.
   - Requires the `tesseract` binary + matching language packs (Fedora: `tesseract` +
-    `tesseract-langpack-chi_sim`). Use `OCR_TESS_CMD` if the binary is not on PATH,
-    and `OCR_TESSDATA_DIR` if tessdata is not in the default location.
+    `tesseract-langpack-chi_sim`). Use `tess_cmd` if the binary is not on PATH,
+    and `tessdata_dir` if tessdata is not in the default location.
   - Each text line is aggregated into one block, auto-classified as
     heading/equation/text, with a confidence score.
 - **generic_openai adapter (any OpenAI-compatible vision model)**: same
-  key/base_url/model config as unlimited; `OCR_GENERIC_PROMPT` overrides the default
+  api_key/base_url/model config as unlimited; `generic_prompt` overrides the default
   bbox-JSON prompt.
 - **Concurrency**: set it on upload, via the WebUI input or the `concurrency` form
   field of `POST /api/ocr/upload` (1–32). Pages are processed concurrently in a
@@ -222,16 +257,17 @@ pdf-ocr-embed/
   `POST /api/ocr/stop/{job_id}`). Completed pages are kept — download them as a
   partial `*_embedded.pdf` via **Download partial**, or finish the rest with
   **Retry remaining**.
-- **Debug logs**: full pipeline logging, verbosity controlled by `OCR_LOG_LEVEL`
-  (default INFO; DEBUG for detail). The **Logs** button at the top-right of the WebUI
-  shows live server logs, or call `GET /api/logs`.
+- **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
+  `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
+  top-right of the WebUI shows live server logs, or call `GET /api/logs`.
 - **Temp file cleanup**: jobs live only in memory — after a server restart,
   `work/<job_id>/` (source PDF + per-page renders) and `output/` (embeds, thumbnails,
   overlays) become orphaned. The backend auto-deletes files that are not referenced by
-  any live job and are older than `OCR_CLEANUP_MAX_AGE_HOURS` (default 168h = 7 days),
-  at startup and every `OCR_CLEANUP_INTERVAL_HOURS` (default 6h). Files in use are
+  any live job and are older than `cleanup_max_age_hours` (default 168h = 7 days),
+  at startup and every `cleanup_interval_hours` (default 6h); both values come from
+  `backend/ocr_config.toml`. Files in use are
   **never deleted**. The **Cleanup** button at the top-right of the WebUI shows a
   summary, lets you adjust the retention window and clean manually (Preview first,
   then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.
-- Runtime artifacts (`output/`, `work/`, `uploads/`, `ocr_config.json`, `.env`) must
+- Runtime artifacts (`output/`, `work/`, `uploads/`, `backend/ocr_config.toml`) must
   not be committed to the repository.
