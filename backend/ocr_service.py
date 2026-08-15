@@ -6,6 +6,7 @@ drives the SSE progress stream.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
@@ -21,6 +22,7 @@ from backend.config import resolve
 
 import fitz  # PyMuPDF
 
+from backend import ocr_cache
 from backend import pdf_processing
 from backend.models import OcrPage, dict_to_page, page_to_dict
 from backend.sources.factory import get_adapter
@@ -59,6 +61,7 @@ def create_job(filename: str, file_bytes: bytes) -> dict:
             "id": job_id,
             "filename": safe_name,
             "pdf_path": str(pdf_path),
+            "pdf_sha256": hashlib.sha256(file_bytes).hexdigest(),
             "img_dir": str(src_dir),
             "pages": [],            # list of OcrPage dicts (normalized), None = not done
             "num_pages": 0,
@@ -172,6 +175,30 @@ def page_preview_path(job_id: str, page_index: int) -> Optional[str]:
         return None
     png = Path(job["img_dir"]) / f"page_{page_index:04d}.png"
     return str(png) if png.exists() else None
+
+
+def ensure_page_image(job_id: str, page_index: int) -> Optional[str]:
+    """Render one page's PNG on demand (cache-hit pages skip pre-rendering).
+
+    Pages served from the OCR cache never went through the pre-render phase,
+    so their preview image may not exist yet.  This renders it lazily when
+    the WebUI first asks for it.  The write is atomic (see
+    ``pdf_processing.render_page_to_file``), so concurrent thumbnail/preview
+    requests cannot observe a half-written file.
+    """
+    job = get_job(job_id)
+    if job is None:
+        return None
+    try:
+        with fitz.open(job["pdf_path"]) as doc:
+            if not 0 <= page_index < doc.page_count:
+                return None
+            log.info("job %s: lazy-rendering page %d preview", job_id, page_index)
+            return pdf_processing.render_page_to_file(
+                doc[page_index], Path(job["img_dir"]), page_index)[0]
+    except Exception:  # noqa: BLE001
+        log.exception("job %s: lazy render page %d failed", job_id, page_index)
+        return None
 
 
 def get_pages(job_id: str) -> List[dict]:
@@ -312,6 +339,7 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
             _set(job, current=already_done)
             push_event(job_id, {
                 "type": "progress",
+                "phase": "ocr",
                 "current": already_done,
                 "total": num,
                 "message": f"OCR {already_done}/{num} already done"
@@ -329,23 +357,65 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
                                     "result": [p for p in job["pages"] if p is not None]})
                 return
 
-            # Pre-render only the pages that need OCR (render is not thread-safe).
-            page_specs: List[dict] = []
-            for i in page_indices:
+            # --- Cache pre-check BEFORE rendering ---
+            # The cache key is content-addressed (PDF hash + page + engine
+            # settings), not image-addressed, so a hit needs no render at all:
+            # re-uploading a large document can finish without rasterizing a
+            # single page (preview PNGs are rendered lazily on first view).
+            fingerprint = base_adapter.cache_fingerprint()
+            cached_hits, pending = _cache_precheck(job, fingerprint, page_indices)
+
+            for i in sorted(cached_hits):
                 if cancel.is_set():
-                    log.info("job %s: cancelled during pre-render at page %d", job_id, i)
                     _finish_stopped(job, job_id, num)
                     return
+                update_page(job_id, i, cached_hits[i])
+                cur = sum(1 for p in job['pages'] if p is not None)
+                with _jobs_lock:
+                    job['current'] = cur
+                push_event(job_id, {'type': 'progress', 'phase': 'ocr',
+                            'cached': True, 'current': cur, 'total': num,
+                            'message': f'OCR page {cur}/{num} (cached)'})
+
+            if not pending:
+                # Everything satisfied from cache - done without rendering.
+                log.info('job %s: all page(s) served from cache', job_id)
+                _set(job, status='done')
+                push_event(job_id, {'type': 'status', 'status': 'done',
+                            'message': 'OCR complete (served from cache)',
+                            'result': [p for p in job['pages'] if p is not None]})
+                return
+
+            # Pre-render only the cache misses (render is not thread-safe),
+            # reporting the phase over SSE so large documents show progress
+            # instead of a frozen bar.
+            page_specs: List[dict] = []
+            total_render = len(pending)
+            for di, i in enumerate(pending, start=1):
+                if cancel.is_set():
+                    log.info('job %s: cancelled during pre-render at page %d',
+                             job_id, i)
+                    _finish_stopped(job, job_id, num)
+                    return
+                push_event(job_id, {'type': 'progress', 'phase': 'render',
+                            'current': di - 1, 'total': total_render,
+                            'message': f'Rendering {di}/{total_render}...'})
                 img_path, w, h = pdf_processing.render_page_to_file(
-                    doc[i], Path(job["img_dir"]), i)
-                page_specs.append({"page_index": i, "img_path": img_path, "w": w, "h": h})
+                    doc[i], Path(job['img_dir']), i)
+                page_specs.append({'page_index': i, 'img_path': img_path,
+                                  'w': w, 'h': h})
+            push_event(job_id, {'type': 'progress', 'phase': 'render',
+                        'current': total_render, 'total': total_render,
+                        'message': 'Rendering done'})
+            seed = already_done + len(cached_hits)
 
             if concurrency <= 1 or len(page_specs) <= 1:
                 _ocr_pages_sequentially(job, job_id, base_adapter, page_specs,
-                                        num, cancel)
+                                        num, cancel, fingerprint)
             else:
                 _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
-                                    num, concurrency, already_done, cancel)
+                                    num, concurrency, seed, cancel,
+                                    fingerprint)
 
         if cancel.is_set():
             _finish_stopped(job, job_id, num)
@@ -414,17 +484,77 @@ def _make_adapter(name: str, adapter_kwargs: dict):
         return adapter
 
 
-def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel):
+def _page_cache_key(job, fingerprint, page_index: int) -> str:
+    """The single source of truth for a page cache key (content-addressed)."""
+    return ocr_cache.build_key({
+        "v": 1,
+        "pdf_sha": job.get("pdf_sha256", ""),
+        "page": page_index,
+        "zoom": pdf_processing.PIXEL_RENDER_ZOOM,
+        "render": {"fmt": "png", "alpha": False},
+        "adapter": fingerprint,
+    })
+
+
+def _cache_precheck(job, fingerprint, page_indices):
+    """Split pending pages into cache hits and misses (before rendering).
+
+    Cache hits need neither a page render (the key is content-addressed on
+    the PDF hash, not the PNG bytes) nor an engine call — applying them up
+    front is what makes re-uploading a large document instant.  Misses are
+    returned in the original order for the render + OCR phase.
+    """
+    hits = {}
+    misses = []
+    for i in page_indices:
+        cached = ocr_cache.get_page(_page_cache_key(job, fingerprint, i),
+                                     count_misses=False)
+        if cached is not None:
+            hits[i] = cached
+        else:
+            misses.append(i)
+    log.info("cache precheck: %d hit(s), %d miss(es) across %d page(s)",
+             len(hits), len(misses), len(page_indices))
+    return hits, misses
+
+
+def _recognize_page(job, adapter, spec, fingerprint=None):
+    """Run OCR on one page with the cross-job result cache in front.
+
+    The cache key covers the source PDF content hash, the page index, the
+    render parameters and the adapter's output-affecting settings
+    (``OcrSource.cache_fingerprint``), so a hit only happens for byte-
+    identical work; any engine/settings change misses and re-runs.
+    ``fingerprint`` (computed once per run in ``run_ocr``) overrides the
+    instance's own fingerprint so every page/worker keys identically.
+    Only the *pristine* OCR output is cached — user edits live in job
+    state above this layer and never touch the cache.
+    """
+    fp = fingerprint if fingerprint is not None else adapter.cache_fingerprint()
+    key = _page_cache_key(job, fp, spec["page_index"])
+    cached = ocr_cache.get_page(key)
+    if cached is not None:
+        log.info("job %s: page %d OCR cache hit", job["id"], spec["page_index"])
+        return dict_to_page(cached)
+    ocr_page = adapter.recognize_pixels(spec["img_path"], spec["w"], spec["h"],
+                                        spec["page_index"])
+    ocr_cache.put_page(key, page_to_dict(ocr_page))
+    return ocr_page
+
+
+def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel,
+                          fingerprint=None):
     for spec in page_specs:
         if cancel.is_set():
             return
-        _ocr_one_page_and_report(job, job_id, adapter, spec, num)
+        _ocr_one_page_and_report(job, job_id, adapter, spec, num, fingerprint)
 
 
-def _ocr_one_page_and_report(job, job_id, adapter, spec, num):
+def _ocr_one_page_and_report(job, job_id, adapter, spec, num,
+                             fingerprint=None):
     i = spec["page_index"]
     log.debug("job %s: OCR page %d", job_id, i)
-    ocr_page = adapter.recognize_pixels(spec["img_path"], spec["w"], spec["h"], i)
+    ocr_page = _recognize_page(job, adapter, spec, fingerprint)
     update_page(job_id, i, page_to_dict(ocr_page))
     _bump_progress(job, job_id, num)
 
@@ -434,6 +564,7 @@ def _bump_progress(job, job_id, num):
         job["current"] = sum(1 for p in job["pages"] if p is not None)
     push_event(job_id, {
         "type": "progress",
+        "phase": "ocr",
         "current": job["current"],
         "total": num,
         "message": f"OCR page {job['current']}/{num}",
@@ -441,7 +572,8 @@ def _bump_progress(job, job_id, num):
 
 
 def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
-                        num, concurrency, already_done, cancel):
+                        num, concurrency, already_done, cancel,
+                        fingerprint=None):
     """OCR pages concurrently; report progress as each page completes (unordered).
 
     `done_count` is seeded with `already_done` so that progress reflects the
@@ -463,8 +595,7 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
         try:
             worker = _make_adapter(job.get("adapter", "unlimited"), adapter_kwargs)
             log.debug("job %s: OCR page %d (parallel)", job_id, spec["page_index"])
-            ocr_page = worker.recognize_pixels(spec["img_path"], spec["w"], spec["h"],
-                                               spec["page_index"])
+            ocr_page = _recognize_page(job, worker, spec, fingerprint)
             if cancel.is_set():
                 return spec["page_index"], None
             update_page(job_id, spec["page_index"], page_to_dict(ocr_page))
@@ -474,6 +605,7 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
             _set(job, current=cur)  # sync job["current"] for status queries
             push_event(job_id, {
                 "type": "progress",
+                "phase": "ocr",
                 "current": cur,
                 "total": num,
                 "page_index": spec["page_index"],

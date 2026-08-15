@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_service
+from backend import config, ocr_cache, ocr_service
 from backend.logging_config import recent_logs, setup_logging
 from backend.sources.factory import available_adapters
 
@@ -128,6 +128,20 @@ def run_cleanup(payload: CleanupModel) -> dict:
         force=payload.force,
         dry_run=payload.dry_run,
     )
+
+
+
+
+@app.get("/api/cache")
+def cache_status() -> dict:
+    """Status of the cross-job OCR result cache (entries, hits/misses, TTL)."""
+    return ocr_cache.status()
+
+
+@app.post("/api/cache/clear")
+def cache_clear() -> dict:
+    """Drop every OCR cache entry (never touches OCR results in job state)."""
+    return ocr_cache.clear()
 
 
 @app.get("/api/settings")
@@ -330,7 +344,11 @@ def update_page(job_id: str, page_index: int, payload: dict) -> dict:
 
 @app.get("/api/pages/{job_id}/{page_index}/image")
 def page_image(job_id: str, page_index: int):
+    # Cache-hit pages skip the pre-render phase; render their preview lazily
+    # the first time the WebUI asks for it.
     path = ocr_service.page_preview_path(job_id, page_index)
+    if path is None:
+        path = ocr_service.ensure_page_image(job_id, page_index)
     if path is None:
         raise HTTPException(status_code=404, detail="Page image not found")
     return FileResponse(path, media_type="image/png")

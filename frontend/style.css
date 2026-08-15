@@ -529,6 +529,18 @@ label input, label select {
   .block .fs-row { min-width: 0; width: 100%; }
 }
 
+/* OCR result cache panel (inside the cleanup modal) */
+.cache-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.cache-panel h3 { margin: 0 0 6px; }
+.cache-panel .cache-actions { margin-top: 8px; }
+#cache-summary { margin: 6px 0; color: var(--text); }
+#cache-summary .hint { margin-top: 2px; }
+#cache-status { min-height: 1.2em; margin-top: 6px; font-size: 0.9em; color: var(--ok-text); }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }

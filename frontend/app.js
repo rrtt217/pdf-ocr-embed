@@ -242,12 +242,20 @@ function jobCard(job) {
   title.appendChild(el("span", "pill" + (pcls ? " " + pcls : ""),
                        t(STATUS_LABEL[job.status] || job.status)));
   head.appendChild(title);
-  head.appendChild(el("span", "job-count", `${job.current} / ${job.total || "?"}`));
+  // During the pre-OCR render phase the bar reflects render progress; the
+  // page-level counts are shown again once OCR itself starts.
+  const rendering = !!(job.render && job.render.total > 0 && job.render.current < job.render.total);
+  const countLabel = rendering
+    ? "⏳ " + job.render.current + " / " + job.render.total
+    : job.current + " / " + (job.total || "?");
+  head.appendChild(el("span", "job-count", countLabel));
   card.appendChild(head);
 
   const bar = el("div", "bar");
   const fill = el("div", "fill");
-  fill.style.width = job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%";
+  fill.style.width = rendering
+    ? Math.round((job.render.current / job.render.total) * 100) + "%"
+    : (job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%");
   bar.appendChild(fill);
   card.appendChild(bar);
 
@@ -314,13 +322,21 @@ function applyJobEvent(jobId, msg) {
   const prevCurrent = job.current;
 
   if (msg.type === "progress") {
-    Object.assign(job, {
-      status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
-      current: msg.current,
-      total: msg.total,
-      error: null,
-    });
+    if (msg.phase === "render") {
+      // Pre-OCR rasterization phase: advance the bar with render counts and
+      // keep the page-level current/total untouched (they only count OCR).
+      job.render = { current: msg.current, total: msg.total };
+    } else {
+      job.render = null;
+      Object.assign(job, {
+        status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
+        current: msg.current,
+        total: msg.total,
+        error: null,
+      });
+    }
   } else if (msg.type === "status") {
+    job.render = null;
     const done = (msg.result || []).filter(Boolean).length;
     Object.assign(job, {
       status: msg.status,
@@ -777,6 +793,7 @@ function areaSummary(name, a) {
 
 async function openCleanup() {
   $("#cleanup-modal").classList.remove("hidden");
+  refreshCacheInfo();  // OCR result-cache panel in the same modal
   const status = $("#cleanup-status");
   status.textContent = "";
   $("#cleanup-summary").innerHTML = "";
@@ -802,6 +819,48 @@ async function openCleanup() {
     }
   } catch (e) {
     status.textContent = t("cleanup.loadFailed", { msg: e.message });
+  }
+}
+
+/* ---------- OCR result cache ---------- */
+async function refreshCacheInfo() {
+  const sum = $("#cache-summary");
+  const status = $("#cache-status");
+  if (!sum) return;
+  try {
+    const data = await api("/api/cache");
+    sum.innerHTML = "";
+    sum.appendChild(el("div", "",
+      t("cache.entries", { n: data.entries, bytes: fmtBytes(data.bytes) })
+      + " · " + t("cache.hitsMisses", { hits: data.hits, misses: data.misses })));
+    sum.appendChild(el("div", "hint", data.enabled
+      ? t("cache.ttlHours", { h: Math.round(data.max_age_hours) })
+      : t("cache.disabled")));
+    if (status) status.textContent = "";
+  } catch (e) {
+    if (sum) {
+      sum.innerHTML = "";
+      sum.appendChild(el("div", "hint", t("cache.loadFailed", { msg: e.message })));
+    }
+  }
+}
+
+async function clearOcrCache() {
+  const btn = $("#btn-cache-clear");
+  const status = $("#cache-status");
+  if (!btn) return;
+  btn.disabled = true;
+  if (status) status.textContent = t("cache.clearing");
+  try {
+    const data = await api("/api/cache/clear", { method: "POST" });
+    const msg = t("cache.cleared", { n: data.removed, bytes: fmtBytes(data.freed_bytes) });
+    if (status) status.textContent = msg;
+    toast(msg, "success");
+    await refreshCacheInfo();
+  } catch (e) {
+    if (status) status.textContent = t("cache.failed", { msg: e.message });
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -970,6 +1029,7 @@ async function init() {
   $("#btn-dataset").onclick = downloadDataset;
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
+  $("#btn-cache-clear").onclick = clearOcrCache;
   $("#btn-cleanup-preview").onclick = () => runCleanup(true);
   $("#btn-cleanup-run").onclick = () => runCleanup(false);
   $("#btn-cleanup-cancel").onclick = () => $("#cleanup-modal").classList.add("hidden");

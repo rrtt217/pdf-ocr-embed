@@ -42,5 +42,9 @@ tess_lang = "chi_sim"                        # e.g. "eng", "chi_sim", "chi_sim+e
 cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days
 cleanup_interval_hours = 6                   # background cleanup re-run interval
 
+# --- OCR result cache (see backend/ocr_cache.py) ----------------------------
+ocr_cache_enabled = true                 # reuse results of identical page+engine work
+ocr_cache_max_age_hours = 720            # cache entry TTL (default 30 days)
+
 # --- Logging (see backend/logging_config.py) -------------------------------
 log_level = "INFO"                           # "DEBUG" | "INFO" | "WARNING" | "ERROR"

@@ -171,6 +171,8 @@ uvicorn backend.main:app --port 8000
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
 | GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
 | POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
+| GET  | `/api/cache` | OCR 结果缓存状态（条目数/字节/命中与未命中计数、TTL、开关） |
+| POST | `/api/cache/clear` | 清空全部 OCR 缓存（不影响任务内已识别的结果） |
 
 ---
 
@@ -197,6 +199,8 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
+├── tests/                      # pytest 测试（坐标映射/解析器/缓存等纯函数）
+├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
@@ -229,6 +233,15 @@ pdf-ocr-embed/
   也可调用 `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。
 - **中途停止**：OCR 运行中可点击 **Stop** 按钮或调用 `POST /api/ocr/stop/{job_id}` 停止。
   已完成的页保留，停止后可点 **Download partial** 下载部分嵌入的 PDF，或 **Retry remaining** 跑完剩余页。
+- **OCR 结果缓存**：同一 PDF 页 + 相同引擎与参数的结果，按内容哈希缓存到
+  `cache/ocr/`（键 = 源 PDF 哈希 + 页码 + 渲染参数 + 引擎指纹，绝不落盘任何密钥或
+  原图）。重复 OCR 直接命中，省时省钱、且错误的缓存条目会被自动丢弃。TTL
+  `ocr_cache_max_age_hours`（默认 720h），`ocr_cache_enabled = false` 可整体关闭；
+  后台清理循环会顺带过期清理，`GET /api/cache` 看命中统计、`POST /api/cache/clear`
+  一键清空。缓存只存**识别原文**，用户在页面上做的文字/字体修改完全不受影响。
+  **命中即跳过渲染**：重新上传同一文档时，缓存命中的页不需要重新渲染 PNG
+  （预览图在首次查看时按需补渲染）。SSE 进度分 `render`（预处理渲染）与
+  `ocr`（识别）两个阶段推送，处理大文件时进度条在渲染阶段就持续前进。
 - **调试日志**：后端全链路 logging（`backend/ocr_config.toml` 的 `log_level` 控制级别，
   默认 INFO，设 DEBUG 看详细）。WebUI 右上角 **Logs** 按钮可实时查看后端日志，
   或调用 `GET /api/logs`。
@@ -239,4 +252,6 @@ pdf-ocr-embed/
   （两个值都在 `backend/ocr_config.toml` 中配置）；
   **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
   清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
+  同一弹窗内的 **OCR result cache** 区块显示缓存统计（条目数/占用/命中/未命中/TTL）
+  并提供 **Clear OCR cache** 一键清空（对应 `POST /api/cache/clear`）。
 - 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。

@@ -166,6 +166,17 @@
         <button id="btn-cleanup-run" class="primary" data-i18n="cleanup.cleanNow">Clean now</button>
         <button id="btn-cleanup-cancel" data-i18n="cleanup.cancel">Cancel</button>
       </div>
+
+      <!-- OCR result cache (inside the same housekeeping modal) -->
+      <div class="cache-panel">
+        <h3 data-i18n="cache.title">OCR result cache</h3>
+        <p class="hint" data-i18n-html="cache.intro"></p>
+        <div id="cache-summary" class="cleanup-summary"></div>
+        <div class="modal-actions cache-actions">
+          <button id="btn-cache-clear" class="warn" data-i18n="cache.clear">Clear OCR cache</button>
+        </div>
+        <div id="cache-status"></div>
+      </div>
       <div id="cleanup-status"></div>
     </div>
   </div>

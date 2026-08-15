@@ -100,6 +100,20 @@ class GenericOpenAiAdapter(OcrSource):
     def _chat_url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
+    def cache_fingerprint(self) -> dict:
+        """Output-affecting settings incl. the request prompt."""
+        import hashlib
+        return {
+            "engine": self.name,
+            "base_url": self.base_url,
+            "model": self.model,
+            "prompt": self.prompt,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "api_key_sha": hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
+            if self.api_key else "",
+        }
+
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
             raise RuntimeError(

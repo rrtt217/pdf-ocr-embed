@@ -8,6 +8,7 @@ config.toml
 output/
 work/
 uploads/
+cache/
 __pycache__/
 *.pyc
 *.egg-info/
