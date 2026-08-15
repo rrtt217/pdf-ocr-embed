@@ -26,7 +26,7 @@ CONFIG_FILE = BACKEND_DIR / "ocr_config.json"
 PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
     "ustc": {
         "base_url": "https://api.llm.ustc.edu.cn/v1",
-        "model": "glm-4v-flash",
+        "model": "unlimited-ocr",
     },
     "openai": {
         "base_url": "https://api.openai.com/v1",

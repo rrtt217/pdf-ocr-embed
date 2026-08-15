@@ -1,5 +1,7 @@
 # PDF OCR Embed
 
+> 中文 ｜ [English](README.en.md)
+
 跨平台的纯图片 PDF → 内嵌可搜索/可选中文字层工具。上传扫描 PDF，OCR 识别文字，
 按识别坐标把文字**不可见地嵌入** PDF 内层（搜索、复制、选择可用，视觉不叠加），
 同时提供 WebUI 编辑识别结果（修正错字）与文本框高亮预览。
@@ -59,7 +61,7 @@ pip install -r requirements.txt
 ```bash
 export OCR_API_KEY="你的 key"                 # 或 USTC_API_KEY 别名
 export OCR_BASE_URL="https://api.llm.ustc.edu.cn/v1"   # 任意 OpenAI 兼容端点
-export OCR_MODEL="glm-4v-flash"
+export OCR_MODEL="unlimited-ocr"
 export OCR_PROVIDER="ustc"                    # 可选：ustc | openai | custom
 ```
 
@@ -74,7 +76,7 @@ export OCR_PROVIDER="ustc"                    # 可选：ustc | openai | custom
   "provider": "ustc",
   "api_key": "你的 key",
   "base_url": "https://api.llm.ustc.edu.cn/v1",
-  "model": "glm-4v-flash"
+  "model": "unlimited-ocr"
 }
 ```
 
@@ -152,12 +154,13 @@ pdf-ocr-embed/
 │       ├── base.py             # OcrSource 抽象基类 + 坐标换算工具
 │       ├── factory.py          # adapter 注册/获取
 │       ├── unlimited_ocr_adapter.py   # 完整实现（<|det|> 标记解析）
-│       ├── tesseract_adapter.py       # stub
-│       └── generic_openai_adapter.py  # stub
+│       ├── tesseract_adapter.py       # 完整实现（本地 Tesseract）
+│       └── generic_openai_adapter.py  # 完整实现（任意 OpenAI 兼容视觉模型）
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
-│   └── app.js
+│   ├── app.js
+│   └── i18n.js                 # 英文 / 中文双语界面
 ├── requirements.txt
 ├── .env.example
 ├── .gitignore
@@ -180,7 +183,7 @@ pdf-ocr-embed/
     tessdata 不在默认位置时用 `OCR_TESSDATA_DIR`。
   - 每行文本聚合成一个 block，自动识别 heading / equation / text，输出置信度。
 - **generic_openai adapter（任意 OpenAI 兼容视觉模型）**：与 unlimited 相同
-  的 key/base_url/model 配置，`OCR_GENERIC_PROMPT` 可覆盖默认的 bbox-JSON 提示词。
+   的 key/base_url/model 配置，`OCR_GENERIC_PROMPT` 可覆盖默认的 bbox-JSON 提示词。
 - **并行数（concurrency）**：上传时可指定，WebUI 上传区有输入框，或调用
   `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。后端用线程池并发处理各页，
   `concurrency=1` 即顺序执行。注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。
