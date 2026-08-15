@@ -154,6 +154,19 @@ const I18N_DICT = {
     "cleanup.done": "Deleted {n} file(s), freed {bytes}. Kept {inUse} in use.",
     "cleanup.failed": "Cleanup failed: {msg}",
 
+    // --- OCR result cache ---
+    "cache.title": "OCR result cache",
+    "cache.intro": "Pages already recognized with the same document + engine + settings are stored on disk so re-uploads finish instantly without re-rendering or re-billing the engine. Clearing frees the disk; the next run will redo recognition from scratch.",
+    "cache.entries": "{n} cached entries, {bytes}",
+    "cache.hitsMisses": "{hits} hit(s) / {misses} miss(es)",
+    "cache.ttlHours": "entries expire after {h} hours",
+    "cache.disabled": "disabled in backend settings (ocr_cache_enabled)",
+    "cache.clear": "Clear OCR cache",
+    "cache.clearing": "Clearing cache…",
+    "cache.cleared": "Cleared {n} entries, freed {bytes}.",
+    "cache.failed": "Cache clear failed: {msg}",
+    "cache.loadFailed": "Failed to load cache info: {msg}",
+
     // --- logs ---
     "logs.title": "Debug logs",
     "logs.refresh": "Refresh",
@@ -302,6 +315,19 @@ const I18N_DICT = {
     "cleanup.previewDone": "预览：将删除 {n} 个文件，释放 {bytes}。保留：{inUse} 个使用中 / {fresh} 个太新。",
     "cleanup.done": "已删除 {n} 个文件，释放 {bytes}。保留 {inUse} 个使用中。",
     "cleanup.failed": "清理失败：{msg}",
+
+    // --- OCR result cache ---
+    "cache.title": "OCR 结果缓存",
+    "cache.intro": "相同文档 + 相同引擎与参数的已识别页会存到磁盘，再次上传同一 PDF 时直接命中、无需重新渲染或再次扣费。清空只释放磁盘空间；之后重跑会从头识别（API 引擎会重新计费）。",
+    "cache.entries": "{n} 个缓存条目，共 {bytes}",
+    "cache.hitsMisses": "命中 {hits} / 未命中 {misses}",
+    "cache.ttlHours": "条目 {h} 小时后过期",
+    "cache.disabled": "已在后端配置中关闭（ocr_cache_enabled）",
+    "cache.clear": "清空 OCR 缓存",
+    "cache.clearing": "正在清空…",
+    "cache.cleared": "已清空 {n} 个条目，释放 {bytes}。",
+    "cache.failed": "清空缓存失败：{msg}",
+    "cache.loadFailed": "加载缓存信息失败：{msg}",
 
     // --- logs ---
     "logs.title": "调试日志",

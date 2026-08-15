@@ -288,5 +288,7 @@ pdf-ocr-embed/
   **never deleted**. The **Cleanup** button at the top-right of the WebUI shows a
   summary, lets you adjust the retention window and clean manually (Preview first,
   then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.
+  The same dialog's **OCR result cache** section shows cache stats (entries/size/
+  hits/misses/TTL) with a one-click **Clear OCR cache** button (`POST /api/cache/clear`).
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `backend/ocr_config.toml`) must
   not be committed to the repository.

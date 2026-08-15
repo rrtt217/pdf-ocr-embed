@@ -793,6 +793,7 @@ function areaSummary(name, a) {
 
 async function openCleanup() {
   $("#cleanup-modal").classList.remove("hidden");
+  refreshCacheInfo();  // OCR result-cache panel in the same modal
   const status = $("#cleanup-status");
   status.textContent = "";
   $("#cleanup-summary").innerHTML = "";
@@ -818,6 +819,48 @@ async function openCleanup() {
     }
   } catch (e) {
     status.textContent = t("cleanup.loadFailed", { msg: e.message });
+  }
+}
+
+/* ---------- OCR result cache ---------- */
+async function refreshCacheInfo() {
+  const sum = $("#cache-summary");
+  const status = $("#cache-status");
+  if (!sum) return;
+  try {
+    const data = await api("/api/cache");
+    sum.innerHTML = "";
+    sum.appendChild(el("div", "",
+      t("cache.entries", { n: data.entries, bytes: fmtBytes(data.bytes) })
+      + " · " + t("cache.hitsMisses", { hits: data.hits, misses: data.misses })));
+    sum.appendChild(el("div", "hint", data.enabled
+      ? t("cache.ttlHours", { h: Math.round(data.max_age_hours) })
+      : t("cache.disabled")));
+    if (status) status.textContent = "";
+  } catch (e) {
+    if (sum) {
+      sum.innerHTML = "";
+      sum.appendChild(el("div", "hint", t("cache.loadFailed", { msg: e.message })));
+    }
+  }
+}
+
+async function clearOcrCache() {
+  const btn = $("#btn-cache-clear");
+  const status = $("#cache-status");
+  if (!btn) return;
+  btn.disabled = true;
+  if (status) status.textContent = t("cache.clearing");
+  try {
+    const data = await api("/api/cache/clear", { method: "POST" });
+    const msg = t("cache.cleared", { n: data.removed, bytes: fmtBytes(data.freed_bytes) });
+    if (status) status.textContent = msg;
+    toast(msg, "success");
+    await refreshCacheInfo();
+  } catch (e) {
+    if (status) status.textContent = t("cache.failed", { msg: e.message });
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -986,6 +1029,7 @@ async function init() {
   $("#btn-dataset").onclick = downloadDataset;
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
+  $("#btn-cache-clear").onclick = clearOcrCache;
   $("#btn-cleanup-preview").onclick = () => runCleanup(true);
   $("#btn-cleanup-run").onclick = () => runCleanup(false);
   $("#btn-cleanup-cancel").onclick = () => $("#cleanup-modal").classList.add("hidden");

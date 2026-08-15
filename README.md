@@ -252,4 +252,6 @@ pdf-ocr-embed/
   （两个值都在 `backend/ocr_config.toml` 中配置）；
   **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
   清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
+  同一弹窗内的 **OCR result cache** 区块显示缓存统计（条目数/占用/命中/未命中/TTL）
+  并提供 **Clear OCR cache** 一键清空（对应 `POST /api/cache/clear`）。
 - 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。
