@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 from backend import ocr_cache as cache
 from backend import ocr_service
@@ -163,3 +164,101 @@ def test_recognize_page_page_index_isolates_entries(monkeypatch, tmp_path):
     ocr_service._recognize_page(job, adapter, spec1)
     assert adapter.calls == 3
     assert cache.status()['hits'] >= 1
+
+def test_page_cache_key_stable_and_sensitive():
+    job = {'pdf_sha256': 'abc'}
+    fp = {'model': 'm', 'api_key_sha': 'x'}
+    k1 = ocr_service._page_cache_key(job, fp, 0)
+    k2 = ocr_service._page_cache_key(job, dict(fp), 0)
+    assert k1 == k2 and len(k1) == 64
+    # any semantic change must miss
+    assert k1 != ocr_service._page_cache_key(job, fp, 1)
+    assert k1 != ocr_service._page_cache_key({'pdf_sha256': 'other'}, fp, 0)
+    assert k1 != ocr_service._page_cache_key(job, {'model': 'other'}, 0)
+
+
+def test_cache_precheck_splits_hits_and_misses(monkeypatch, tmp_path):
+    _use_tmp_entry_dir(monkeypatch, tmp_path)
+    job = {'id': 'j4', 'pdf_sha256': 'abc'}
+    fp = {'tag': 'A'}
+    seed = OcrPage(0, 10, 10, []).to_dict()
+    for i in (0, 2):
+        cache.put_page(ocr_service._page_cache_key(job, fp, i), seed)
+    hits_before = cache.status()['hits']
+    misses_before = cache.status()['misses']
+    hits, misses = ocr_service._cache_precheck(job, fp, [0, 1, 2, 3])
+    assert set(hits) == {0, 2} and misses == [1, 3]
+    assert cache.status()['hits'] == hits_before + 2
+    # precheck probes must not pollute the miss counter (double counting)
+    assert cache.status()['misses'] == misses_before
+
+
+def test_recognize_page_prefers_explicit_fingerprint(monkeypatch, tmp_path):
+    _use_tmp_entry_dir(monkeypatch, tmp_path)
+    job = {'id': 'j5', 'pdf_sha256': 'abc'}
+    spec = {'page_index': 0, 'img_path': 'x.png', 'w': 100, 'h': 200}
+
+    # Fingerprint computed once per run must win over per-instance values,
+    # otherwise parallel workers could key differently and miss the cache.
+    a1 = CountingAdapter('A')
+    p1 = ocr_service._recognize_page(job, a1, spec, fingerprint={'tag': 'Z'})
+    assert a1.calls == 1
+    a2 = CountingAdapter('WRONG')  # its own fingerprint would miss;
+    p2 = ocr_service._recognize_page(job, a2, spec, fingerprint={'tag': 'Z'})
+    assert a2.calls == 0           # the explicit fingerprint still hit
+    assert p1.blocks[0].text == p2.blocks[0].text
+
+
+def test_run_ocr_second_job_served_from_cache_without_rendering(
+        monkeypatch, tmp_path):
+    _use_tmp_entry_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(ocr_service, 'WORK_DIR', tmp_path / 'work')
+    import fitz
+
+    doc = fitz.open()
+    for _ in range(3):
+        page = doc.new_page(width=200, height=200)
+        page.insert_text(fitz.Point(50, 100), 'hello smoke page')
+    pdf_path = tmp_path / 'doc.pdf'
+    doc.save(str(pdf_path))
+    doc.close()
+    pdf_bytes = pdf_path.read_bytes()
+
+    adapter = CountingAdapter('A')
+    monkeypatch.setattr(ocr_service, '_make_adapter',
+                        lambda *a, **k: adapter)
+
+    # -- first upload: renders + engine calls for every page --
+    job1 = ocr_service.create_job('doc.pdf', pdf_bytes)
+    ocr_service.run_ocr(job1['id'], 'fake', None, 2)
+    assert job1['status'] == 'done'
+    assert sum(1 for p in job1['pages'] if p) == 3
+    assert adapter.calls == 3
+    ev1 = ocr_service.drain_events(job1['id'])
+    phases1 = [e.get('phase') for e in ev1 if e.get('type') == 'progress']
+    assert 'render' in phases1 and 'ocr' in phases1   # both phases on SSE
+    img_dir1 = Path(job1['img_dir'])
+    assert (img_dir1 / 'page_0000.png').exists()
+    assert not list(img_dir1.glob('.page_*.tmp'))     # atomic write, no temp
+
+    # -- second upload of the same PDF: zero renders, zero engine calls --
+    job2 = ocr_service.create_job('doc.pdf', pdf_bytes)
+    ocr_service.run_ocr(job2['id'], 'fake', None, 2)
+    assert job2['status'] == 'done'
+    assert adapter.calls == 3                         # nothing ran again
+    ev2 = ocr_service.drain_events(job2['id'])
+    phases2 = [e.get('phase') for e in ev2 if e.get('type') == 'progress']
+    assert 'render' not in phases2                    # skipped entirely
+    cached = [e for e in ev2 if e.get('cached')]
+    assert len(cached) == 3                           # 3 cache-hit markers
+    img_dir2 = Path(job2['img_dir'])
+    assert not (img_dir2 / 'page_0000.png').exists()  # not rendered yet
+
+    # -- the preview is rendered lazily on first view --
+    p = ocr_service.ensure_page_image(job2['id'], 0)
+    assert p is not None and Path(p).exists()
+    assert (img_dir2 / 'page_0000.png').exists()
+    assert ocr_service.ensure_page_image(job2['id'], 99) is None
+
+    ocr_service.clear_job(job1['id'])
+    ocr_service.clear_job(job2['id'])

@@ -81,7 +81,7 @@
     重跑」（对调 prompt、换引擎后的 A/B 试跑非常有用）。涉及
     `backend/ocr_service.py` 与 upload/retry 参数。
 
-13. **OCR 结果缓存**（S / ✅ 已实现于 `feat/01-tests-ocr-cache`：`backend/ocr_cache.py`，hash 键 + TTL + `/api/cache`）
+13. **OCR 结果缓存**（S / ✅ 已实现于 `feat/01-tests-ocr-cache`：`backend/ocr_cache.py`，hash 键 + TTL + `/api/cache`；命中页跳过整页渲染，SSE 渲染/识别分阶段进度，预览图按需补渲染）
     按「源 PDF hash + 页码 + 预处理参数 + 引擎/参数」缓存 `OcrPage`。重复跑
     同一文件不再重复调用 API（省时省钱），对大文档反复调试价值突出。注意缓存
     生命周期要纳入 cleanup。

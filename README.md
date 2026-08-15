@@ -239,6 +239,9 @@ pdf-ocr-embed/
   `ocr_cache_max_age_hours`（默认 720h），`ocr_cache_enabled = false` 可整体关闭；
   后台清理循环会顺带过期清理，`GET /api/cache` 看命中统计、`POST /api/cache/clear`
   一键清空。缓存只存**识别原文**，用户在页面上做的文字/字体修改完全不受影响。
+  **命中即跳过渲染**：重新上传同一文档时，缓存命中的页不需要重新渲染 PNG
+  （预览图在首次查看时按需补渲染）。SSE 进度分 `render`（预处理渲染）与
+  `ocr`（识别）两个阶段推送，处理大文件时进度条在渲染阶段就持续前进。
 - **调试日志**：后端全链路 logging（`backend/ocr_config.toml` 的 `log_level` 控制级别，
   默认 INFO，设 DEBUG 看详细）。WebUI 右上角 **Logs** 按钮可实时查看后端日志，
   或调用 `GET /api/logs`。

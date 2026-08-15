@@ -115,20 +115,29 @@ def _bump(hit: bool) -> None:
             _misses += 1
 
 
-def get_page(key: str) -> Optional[Dict[str, Any]]:
-    """Fetch a cached OcrPage dict for *key*, or None on miss / expiry / damage."""
+def get_page(key: str, count_misses: bool = True) -> Optional[Dict[str, Any]]:
+    """Fetch a cached OcrPage dict for *key*, or None on miss / expiry / damage.
+
+    ``count_misses=False`` is used by the pre-render cache precheck, whose
+    fruitless lookups are pure optimization probes — they must not pollute the
+    hit/miss statistics with double counting (the real lookup happens again
+    inside ``_recognize_page`` for the pages that go to the engine).
+    """
     if not is_enabled():
-        _bump(False)
+        if count_misses:
+            _bump(False)
         return None
     path = _entry_path(key)
     try:
         if not path.exists():
-            _bump(False)
+            if count_misses:
+                _bump(False)
             return None
         st = path.stat()
         if time.time() - st.st_mtime > max_age_hours() * 3600.0:
             path.unlink(missing_ok=True)
-            _bump(False)
+            if count_misses:
+                _bump(False)
             return None
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -137,7 +146,8 @@ def get_page(key: str) -> Optional[Dict[str, Any]]:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        _bump(False)
+        if count_misses:
+            _bump(False)
         return None
 
     page = data.get("page") if isinstance(data, dict) else None
@@ -146,7 +156,8 @@ def get_page(key: str) -> Optional[Dict[str, Any]]:
             path.unlink(missing_ok=True)
         except OSError:
             pass
-        _bump(False)
+        if count_misses:
+            _bump(False)
         return None
     _bump(True)
     return page

@@ -272,6 +272,10 @@ pdf-ocr-embed/
   disables it entirely. The background cleanup loop also expires old entries;
   `GET /api/cache` shows hit/miss stats and `POST /api/cache/clear` wipes the cache.
   Only *pristine* recognition results are cached — your per-page edits are unaffected.
+  **Hits skip rendering entirely**: re-uploading the same document does not
+  re-rasterize any cached page (preview PNGs render lazily on first view).
+  SSE progress is split into a `render` (preprocessing) phase and an `ocr`
+  phase, so the progress bar keeps moving while large files are rasterized.
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.

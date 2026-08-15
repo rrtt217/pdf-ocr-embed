@@ -12,6 +12,7 @@ downward.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -77,11 +78,24 @@ def render_page(page: fitz.Page) -> "tuple[fitz.Pixmap, int, int]":
 
 
 def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tuple[str, int, int]:
-    """Render page to PNG on disk. Returns (path, width_px, height_px)."""
+    """Render page to PNG on disk. Returns (path, width_px, height_px).
+
+    The PNG is written atomically (temp file + os.replace): the OCR pre-render
+    phase and the lazy on-demand preview render (cache-hit pages are rendered
+    only when first viewed) may race in practice, and no reader should ever
+    observe a half-written image.
+    """
     out_path.mkdir(parents=True, exist_ok=True)
     pix, w, h = render_page(page)
     png_path = out_path / f"page_{page_index:04d}.png"
-    pix.save(str(png_path))
+    tmp_path = out_path / f".page_{page_index:04d}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
+        pix.save(str(tmp_path), output="png")
+        os.replace(tmp_path, png_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     log.debug("rendered page %d -> %s (%dx%d)", page_index, png_path, w, h)
     return str(png_path), w, h
 

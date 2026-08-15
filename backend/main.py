@@ -344,7 +344,11 @@ def update_page(job_id: str, page_index: int, payload: dict) -> dict:
 
 @app.get("/api/pages/{job_id}/{page_index}/image")
 def page_image(job_id: str, page_index: int):
+    # Cache-hit pages skip the pre-render phase; render their preview lazily
+    # the first time the WebUI asks for it.
     path = ocr_service.page_preview_path(job_id, page_index)
+    if path is None:
+        path = ocr_service.ensure_page_image(job_id, page_index)
     if path is None:
         raise HTTPException(status_code=404, detail="Page image not found")
     return FileResponse(path, media_type="image/png")

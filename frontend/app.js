@@ -242,12 +242,20 @@ function jobCard(job) {
   title.appendChild(el("span", "pill" + (pcls ? " " + pcls : ""),
                        t(STATUS_LABEL[job.status] || job.status)));
   head.appendChild(title);
-  head.appendChild(el("span", "job-count", `${job.current} / ${job.total || "?"}`));
+  // During the pre-OCR render phase the bar reflects render progress; the
+  // page-level counts are shown again once OCR itself starts.
+  const rendering = !!(job.render && job.render.total > 0 && job.render.current < job.render.total);
+  const countLabel = rendering
+    ? "⏳ " + job.render.current + " / " + job.render.total
+    : job.current + " / " + (job.total || "?");
+  head.appendChild(el("span", "job-count", countLabel));
   card.appendChild(head);
 
   const bar = el("div", "bar");
   const fill = el("div", "fill");
-  fill.style.width = job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%";
+  fill.style.width = rendering
+    ? Math.round((job.render.current / job.render.total) * 100) + "%"
+    : (job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%");
   bar.appendChild(fill);
   card.appendChild(bar);
 
@@ -314,13 +322,21 @@ function applyJobEvent(jobId, msg) {
   const prevCurrent = job.current;
 
   if (msg.type === "progress") {
-    Object.assign(job, {
-      status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
-      current: msg.current,
-      total: msg.total,
-      error: null,
-    });
+    if (msg.phase === "render") {
+      // Pre-OCR rasterization phase: advance the bar with render counts and
+      // keep the page-level current/total untouched (they only count OCR).
+      job.render = { current: msg.current, total: msg.total };
+    } else {
+      job.render = null;
+      Object.assign(job, {
+        status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
+        current: msg.current,
+        total: msg.total,
+        error: null,
+      });
+    }
   } else if (msg.type === "status") {
+    job.render = null;
     const done = (msg.result || []).filter(Boolean).length;
     Object.assign(job, {
       status: msg.status,
