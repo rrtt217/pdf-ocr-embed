@@ -306,3 +306,15 @@ class TesseractAdapter(OcrSource):
     def close(self) -> None:
         # Nothing to release (pytesseract spawns a short-lived subprocess).
         pass
+
+    def cache_fingerprint(self) -> dict:
+        """Output-affecting settings: language + segmentation/engine flags."""
+        return {
+            "engine": self.name,
+            "lang": self.lang,
+            "psm": self.psm,
+            "oem": self.oem,
+            "config": self.config,
+            "tessdata_dir": self.tessdata_dir or "",
+            "tess_cmd": self.tess_cmd or "",
+        }

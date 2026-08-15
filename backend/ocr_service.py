@@ -6,6 +6,7 @@ drives the SSE progress stream.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import shutil
@@ -21,6 +22,7 @@ from backend.config import resolve
 
 import fitz  # PyMuPDF
 
+from backend import ocr_cache
 from backend import pdf_processing
 from backend.models import OcrPage, dict_to_page, page_to_dict
 from backend.sources.factory import get_adapter
@@ -59,6 +61,7 @@ def create_job(filename: str, file_bytes: bytes) -> dict:
             "id": job_id,
             "filename": safe_name,
             "pdf_path": str(pdf_path),
+            "pdf_sha256": hashlib.sha256(file_bytes).hexdigest(),
             "img_dir": str(src_dir),
             "pages": [],            # list of OcrPage dicts (normalized), None = not done
             "num_pages": 0,
@@ -414,6 +417,35 @@ def _make_adapter(name: str, adapter_kwargs: dict):
         return adapter
 
 
+def _recognize_page(job, adapter, spec):
+    """Run OCR on one page with the cross-job result cache in front.
+
+    The cache key covers the source PDF content hash, the page index, the
+    render parameters and the adapter's output-affecting settings
+    (``OcrSource.cache_fingerprint``), so a hit only happens for byte-
+    identical work; any engine/settings change misses and re-runs.
+    Only the *pristine* OCR output is cached — user edits live in job
+    state above this layer and never touch the cache.
+    """
+    context = {
+        "v": 1,
+        "pdf_sha": job.get("pdf_sha256", ""),
+        "page": spec["page_index"],
+        "zoom": pdf_processing.PIXEL_RENDER_ZOOM,
+        "render": {"fmt": "png", "alpha": False},
+        "adapter": adapter.cache_fingerprint(),
+    }
+    key = ocr_cache.build_key(context)
+    cached = ocr_cache.get_page(key)
+    if cached is not None:
+        log.info("job %s: page %d OCR cache hit", job["id"], spec["page_index"])
+        return dict_to_page(cached)
+    ocr_page = adapter.recognize_pixels(spec["img_path"], spec["w"], spec["h"],
+                                        spec["page_index"])
+    ocr_cache.put_page(key, page_to_dict(ocr_page))
+    return ocr_page
+
+
 def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel):
     for spec in page_specs:
         if cancel.is_set():
@@ -424,7 +456,7 @@ def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel):
 def _ocr_one_page_and_report(job, job_id, adapter, spec, num):
     i = spec["page_index"]
     log.debug("job %s: OCR page %d", job_id, i)
-    ocr_page = adapter.recognize_pixels(spec["img_path"], spec["w"], spec["h"], i)
+    ocr_page = _recognize_page(job, adapter, spec)
     update_page(job_id, i, page_to_dict(ocr_page))
     _bump_progress(job, job_id, num)
 
@@ -463,8 +495,7 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
         try:
             worker = _make_adapter(job.get("adapter", "unlimited"), adapter_kwargs)
             log.debug("job %s: OCR page %d (parallel)", job_id, spec["page_index"])
-            ocr_page = worker.recognize_pixels(spec["img_path"], spec["w"], spec["h"],
-                                               spec["page_index"])
+            ocr_page = _recognize_page(job, worker, spec)
             if cancel.is_set():
                 return spec["page_index"], None
             update_page(job_id, spec["page_index"], page_to_dict(ocr_page))

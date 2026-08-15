@@ -140,6 +140,8 @@ is not set). The mapping from environment variables to TOML keys is:
 | `OCR_EMBED_FONT` | `embed_font` |
 | `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
 | `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
+| `OCR_CACHE_ENABLED` | `ocr_cache_enabled` |
+| `OCR_CACHE_MAX_AGE_HOURS` | `ocr_cache_max_age_hours` |
 | `OCR_LOG_LEVEL` | `log_level` |
 
 ---
@@ -192,6 +194,8 @@ uvicorn backend.main:app --port 8000
 | GET | `/api/download/{job_id}.pdf` | Download the embedded result |
 | GET | `/api/cleanup` | Temp-file cleanup overview (unreferenced work/output/uploads counts + sizes) |
 | POST | `/api/cleanup/run` | Run/preview cleanup (`older_than_hours`, `dry_run` preview, `force` to ignore the age limit; in-use job files are never deleted) |
+| GET | `/api/cache` | OCR result-cache status (entries/bytes, hit and miss counts, TTL, enabled flag) |
+| POST | `/api/cache/clear` | Drop all cached OCR results (never touches OCR results held in job state) |
 
 ---
 
@@ -218,6 +222,8 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # EN + 中文 UI strings
+├── tests/                      # pytest suite (coordinate mapping / parsers / cache, ...)
+├── requirements-dev.txt        # dev dependencies (pytest)
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
@@ -258,6 +264,14 @@ pdf-ocr-embed/
   `POST /api/ocr/stop/{job_id}`). Completed pages are kept — download them as a
   partial `*_embedded.pdf` via **Download partial**, or finish the rest with
   **Retry remaining**.
+- **OCR result cache**: identical work (same PDF content + page + engine + settings)
+  is cached by content hash under `cache/ocr/` (key = source-PDF hash + page number +
+  render parameters + engine fingerprint; no secrets or page images are ever written).
+  Re-OCRing the same document hits the cache instead of re-calling the engine.
+  TTL comes from `ocr_cache_max_age_hours` (default 720h); `ocr_cache_enabled = false`
+  disables it entirely. The background cleanup loop also expires old entries;
+  `GET /api/cache` shows hit/miss stats and `POST /api/cache/clear` wipes the cache.
+  Only *pristine* recognition results are cached — your per-page edits are unaffected.
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.

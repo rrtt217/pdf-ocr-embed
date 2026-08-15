@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_service
+from backend import config, ocr_cache, ocr_service
 from backend.logging_config import recent_logs, setup_logging
 from backend.sources.factory import available_adapters
 
@@ -128,6 +128,20 @@ def run_cleanup(payload: CleanupModel) -> dict:
         force=payload.force,
         dry_run=payload.dry_run,
     )
+
+
+
+
+@app.get("/api/cache")
+def cache_status() -> dict:
+    """Status of the cross-job OCR result cache (entries, hits/misses, TTL)."""
+    return ocr_cache.status()
+
+
+@app.post("/api/cache/clear")
+def cache_clear() -> dict:
+    """Drop every OCR cache entry (never touches OCR results in job state)."""
+    return ocr_cache.clear()
 
 
 @app.get("/api/settings")

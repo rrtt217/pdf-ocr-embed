@@ -99,6 +99,17 @@ class UnlimitedOcrAdapter(OcrSource):
     def _chat_url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
+    def cache_fingerprint(self) -> dict:
+        """Output-affecting settings: endpoint, model, and key identity."""
+        import hashlib
+        return {
+            "engine": self.name,
+            "base_url": self.base_url,
+            "model": self.model,
+            "api_key_sha": hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
+            if self.api_key else "",
+        }
+
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
             raise RuntimeError(

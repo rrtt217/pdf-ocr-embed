@@ -20,7 +20,7 @@
 
 ## A. OCR 正确性与质量
 
-1. **置信度审阅视图**（S / 高价值）
+1. **置信度审阅视图**（S / 高价值 / 未做）
    `OcrBlock.conf` 一直存在，但前端从未消费。按置信度给块着色/排序、一键过滤
    「低于阈值」的块、跳转审阅，能显著降低人工纠错成本。
    涉及：`frontend/app.js`（buildBlockEditor/overlay）+ 少量 i18n。
@@ -81,7 +81,7 @@
     重跑」（对调 prompt、换引擎后的 A/B 试跑非常有用）。涉及
     `backend/ocr_service.py` 与 upload/retry 参数。
 
-13. **OCR 结果缓存**（S）
+13. **OCR 结果缓存**（S / ✅ 已实现于 `feat/01-tests-ocr-cache`：`backend/ocr_cache.py`，hash 键 + TTL + `/api/cache`）
     按「源 PDF hash + 页码 + 预处理参数 + 引擎/参数」缓存 `OcrPage`。重复跑
     同一文件不再重复调用 API（省时省钱），对大文档反复调试价值突出。注意缓存
     生命周期要纳入 cleanup。
@@ -119,7 +119,7 @@
 
 ## E. 运维与工程质量
 
-21. **pytest 测试脚手架（P0）**（S）
+21. **pytest 测试脚手架（P0）**（S / ✅ 已实现于 `feat/01-tests-ocr-cache`：`tests/` 49 用例 + `requirements-dev.txt`）
     优先覆盖 `sources/*` 的解析器与 `base.normalize_bbox` 等坐标纯函数，
     再覆盖 embed 的 y 轴翻转与缩放。这是所有后续功能的安全网。
 

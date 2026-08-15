@@ -31,6 +31,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from backend import ocr_cache
 from backend.config import resolve
 
 log = logging.getLogger(__name__)
@@ -257,6 +258,18 @@ def start_background_cleanup() -> threading.Thread:
     return _thread
 
 
+def _purge_ocr_cache() -> None:
+    """Expire old OCR-cache entries on the same background cadence."""
+    try:
+        result = ocr_cache.purge_expired()
+        if result["removed"]:
+            log.info("auto-cleanup: OCR cache purged %d entr%s (%.1f MB)",
+                     result["removed"], "y" if result["removed"] == 1 else "ies",
+                     result["freed_bytes"] / _MB)
+    except Exception:  # noqa: BLE001
+        log.exception("auto-cleanup: OCR cache purge failed")
+
+
 def stop_background_cleanup() -> None:
     """Signal the background loop to exit (used on server shutdown)."""
     _stop.set()
@@ -272,6 +285,7 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: initial pass failed")
+        _purge_ocr_cache()
     while not _stop.is_set():
         if _stop.wait(interval_hours() * 3600.0):
             break
@@ -282,3 +296,4 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: pass failed")
+        _purge_ocr_cache()
