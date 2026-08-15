@@ -20,7 +20,7 @@
 
 ## A. OCR 正确性与质量
 
-1. **置信度审阅视图**（S / 高价值 / 未做）
+1. **置信度审阅视图**（S / 高价值 / ✅ 已实现于 `feat/02-conf-review-output-opt`：conf 徽标 + 阈值过滤 + 页 tab 角标 + 低置信红描边）
    `OcrBlock.conf` 一直存在，但前端从未消费。按置信度给块着色/排序、一键过滤
    「低于阈值」的块、跳转审阅，能显著降低人工纠错成本。
    涉及：`frontend/app.js`（buildBlockEditor/overlay）+ 少量 i18n。
@@ -105,7 +105,7 @@
     置信度分布，UI 展示报告。这是「信不信这个 PDF」的关键闭环，几乎无人做过，
     差异化大。涉及：`backend/pdf_processing.py` + 新校验模块 + 前端报告视图。
 
-18. **输出 PDF 优化选项**（S）
+18. **输出 PDF 优化选项**（S / ✅ 已实现于 `feat/02-conf-review-output-opt`：JPEG/灰度重压、降采样 1/2·1/4、linearize 降级回退 + 统计）
     嵌入时可选：图片降采样/重压缩、线性化（web 快开）、PDF/A 合规。PyMuPDF
     `doc.save(...)` 已支持大部分参数，主要是暴露开关与预设。
 

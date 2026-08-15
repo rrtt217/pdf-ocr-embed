@@ -36,6 +36,12 @@ const PREFS = {
   concurrency: "pdfocr.ui.concurrency",
   zoom: "pdfocr.ui.zoom",
   embedFont: "pdfocr.ui.embedFont",
+  confFilter: "pdfocr.ui.confFilter",
+  confThreshold: "pdfocr.ui.confThreshold",
+  imgMode: "pdfocr.ui.imgMode",
+  imgQuality: "pdfocr.ui.imgQuality",
+  imgDownscale: "pdfocr.ui.imgDownscale",
+  linearize: "pdfocr.ui.linearize",
 };
 
 function getPref(key, fallback) {
@@ -56,9 +62,37 @@ const state = {
   es: {},       // jobId -> EventSource
   logTimer: null,
   embedFont: "",   // selected system font name for the text layer
+  confFilter: false,   // show only low-confidence blocks in the editor
+  confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
 };
 
 /* ---------- helpers ---------- */
+/* ---------- confidence review (#1) ---------- */
+function confPct(block) {
+  const c = block && block.conf;
+  if (typeof c !== "number" || !isFinite(c)) return null;
+  return c > 1 ? c : c * 100;   // engines report 0..100 or 0..1
+}
+
+function confClass(pct) {
+  if (pct === null) return "conf-na";
+  return pct >= 85 ? "conf-high" : pct >= 60 ? "conf-med" : "conf-low";
+}
+
+function isLowConf(block) {
+  const p = confPct(block);
+  return p !== null && p < state.confThreshold;
+}
+
+function pageLowConfCount(page) {
+  return (page.blocks || []).filter(isLowConf).length;
+}
+
+function jobHasConfData() {
+  const sel = state.sel;
+  return !!sel && sel.pages.some((pg) => (pg.blocks || [])
+    .some((b) => confPct(b) !== null));
+}
 function setStatus(code, cls) {
   const elx = $("#conn-status");
   elx.textContent = t("status." + code);
@@ -510,8 +544,13 @@ function renderTabs() {
   wrap.innerHTML = "";
   const sel = state.sel;
   if (!sel) return;
-  sel.pages.forEach((_, i) => {
+  sel.pages.forEach((pg, i) => {
     const tab = el("button", "page-tab" + (i === sel.pageIndex ? " active" : ""), String(i + 1));
+    const low = pageLowConfCount(pg);
+    if (low) {
+      tab.appendChild(el("span", "tab-badge", String(low)));
+      tab.title = t("editor.confPageBadge", { n: low, p: state.confThreshold });
+    }
     tab.onclick = () => { sel.pageIndex = i; renderTabs(); renderPage(); };
     wrap.appendChild(tab);
   });
@@ -540,8 +579,27 @@ function renderPage() {
     blocksBox.appendChild(el("div", "", t("editor.noBlocks")));
   }
   (page.blocks || []).forEach((block, bi) => {
+    if (state.confFilter && !isLowConf(block)) return;
     blocksBox.appendChild(buildBlockEditor(block, bi));
   });
+  if (state.confFilter && blocksBox.childElementCount === 0
+      && page.blocks && page.blocks.length) {
+    blocksBox.appendChild(el("div", "embed-hint",
+      t("editor.confNoLowOnPage", { p: state.confThreshold })));
+  }
+
+  // Confidence summary line
+  const count = $("#conf-count");
+  if (count) {
+    if (!jobHasConfData()) {
+      count.textContent = t("editor.confNoData");
+    } else {
+      const total = state.sel.pages.reduce((n, pg) => n + pageLowConfCount(pg), 0);
+      count.textContent = total
+        ? t("editor.confCount", { n: total, p: state.confThreshold })
+        : t("editor.confNone", { p: state.confThreshold });
+    }
+  }
 
   $("#zoom-label").textContent = state.zoom + "%";
   img.style.width = state.zoom + "%";
@@ -564,7 +622,13 @@ function drawOverlay(page) {
 
   (page.blocks || []).forEach((block) => {
     const [x1, y1, x2, y2] = block.bbox;
-    ctx.strokeStyle = block.kind === "image" ? "#7a5cff" : "#2f6fed";
+    let color = block.kind === "image" ? "#7a5cff" : "#2f6fed";
+    if (block.kind !== "image") {
+      const cls = confClass(confPct(block));
+      if (cls === "conf-low") color = "#e85d3a";
+      else if (cls === "conf-med") color = "#f0a020";
+    }
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
     ctx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
   });
@@ -573,8 +637,12 @@ function drawOverlay(page) {
 function buildBlockEditor(block, bi) {
   const wrapper = el("div", "block");
   wrapper.dataset.bi = bi;
+  const pct = confPct(block);
+  if (confClass(pct) === "conf-low") wrapper.classList.add("block-low");
   const meta = el("div", "meta");
   meta.appendChild(el("span", "badge", block.kind));
+  meta.appendChild(el("span", "conf-badge " + confClass(pct),
+    pct === null ? t("editor.confNa") : Math.round(pct) + "%"));
   meta.appendChild(el("div", "coords", block.bbox.join(", ") + " px"));
 
   const textarea = document.createElement("textarea");
@@ -645,11 +713,20 @@ async function embed() {
   if (!sel || !sel.pages.length) return;
   $("#btn-embed").disabled = true;
   $("#embed-status").textContent = t("embed.busy");
+  const imgMode = $("#img-mode") ? $("#img-mode").value : "none";
+  const imgQuality = $("#img-quality") ? parseInt($("#img-quality").value || "75", 10) : 75;
+  const imgDownscaleRaw = $("#img-downscale") ? $("#img-downscale").value : "";
+  const imgDownscale = imgDownscaleRaw ? parseInt(imgDownscaleRaw, 10) : null;
+  const linearize = !!( $("#opt-linearize") && $("#opt-linearize").checked);
   try {
     const out = await api(`/api/embed/${sel.jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ job_id: sel.jobId, pages: sel.pages, embed_font: state.embedFont }),
+      body: JSON.stringify({
+        job_id: sel.jobId, pages: sel.pages, embed_font: state.embedFont,
+        img_mode: imgMode, img_quality: imgQuality,
+        img_downscale: imgDownscale, linearize: linearize,
+      }),
     });
     sel.embedded = true;
     setStatus("embedded", "done");
@@ -657,7 +734,14 @@ async function embed() {
     link.classList.remove("hidden");
     link.href = out.url;
     link.textContent = t("embed.download", { name: out.filename });
-    $("#embed-status").textContent = t("embed.done");
+    let extra = "";
+    const imgs = out.images;
+    if (imgs && imgs.replaced > 0) {
+      extra = " " + t("embed.optStats", { n: imgs.replaced, bytes: fmtBytes(imgs.saved_bytes) });
+    }
+    if (imgs && imgs.linearized === true) extra += " " + t("embed.linearized");
+    else if (linearize && imgs && imgs.linearized === false) extra += " " + t("embed.linearUnavailable");
+    $("#embed-status").textContent = t("embed.done") + extra;
     const job = jobById(sel.jobId);
     if (job) { job.has_embedded = true; renderJobs(); }
     toast(t("toast.embedDone"), "success");
@@ -1000,6 +1084,36 @@ async function init() {
   }
   state.embedFont = getPref(PREFS.embedFont, "");
 
+  // --- confidence review preferences ---
+  state.confFilter = getPref(PREFS.confFilter, "") === "1";
+  const confBox = $("#conf-filter");
+  if (confBox) confBox.checked = state.confFilter;
+  const savedThr = parseFloat(getPref(PREFS.confThreshold, "60"));
+  if (savedThr >= 1 && savedThr <= 100) {
+    state.confThreshold = savedThr;
+    const thrBox = $("#conf-threshold");
+    if (thrBox) thrBox.value = String(Math.round(savedThr));
+  }
+
+  // --- output optimization preferences ---
+  const savedImgMode = getPref(PREFS.imgMode, "none");
+  if (["none", "jpeg", "gray-jpeg"].includes(savedImgMode)) {
+    const imBox = $("#img-mode");
+    if (imBox) imBox.value = savedImgMode;
+  }
+  const savedQ = parseFloat(getPref(PREFS.imgQuality, "75"));
+  if (savedQ >= 20 && savedQ <= 100) {
+    const qBox = $("#img-quality");
+    if (qBox) qBox.value = String(Math.round(savedQ));
+  }
+  const savedDs = getPref(PREFS.imgDownscale, "");
+  if (["2", "4"].includes(savedDs)) {
+    const dsBox = $("#img-downscale");
+    if (dsBox) dsBox.value = savedDs;
+  }
+  const linBox = $("#opt-linearize");
+  if (linBox) linBox.checked = getPref(PREFS.linearize, "") === "1";
+
   // 有任务运行时关闭标签页 → 浏览器原生关闭确认提示（任意一个任务在跑都会提示）。
   window.addEventListener("beforeunload", (e) => {
     if (!anyRunning()) return;
@@ -1030,6 +1144,28 @@ async function init() {
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
   $("#btn-cache-clear").onclick = clearOcrCache;
+
+  // --- confidence review controls ---
+  $("#conf-filter").onchange = () => {
+    state.confFilter = $("#conf-filter").checked;
+    setPref(PREFS.confFilter, state.confFilter ? "1" : "0");
+    renderPage();
+  };
+  $("#conf-threshold").onchange = () => {
+    const v = Math.max(1, Math.min(100, parseFloat($("#conf-threshold").value) || 60));
+    state.confThreshold = v;
+    $("#conf-threshold").value = String(Math.round(v));
+    setPref(PREFS.confThreshold, String(Math.round(v)));
+    renderTabs();
+    renderPage();
+  };
+
+  // --- output optimization controls (persist only; read at embed time) ---
+  $("#img-mode").onchange = () => setPref(PREFS.imgMode, $("#img-mode").value || "none");
+  $("#img-quality").onchange = () => setPref(PREFS.imgQuality, $("#img-quality").value || "75");
+  $("#img-downscale").onchange = () => setPref(PREFS.imgDownscale, $("#img-downscale").value);
+  $("#opt-linearize").onchange = () =>
+    setPref(PREFS.linearize, $("#opt-linearize").checked ? "1" : "0");
   $("#btn-cleanup-preview").onclick = () => runCleanup(true);
   $("#btn-cleanup-run").onclick = () => runCleanup(false);
   $("#btn-cleanup-cancel").onclick = () => $("#cleanup-modal").classList.add("hidden");
