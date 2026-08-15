@@ -75,6 +75,11 @@ class EmbedModel(BaseModel):
     model: Optional[str] = None
     pages: Optional[list] = None
     embed_font: Optional[str] = None   # system font name / path for the text layer
+    # --- output optimization (see backend/pdf_processing.optimize_images) ---
+    img_mode: Optional[str] = None      # none | jpeg | gray-jpeg
+    img_quality: Optional[int] = None   # 1..100 JPEG quality
+    img_downscale: Optional[int] = None # 2 (half) | 4 (quarter) raster dims
+    linearize: bool = False             # web-first / linearized PDF
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -457,7 +462,10 @@ def embed(job_id: str, payload: EmbedModel):
     embed_font = _resolve_embed_font(payload.embed_font)
     # embed_job filters out None entries, so partial results work too.
     try:
-        out_path = ocr_service.embed_job(job_id, pages, embed_font=embed_font)
+        out_path, img_stats = ocr_service.embed_job(
+            job_id, pages, embed_font=embed_font,
+            img_mode=payload.img_mode, img_quality=payload.img_quality,
+            img_downscale=payload.img_downscale, linearize=payload.linearize)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -467,6 +475,7 @@ def embed(job_id: str, payload: EmbedModel):
         "filename": out_path.name,
         "url": f"/api/download/{job_id}.pdf",
         "font": embed_font.name,
+        "images": img_stats,
     }
 
 

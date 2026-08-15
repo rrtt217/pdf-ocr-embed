@@ -49,6 +49,15 @@ nothing is hardcoded in the code.
   thread pool, significantly speeding up multi-page documents.
 - **Single-page WebUI** — editable text blocks on the left, page preview + bbox
   overlay on the right, settings form, embed button, progress bars, concurrency input.
+- **Confidence review** — every block shows a confidence badge (green/amber/red at
+  85/60), low-confidence blocks get a red outline; a "Low confidence only" filter
+  with an adjustable threshold (default 60%) and per-page badge counts on the tabs.
+  Engines that report no confidence (the API adapters) show a hint — Tesseract reports it.
+- **Output optimization** — optionally recompress page images to **JPEG / grayscale
+  JPEG** and **downscale** them (1/2, 1/4) at embed time; only replacements smaller
+  than the original are applied (soft-masked images are always kept). Optional
+  **linearization** degrades gracefully to a normal save where the bundled MuPDF
+  dropped it. Embed finishes with an "N image(s) replaced, saved X" note.
 - **i18n** — English & 中文 built in; switch anytime from the header
   (`frontend/i18n.js`), defaults to the browser language, applies instantly with no
   page refresh.
@@ -276,6 +285,12 @@ pdf-ocr-embed/
   re-rasterize any cached page (preview PNGs render lazily on first view).
   SSE progress is split into a `render` (preprocessing) phase and an `ocr`
   phase, so the progress bar keeps moving while large files are rasterized.
+- **Output-optimization notes**: image recompression is **lossy** — it only affects
+  the scanned background, never the text layer; soft-masked (transparent) images and
+  images that would grow are always kept. Per-run stats come back in the
+  `/api/embed` response (`images.replaced` / `saved_bytes` / `attempted` / `skipped`).
+  This MuPDF build dropped linearization: requesting it degrades to a normal save
+  with `images.linearized = false` — everything else is unaffected.
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.

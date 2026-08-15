@@ -91,6 +91,13 @@
       <div id="panes">
         <div id="editor-pane" class="pane">
           <h3 data-i18n="workspace.blockTitle">Editable text blocks</h3>
+          <div class="conf-toolbar">
+            <label class="inline-check"><input id="conf-filter" type="checkbox" />
+              <span data-i18n="editor.confLowOnly">Low confidence only</span></label>
+            <label class="inline-label"><span data-i18n="editor.confThreshold">Threshold</span>
+              <input id="conf-threshold" type="number" min="1" max="100" step="1" value="60" /></label>
+            <span id="conf-count" class="hint"></span>
+          </div>
           <div id="blocks"></div>
         </div>
         <div id="preview-pane" class="pane">
@@ -107,6 +114,29 @@
             <option value="" data-i18n="workspace.autoFont">Auto (default)</option>
           </select>
         </label>
+        <details class="embed-opts" id="embed-opts">
+          <summary data-i18n="workspace.outputOptions">Output options</summary>
+          <div class="embed-opts-grid">
+            <label class="inline-label"><span data-i18n="workspace.imgMode">Image mode</span>
+              <select id="img-mode">
+                <option value="none" data-i18n="workspace.imgMode.none">Keep original</option>
+                <option value="jpeg" data-i18n="workspace.imgMode.jpeg">Recompress JPEG</option>
+                <option value="gray-jpeg" data-i18n="workspace.imgMode.grayjpeg">Grayscale JPEG</option>
+              </select>
+            </label>
+            <label class="inline-label"><span data-i18n="workspace.imgQuality">JPEG quality</span>
+              <input id="img-quality" type="number" min="20" max="100" step="5" value="75" /></label>
+            <label class="inline-label"><span data-i18n="workspace.imgDownscale">Downscale</span>
+              <select id="img-downscale">
+                <option value="" data-i18n="workspace.imgDownscale.none">None</option>
+                <option value="2" data-i18n="workspace.imgDownscale.half">Half</option>
+                <option value="4" data-i18n="workspace.imgDownscale.quarter">Quarter</option>
+              </select>
+            </label>
+            <label class="inline-check"><input id="opt-linearize" type="checkbox" />
+              <span data-i18n="workspace.linearize">Fast web view (linearize)</span></label>
+          </div>
+        </details>
         <button id="btn-preview" class="small" data-i18n="workspace.previewOverlay" data-i18n-title="workspace.previewOverlayTitle">Preview overlay</button>
         <button id="btn-embed" class="primary" disabled data-i18n="workspace.embed" data-i18n-title="workspace.embedTitle">Embed invisible text</button>
         <a id="download-link" class="hidden" download></a>

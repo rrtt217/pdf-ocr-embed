@@ -665,7 +665,10 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
 
 
 def embed_job(job_id: str, pages: List[dict], out_dir: Optional[Path] = None,
-              embed_font=None) -> Path:
+              embed_font=None, img_mode: Optional[str] = None,
+              img_quality: Optional[int] = None,
+              img_downscale: Optional[int] = None,
+              linearize: bool = False):
     """Embed the (possibly edited) page list into an embedded copy.
 
     Pages that are None (not yet OCR'd / failed) are silently skipped so the
@@ -684,9 +687,11 @@ def embed_job(job_id: str, pages: List[dict], out_dir: Optional[Path] = None,
     log.info("job %s: embedding %d/%d pages (skipping %d incomplete) font=%s",
              job_id, len(ocr_pages), len(pages), len(pages) - len(valid),
              getattr(embed_font, "name", "builtin"))
-    out_file, thumb = pdf_processing.embed_invisible_text(
+    out_file, thumb, img_stats = pdf_processing.embed_invisible_text(
         job["pdf_path"], ocr_pages, out_dir or pdf_processing.ensure_output_dir(),
-        embed_font=embed_font)
+        embed_font=embed_font, img_mode=img_mode, img_quality=img_quality,
+        img_downscale=img_downscale, linearize=linearize)
     _set(job, status="embedded", embedded_path=str(out_file), thumb_path=str(thumb))
-    log.info("job %s: embedded -> %s", job_id, out_file)
-    return Path(out_file)
+    log.info("job %s: embedded -> %s (image optimize: %s)",
+             job_id, out_file, img_stats)
+    return Path(out_file), img_stats
