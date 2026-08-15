@@ -474,14 +474,15 @@ def download(job_id: str):
 
 
 # Serve static frontend assets (css/js) if present — with no-cache so JS
-# changes are picked up immediately without a hard browser refresh.
+# changes are picked up immediately without a hard browser refresh. The root
+# HTML gets the same no-cache treatment so markup updates always show up too.
 if FRONTEND_DIR.exists():
     from starlette.middleware.base import BaseHTTPMiddleware
 
     class NoCacheStaticMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
             response = await call_next(request)
-            if request.url.path.startswith("/static"):
+            if request.url.path == "/" or request.url.path.startswith("/static"):
                 response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             return response
 

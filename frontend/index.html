@@ -4,16 +4,40 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>PDF OCR Embed</title>
-  <link rel="stylesheet" href="/static/style.css?v=7" />
+  <meta name="theme-color" content="#f5f6f8" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2064%2064'%3E%3Crect%20width='64'%20height='64'%20rx='12'%20fill='%232f6fed'/%3E%3Crect%20x='14'%20y='20'%20width='36'%20height='6'%20rx='3'%20fill='%23fff'/%3E%3Crect%20x='14'%20y='30'%20width='36'%20height='6'%20rx='3'%20fill='%23fff'%20opacity='.85'/%3E%3Crect%20x='14'%20y='40'%20width='24'%20height='6'%20rx='3'%20fill='%23fff'%20opacity='.65'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/style.css?v=8" />
+  <script>
+    // Apply the saved theme before first paint to avoid a dark-mode flash.
+    (function () {
+      try {
+        var t = localStorage.getItem("pdfocr.ui.theme") || "auto";
+        var dark = t === "dark" ||
+          (t === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        document.documentElement.dataset.theme = dark ? "dark" : "light";
+        var m = document.querySelector('meta[name="theme-color"]');
+        if (m) m.setAttribute("content", dark ? "#12161c" : "#f5f6f8");
+      } catch (e) { /* localStorage unavailable — keep light */ }
+    })();
+  </script>
 </head>
 <body>
   <header>
     <h1>PDF OCR Embed</h1>
     <div class="header-actions">
-      <span id="conn-status" class="pill">idle</span>
-      <button id="btn-cleanup" class="small" title="Delete orphaned/old working files and outputs">Cleanup</button>
-      <button id="btn-logs" class="small">Logs</button>
-      <button id="btn-settings">Settings</button>
+      <select id="lang-select" class="header-select" data-i18n-title="header.language" aria-label="Language">
+        <option value="en">English</option>
+        <option value="zh">中文</option>
+      </select>
+      <select id="theme-select" class="header-select" data-i18n-title="header.theme" aria-label="Theme">
+        <option value="auto" data-i18n="theme.auto">Auto</option>
+        <option value="light" data-i18n="theme.light">Light</option>
+        <option value="dark" data-i18n="theme.dark">Dark</option>
+      </select>
+      <span id="conn-status" class="pill">…</span>
+      <button id="btn-cleanup" class="small" data-i18n="header.cleanup" data-i18n-title="header.cleanupTitle">Cleanup</button>
+      <button id="btn-logs" class="small" data-i18n="header.logs">Logs</button>
+      <button id="btn-settings" data-i18n="header.settings">Settings</button>
     </div>
   </header>
 
@@ -22,24 +46,24 @@
     <section id="upload-zone" class="card">
       <input type="file" id="file-input" accept="application/pdf" hidden />
       <label id="drop-zone" for="file-input">
-        <strong>Drop a scanned PDF here</strong>
-        <span>or click to choose a file. Pages are rasterized, OCR'd, and made searchable.</span>
+        <strong data-i18n="upload.drop">Drop a scanned PDF here</strong>
+        <span data-i18n="upload.orClick">or click to choose a file. Pages are rasterized, OCR'd, and made searchable.</span>
       </label>
       <div class="upload-opts">
-        <label class="inline-label">OCR engine
+        <label class="inline-label"><span data-i18n="upload.engine">OCR engine</span>
           <select id="adapter">
-            <option value="unlimited">Unlimited OCR (API)</option>
-            <option value="tesseract">Tesseract (local)</option>
-            <option value="generic_openai">Generic OpenAI (API)</option>
+            <option value="unlimited" data-i18n="upload.engine.unlimited">Unlimited OCR (API)</option>
+            <option value="tesseract" data-i18n="upload.engine.tesseract">Tesseract (local)</option>
+            <option value="generic_openai" data-i18n="upload.engine.generic">Generic OpenAI (API)</option>
           </select>
         </label>
-        <label class="inline-label" id="tess-lang-row">Tesseract language
+        <label class="inline-label" id="tess-lang-row"><span data-i18n="upload.lang">Tesseract language</span>
           <input id="tess-lang" type="text" placeholder="chi_sim" />
         </label>
-        <label class="inline-label">Parallel OCR pages
+        <label class="inline-label"><span data-i18n="upload.concurrency">Parallel OCR pages</span>
           <input id="concurrency" type="number" min="1" max="32" value="1" />
         </label>
-        <span class="hint" id="adapter-hint">Higher = faster on many pages, but more concurrent API calls.</span>
+        <span class="hint" id="adapter-hint"></span>
         <span class="hint" id="upload-msg"></span>
       </div>
     </section>
@@ -48,8 +72,8 @@
          Several jobs can run in parallel; each has its own card + live SSE. -->
     <section id="jobs-section" class="card hidden">
       <div class="row">
-        <h2>Jobs</h2>
-        <span class="hint">All tasks on the server — close this page and come back anytime, they survive.</span>
+        <h2 data-i18n="jobs.title">Jobs</h2>
+        <span class="hint" data-i18n="jobs.hint">All tasks on the server — close this page and come back anytime, they survive.</span>
       </div>
       <div id="jobs-list"></div>
     </section>
@@ -58,75 +82,66 @@
     <section id="workspace" class="hidden">
       <div class="toolbar">
         <span id="editing-job"></span>
-        <button id="btn-prev">◀</button>
+        <button id="btn-prev" data-i18n-title="workspace.prev">◀</button>
         <span id="page-tabs"></span>
-        <button id="btn-next">▶</button>
+        <button id="btn-next" data-i18n-title="workspace.next">▶</button>
         <span id="zoom-label"></span>
         <input id="zoom" type="range" min="50" max="200" value="100" />
       </div>
       <div id="panes">
         <div id="editor-pane" class="pane">
-          <h3>Editable text blocks</h3>
+          <h3 data-i18n="workspace.blockTitle">Editable text blocks</h3>
           <div id="blocks"></div>
         </div>
         <div id="preview-pane" class="pane">
-          <h3>Page preview</h3>
+          <h3 data-i18n="workspace.previewTitle">Page preview</h3>
           <div id="preview-wrap">
-            <img id="preview-img" alt="page preview" />
+            <img id="preview-img" data-i18n-alt="workspace.previewTitle" alt="page preview" />
             <canvas id="overlay-canvas"></canvas>
           </div>
         </div>
       </div>
       <div class="embed-bar">
-        <label class="inline-label" title="System font used for the embedded text layer and preview">Embed font
+        <label class="inline-label" data-i18n-title="workspace.embedFontTitle"><span data-i18n="workspace.embedFont">Embed font</span>
           <select id="embed-font">
-            <option value="">Auto (default)</option>
+            <option value="" data-i18n="workspace.autoFont">Auto (default)</option>
           </select>
         </label>
-        <button id="btn-preview" class="small" title="Draw the placed text visibly so you can judge font size">Preview overlay</button>
-        <button id="btn-embed" class="primary" disabled>Embed invisible text</button>
-        <a id="download-link" class="hidden" download>Download embedded PDF</a>
+        <button id="btn-preview" class="small" data-i18n="workspace.previewOverlay" data-i18n-title="workspace.previewOverlayTitle">Preview overlay</button>
+        <button id="btn-embed" class="primary" disabled data-i18n="workspace.embed" data-i18n-title="workspace.embedTitle">Embed invisible text</button>
+        <a id="download-link" class="hidden" download></a>
         <span id="embed-status"></span>
         <span class="spacer"></span>
-        <button id="btn-dataset" class="small" title="Download the per-block font-scale dataset (JSON)">Download dataset (JSON)</button>
+        <button id="btn-dataset" class="small" data-i18n="workspace.downloadDataset" data-i18n-title="workspace.downloadDatasetTitle">Download dataset (JSON)</button>
       </div>
-      <div class="embed-hint" id="embed-hint">
-        Use each block's <em>font size</em> slider (below) to fine-tune — bigger/smaller —
-        then <strong>Preview overlay</strong> to see the placed text on the page, and
-        <strong>Embed</strong> to bake your chosen sizes in.
-      </div>
+      <p class="embed-hint" id="embed-hint" data-i18n-html="workspace.hint"></p>
     </section>
   </main>
 
   <!-- Settings modal -->
   <div id="settings-modal" class="modal hidden">
     <div class="modal-box">
-      <h2>OCR Settings</h2>
-      <p class="hint">
-        Leave fields blank to fall back to environment variables (
-        <code>OCR_API_KEY</code> / <code>OCR_BASE_URL</code> / <code>OCR_MODEL</code>
-        / <code>OCR_PROVIDER</code>, <code>USTC_API_KEY</code> alias) or a local
-        <code>ocr_config.json</code>. A masked key means one is already configured.
-      </p>
-      <label>Provider preset
+      <h2 data-i18n="settings.title">OCR Settings</h2>
+      <p class="hint" data-i18n-html="settings.hint"></p>
+      <label><span data-i18n="settings.provider">Provider preset</span>
         <select id="set-provider">
-          <option value="ustc">USTC (OpenAI-compatible)</option>
-          <option value="openai">OpenAI</option>
-          <option value="custom">Custom</option>
+          <option value="ustc" data-i18n="settings.provider.ustc">USTC (OpenAI-compatible)</option>
+          <option value="openai" data-i18n="settings.provider.openai">OpenAI</option>
+          <option value="custom" data-i18n="settings.provider.custom">Custom</option>
         </select>
       </label>
-      <label>Base URL
+      <label><span data-i18n="settings.baseurl">Base URL</span>
         <input id="set-baseurl" type="url" placeholder="https://api.llm.ustc.edu.cn/v1" />
       </label>
-      <label>Model
+      <label><span data-i18n="settings.model">Model</span>
         <input id="set-model" type="text" placeholder="glm-4v-flash" />
       </label>
-      <label>API Key
+      <label><span data-i18n="settings.apikey">API Key</span>
         <input id="set-apikey" type="password" placeholder="sk-… (masked if already set)" />
       </label>
       <div class="modal-actions">
-        <button id="btn-settings-save" class="primary">Save</button>
-        <button id="btn-settings-cancel">Cancel</button>
+        <button id="btn-settings-save" class="primary" data-i18n="settings.save">Save</button>
+        <button id="btn-settings-cancel" data-i18n="settings.cancel">Cancel</button>
       </div>
       <div id="settings-status"></div>
     </div>
@@ -135,23 +150,21 @@
   <!-- Temp-file cleanup modal -->
   <div id="cleanup-modal" class="modal hidden">
     <div class="modal-box">
-      <h2>Temporary file cleanup</h2>
+      <h2 data-i18n="cleanup.title">Temporary file cleanup</h2>
+      <p class="hint" data-i18n-html="cleanup.intro"></p>
       <p class="hint">
-        Working files (<code>work/</code>), embedded PDFs and overlays
-        (<code>output/</code>) are only referenced while the server is running.
-        <strong>Unreferenced</strong> files older than the age limit are safe to
-        delete; anything a live job still uses is always kept. A background
-        task also removes them automatically every
-        <span id="cleanup-interval">—</span>&nbsp;h.
+        <span data-i18n="cleanup.interval"></span>
+        <span id="cleanup-interval" class="code-badge">—</span>
+        <span data-i18n="cleanup.hoursUnit"></span>
       </p>
-      <div id="cleanup-summary" class="cleanup-summary">Loading…</div>
-      <label>Delete unreferenced files older than
-        <input id="cleanup-max-age" type="number" min="1" step="1" /> hours
+      <div id="cleanup-summary" class="cleanup-summary"></div>
+      <label><span data-i18n="cleanup.olderThan">Delete unreferenced files older than</span>
+        <input id="cleanup-max-age" type="number" min="1" step="1" /> <span data-i18n="cleanup.hoursUnit"></span>
       </label>
       <div class="modal-actions">
-        <button id="btn-cleanup-preview">Preview</button>
-        <button id="btn-cleanup-run" class="primary">Clean now</button>
-        <button id="btn-cleanup-cancel">Cancel</button>
+        <button id="btn-cleanup-preview" data-i18n="cleanup.preview">Preview</button>
+        <button id="btn-cleanup-run" class="primary" data-i18n="cleanup.cleanNow">Clean now</button>
+        <button id="btn-cleanup-cancel" data-i18n="cleanup.cancel">Cancel</button>
       </div>
       <div id="cleanup-status"></div>
     </div>
@@ -160,15 +173,16 @@
   <!-- Debug log panel -->
   <section id="debug-panel" class="card hidden">
     <div class="row">
-      <h3>Debug logs</h3>
+      <h3 data-i18n="logs.title">Debug logs</h3>
       <div>
-        <button id="btn-refresh-logs" class="small">Refresh</button>
-        <label class="inline-check"><input id="auto-log" type="checkbox" checked /> Auto</label>
+        <button id="btn-refresh-logs" class="small" data-i18n="logs.refresh">Refresh</button>
+        <label class="inline-check"><input id="auto-log" type="checkbox" checked /> <span data-i18n="logs.auto">Auto</span></label>
       </div>
     </div>
     <pre id="log-box"></pre>
   </section>
 
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/i18n.js?v=8"></script>
+  <script src="/static/app.js?v=8"></script>
 </body>
 </html>

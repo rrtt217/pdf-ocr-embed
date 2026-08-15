@@ -2,25 +2,52 @@
 
    The backend is the single source of truth for every OCR task: it holds them
    all in memory, so this page simply asks "what jobs are there?" on load and
-   subscribes to live progress (SSE) per running job. No client-side job-id
-   persistence, no localStorage. Jobs survive closing the tab; several may run
-   in parallel and each is managed from its own card.
+   subscribes to live progress (SSE) per running job. Jobs survive closing the
+   tab; several may run in parallel and each is managed from its own card.
+
+   View preferences (theme, locale, engine, zoom…) are persisted in
+   localStorage — job data itself is never stored client-side.
 */
 "use strict";
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+const t = (key, params) => I18N.t(key, params);
 
 const RUNNING_STATUSES = new Set(["uploaded", "running", "retrying"]);
+// status -> i18n key (rendered through t())
 const STATUS_LABEL = {
-  uploaded: "starting",
-  running: "running",
-  retrying: "retrying",
-  stopped: "stopped",
-  done: "done",
-  error: "error",
-  embedded: "embedded",
+  uploaded: "job.uploaded",
+  running: "job.running",
+  retrying: "job.retrying",
+  stopped: "job.stopped",
+  done: "job.done",
+  error: "job.error",
+  embedded: "job.embedded",
 };
+
+/* Persisted UI preferences (theme/locale/engine/zoom…). localStorage only —
+   job data itself stays server-side, these are purely view preferences. */
+const PREFS = {
+  theme: "pdfocr.ui.theme",
+  locale: "pdfocr.ui.locale",
+  adapter: "pdfocr.ui.adapter",
+  tessLang: "pdfocr.ui.tessLang",
+  concurrency: "pdfocr.ui.concurrency",
+  zoom: "pdfocr.ui.zoom",
+  embedFont: "pdfocr.ui.embedFont",
+};
+
+function getPref(key, fallback) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v;
+  } catch { return fallback; }
+}
+
+function setPref(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* ignore */ }
+}
 
 const state = {
   jobs: [],     // job summaries: {id, filename, status, current, total, error, has_embedded, created, busy}
@@ -32,10 +59,41 @@ const state = {
 };
 
 /* ---------- helpers ---------- */
-function setStatus(text, cls) {
+function setStatus(code, cls) {
   const elx = $("#conn-status");
-  elx.textContent = text;
+  elx.textContent = t("status." + code);
   elx.className = "pill" + (cls ? " " + cls : "");
+}
+
+/* ---------- theme (light / dark / auto) ---------- */
+const MEDIA_DARK = window.matchMedia("(prefers-color-scheme: dark)");
+
+function effectiveTheme(pref) {
+  if (pref === "light" || pref === "dark") return pref;
+  return MEDIA_DARK.matches ? "dark" : "light";
+}
+
+function applyTheme(pref) {
+  const eff = effectiveTheme(pref);
+  document.documentElement.dataset.theme = eff;
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", eff === "dark" ? "#12161c" : "#f5f6f8");
+}
+
+/* ---------- toasts ---------- */
+function toast(msg, type) {
+  let box = $("#toast-box");
+  if (!box) {
+    box = el("div", "toast-box");
+    box.id = "toast-box";
+    document.body.appendChild(box);
+  }
+  const node = el("div", "toast" + (type ? " " + type : ""), msg);
+  box.appendChild(node);
+  setTimeout(() => {
+    node.classList.add("out");
+    setTimeout(() => node.remove(), 350);
+  }, 4000);
 }
 
 async function api(path, opts) {
@@ -78,12 +136,12 @@ function updateAdapterUI() {
   const hint = $("#adapter-hint");
   if (adapter === "tesseract") {
     langRow.classList.remove("hidden");
-    hint.textContent = "Local OCR — no API key needed. Configure Tesseract language (e.g. chi_sim, eng, chi_sim+eng).";
+    hint.textContent = t("upload.hint.tesseract");
   } else {
     langRow.classList.add("hidden");
     hint.textContent = adapter === "unlimited"
-      ? "Higher = faster on many pages, but more concurrent API calls."
-      : "Generic OpenAI vision model — set API key / base URL / model in Settings.";
+      ? t("upload.hint.unlimited")
+      : t("upload.hint.generic");
   }
 }
 
@@ -104,7 +162,7 @@ async function handleFile(file) {
   if (msg) msg.textContent = "";
   if (!file || !file.name.toLowerCase().endsWith(".pdf")) {
     setStatus("error", "error");
-    if (msg) msg.textContent = "Please choose a PDF file.";
+    if (msg) msg.textContent = t("upload.notPdf");
     return;
   }
   const fd = new FormData();
@@ -134,9 +192,11 @@ async function handleFile(file) {
     selectJob(data.job_id);
     setStatus("running", "running");
     if (msg) msg.textContent = "";
+    toast(t("upload.started"), "success");
   } catch (e) {
     setStatus("error", "error");
-    if (msg) msg.textContent = "Upload failed: " + e.message;
+    if (msg) msg.textContent = t("upload.failed", { msg: e.message });
+    toast(t("upload.failed", { msg: e.message }), "error");
   }
 }
 
@@ -180,7 +240,7 @@ function jobCard(job) {
     : (job.status === "done" || job.status === "embedded") ? "done"
     : job.status === "error" ? "error" : "";
   title.appendChild(el("span", "pill" + (pcls ? " " + pcls : ""),
-                       STATUS_LABEL[job.status] || job.status));
+                       t(STATUS_LABEL[job.status] || job.status)));
   head.appendChild(title);
   head.appendChild(el("span", "job-count", `${job.current} / ${job.total || "?"}`));
   card.appendChild(head);
@@ -197,35 +257,35 @@ function jobCard(job) {
   const active = RUNNING_STATUSES.has(job.status);
 
   if (active) {
-    const stop = el("button", "warn", job.busy ? "Stopping…" : "Stop");
+    const stop = el("button", "warn", job.busy ? t("job.stopping") : t("job.stop"));
     stop.disabled = !!job.busy;
     stop.onclick = () => stopJob(job.id);
     actions.appendChild(stop);
   } else {
     if (job.status === "error" || job.current > 0) {
-      const retry = el("button", "primary", job.current > 0 ? "Retry remaining" : "Retry");
+      const retry = el("button", "primary", job.current > 0 ? t("job.retryRemaining") : t("job.retry"));
       retry.disabled = !!job.busy;
       retry.onclick = () => retryJob(job.id);
       actions.appendChild(retry);
     }
     if (job.current > 0) {
-      const partial = el("button", "primary", "Download partial");
+      const partial = el("button", "primary", t("job.downloadPartial"));
       partial.disabled = !!job.busy;
       partial.onclick = () => partialJob(job.id);
       actions.appendChild(partial);
     }
-    const clear = el("button", "warn", "Clear");
+    const clear = el("button", "warn", t("job.clear"));
     clear.onclick = () => clearJob(job.id);
     actions.appendChild(clear);
   }
 
   if (job.current > 0) {
-    const edit = el("button", "small", "Edit pages");
+    const edit = el("button", "small", t("job.editPages"));
     edit.onclick = () => selectJob(job.id);
     actions.appendChild(edit);
   }
   if (job.has_embedded) {
-    const a = el("a", "download-link", "⬇ Embedded PDF");
+    const a = el("a", "download-link", t("job.embeddedPdf"));
     a.href = `/api/download/${job.id}.pdf`;
     a.download = "";
     actions.appendChild(a);
@@ -303,7 +363,7 @@ async function stopJob(jobId) {
       total: data.total || job.total,
     });
   } catch (e) {
-    Object.assign(job, { status: "error", error: "Stop failed: " + e.message });
+    Object.assign(job, { status: "error", error: t("job.stopFailed", { msg: e.message }) });
   } finally {
     job.busy = false;
     renderJobs();
@@ -327,7 +387,7 @@ async function retryJob(jobId) {
     renderJobs();
     connectStream(jobId);
   } catch (e) {
-    Object.assign(job, { status: "error", error: "Retry failed: " + e.message });
+    Object.assign(job, { status: "error", error: t("job.retryFailed", { msg: e.message }) });
     renderJobs();
   } finally {
     job.busy = false;
@@ -343,7 +403,7 @@ async function partialJob(jobId) {
   try {
     const data = await api(`/api/pages/${jobId}`);
     const pages = (data.pages || []).filter(Boolean);
-    if (!pages.length) throw new Error("No completed pages");
+    if (!pages.length) throw new Error(t("job.noPages"));
     const out = await api(`/api/embed/${jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -351,7 +411,7 @@ async function partialJob(jobId) {
     });
     window.open(out.url, "_blank");
   } catch (e) {
-    Object.assign(job, { error: "Partial failed: " + e.message });
+    Object.assign(job, { error: t("job.partialFailed", { msg: e.message }) });
   } finally {
     job.busy = false;
     renderJobs();
@@ -361,7 +421,7 @@ async function partialJob(jobId) {
 async function clearJob(jobId) {
   const job = jobById(jobId);
   if (!job) return;
-  if (!confirm(`Delete job "${job.filename}" entirely?\n\nThis removes its OCR results, working files and any embedded PDF.`)) {
+  if (!confirm(t("job.clearConfirm", { name: job.filename }))) {
     return;
   }
   try {
@@ -379,7 +439,7 @@ async function selectJob(jobId) {
   state.sel = { jobId, pages: [], pageIndex: 0, embedded: false };
   const job = jobById(jobId);
   const label = $("#editing-job");
-  if (label) label.textContent = job ? `Editing: ${job.filename}` : "";
+  if (label) label.textContent = job ? t("workspace.editing", { name: job.filename }) : "";
   $("#download-link").classList.add("hidden");
   $("#embed-status").textContent = "";
   renderJobs();
@@ -414,7 +474,7 @@ async function refreshSelectedPages() {
     if (!pages.length) {
       $("#blocks").innerHTML = "";
       $("#blocks").appendChild(
-        el("div", "embed-hint", "No pages OCR'd yet — they appear here as each page finishes."));
+        el("div", "embed-hint", t("editor.noPagesYet")));
       return;
     }
     if (sel.pageIndex >= pages.length) sel.pageIndex = pages.length - 1;
@@ -461,12 +521,13 @@ function renderPage() {
   const blocksBox = $("#blocks");
   blocksBox.innerHTML = "";
   if (!page.blocks || page.blocks.length === 0) {
-    blocksBox.appendChild(el("div", "", "No text blocks on this page."));
+    blocksBox.appendChild(el("div", "", t("editor.noBlocks")));
   }
   (page.blocks || []).forEach((block, bi) => {
     blocksBox.appendChild(buildBlockEditor(block, bi));
   });
 
+  $("#zoom-label").textContent = state.zoom + "%";
   img.style.width = state.zoom + "%";
   loadFontInfo();  // annotate each block with its derived / applied font size
 }
@@ -502,7 +563,7 @@ function buildBlockEditor(block, bi) {
 
   const textarea = document.createElement("textarea");
   textarea.value = block.text || block.caption || "";
-  textarea.placeholder = "Text…";
+  textarea.placeholder = t("editor.placeholder");
   textarea.oninput = (e) => {
     textarea.classList.add("edit");
     const sel = state.sel;
@@ -515,7 +576,7 @@ function buildBlockEditor(block, bi) {
   };
 
   const del = el("button", "del", "✕");
-  del.title = "Remove block";
+  del.title = t("editor.removeBlock");
   del.onclick = () => {
     const sel = state.sel;
     if (!sel) return;
@@ -526,7 +587,7 @@ function buildBlockEditor(block, bi) {
   // ---- Interactive font-size control (debug: too big / too small) ----
   if (block.font_scale == null) block.font_scale = 1.0;
   const fsRow = el("div", "fs-row");
-  const fsLabel = el("span", "fs-label", "font size");
+  const fsLabel = el("span", "fs-label", t("editor.fontSize"));
   const fsSlider = document.createElement("input");
   fsSlider.type = "range";
   fsSlider.min = "0.5"; fsSlider.max = "1.5"; fsSlider.step = "0.05";
@@ -540,8 +601,8 @@ function buildBlockEditor(block, bi) {
     setStatus("dirty", "running");
   };
   // Reset to auto
-  const fsReset = el("button", "small", "auto");
-  fsReset.title = "Reset to auto (1.0)";
+  const fsReset = el("button", "small", t("editor.auto"));
+  fsReset.title = t("editor.autoTitle");
   fsReset.onclick = () => {
     block.font_scale = 1.0;
     fsSlider.value = "1.0";
@@ -567,7 +628,7 @@ async function embed() {
   const sel = state.sel;
   if (!sel || !sel.pages.length) return;
   $("#btn-embed").disabled = true;
-  $("#embed-status").textContent = "Embedding…";
+  $("#embed-status").textContent = t("embed.busy");
   try {
     const out = await api(`/api/embed/${sel.jobId}`, {
       method: "POST",
@@ -579,12 +640,14 @@ async function embed() {
     const link = $("#download-link");
     link.classList.remove("hidden");
     link.href = out.url;
-    link.textContent = "Download " + out.filename;
-    $("#embed-status").textContent = "Embedded. Text is now selectable/searchable.";
+    link.textContent = t("embed.download", { name: out.filename });
+    $("#embed-status").textContent = t("embed.done");
     const job = jobById(sel.jobId);
     if (job) { job.has_embedded = true; renderJobs(); }
+    toast(t("toast.embedDone"), "success");
   } catch (e) {
-    $("#embed-status").textContent = "Embed failed: " + e.message;
+    $("#embed-status").textContent = t("embed.failed", { msg: e.message });
+    toast(t("embed.failed", { msg: e.message }), "error");
   } finally {
     $("#btn-embed").disabled = false;
   }
@@ -613,7 +676,7 @@ async function previewOverlay() {
     setStatus("preview", "running");
   } catch (e) {
     setStatus("error", "error");
-    $("#embed-status").textContent = "Preview failed: " + e.message;
+    $("#embed-status").textContent = t("embed.previewFailed", { msg: e.message });
   }
 }
 
@@ -631,7 +694,7 @@ async function loadFontInfo() {
     // Refresh derived-fs annotations in the editor blocks.
     (data.blocks || []).forEach((fi) => {
       const row = document.querySelector(`.block[data-bi="${fi.index}"] .fs-der`);
-      if (row) row.textContent = `${fi.derived_fs}pt → ${fi.fs}pt (${fi.lines} ln)`;
+      if (row) row.textContent = t("fontInfo.line", { derived: fi.derived_fs, fs: fi.fs, lines: fi.lines });
     });
   } catch (e) { /* ignore */ }
 }
@@ -642,7 +705,7 @@ function downloadDataset() {
   const ds = {
     job_id: sel.jobId,
     generated_at: new Date().toISOString(),
-    adapter_font_scale_def: "font_scale multiplies the auto font size",
+    adapter_font_scale_def: t("dataset.def"),
     pages: sel.pages,
   };
   const blob = new Blob([JSON.stringify(ds, null, 2)], { type: "application/json" });
@@ -665,7 +728,7 @@ async function openSettings() {
     $("#set-model").value = s.model || "";
     $("#set-apikey").value = s.has_api_key ? s.api_key_masked : "";
   } catch (e) {
-    $("#settings-status").textContent = "Failed to load settings: " + e.message;
+    $("#settings-status").textContent = t("settings.loadFailed", { msg: e.message });
   }
 }
 
@@ -682,10 +745,11 @@ async function saveSettings() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    $("#settings-status").textContent = "Saved.";
+    $("#settings-status").textContent = t("settings.saved");
+    toast(t("settings.saved"), "success");
     setTimeout(() => $("#settings-modal").classList.add("hidden"), 700);
   } catch (e) {
-    $("#settings-status").textContent = "Save failed: " + e.message;
+    $("#settings-status").textContent = t("settings.saveFailed", { msg: e.message });
   }
 }
 
@@ -700,11 +764,14 @@ function fmtBytes(n) {
 }
 
 function areaSummary(name, a) {
-  const line = el("div", "cleanup-line",
-    `${name}: <b>${a.ready_count}</b> ready (${fmtBytes(a.ready_bytes)}), ` +
-    `${a.unreferenced_count} unreferenced total (${fmtBytes(a.unreferenced_bytes)})` +
-    (a.referenced_count ? `, ${a.referenced_count} in use` : ""));
-  line.innerHTML = line.textContent; // allow the <b> markup above
+  const line = el("div", "cleanup-line");
+  line.appendChild(document.createTextNode(t("cleanup.area." + name) + ": "));
+  line.appendChild(el("b", null, String(a.ready_count)));
+  line.appendChild(document.createTextNode(
+    ` ${t("cleanup.areaReady")} (${fmtBytes(a.ready_bytes)}), ${a.unreferenced_count} ${t("cleanup.areaUnref")} (${fmtBytes(a.unreferenced_bytes)})`));
+  if (a.referenced_count) {
+    line.appendChild(document.createTextNode(`, ${a.referenced_count} ${t("cleanup.areaInUse")}`));
+  }
   return line;
 }
 
@@ -713,7 +780,7 @@ async function openCleanup() {
   const status = $("#cleanup-status");
   status.textContent = "";
   $("#cleanup-summary").innerHTML = "";
-  $("#cleanup-summary").appendChild(el("div", "", "Loading…"));
+  $("#cleanup-summary").appendChild(el("div", "", t("cleanup.loading")));
   try {
     const data = await api("/api/cleanup");
     $("#cleanup-interval").textContent = String(Math.round(data.config.interval_hours));
@@ -724,20 +791,17 @@ async function openCleanup() {
 
     const sum = $("#cleanup-summary");
     sum.innerHTML = "";
-    const t = data.totals || {};
+    const totals = data.totals || {};
     sum.appendChild(el("div", "cleanup-total",
-      `${t.ready_count} file(s) ready to clean right now (older than ${Math.round(age)} h), ` +
-      `${fmtBytes(t.ready_bytes)}`));
+      t("cleanup.total", { n: totals.ready_count, age: Math.round(age), bytes: fmtBytes(totals.ready_bytes) })));
     ["work", "output", "uploads"].forEach((area) => {
       if (data.areas && data.areas[area]) sum.appendChild(areaSummary(area, data.areas[area]));
     });
-    if (!t.ready_count) {
-      sum.appendChild(el("div", "hint",
-        "No unreferenced files are old enough yet — " +
-        "lower the limit or use Preview to see younger candidates."));
+    if (!totals.ready_count) {
+      sum.appendChild(el("div", "hint", t("cleanup.none")));
     }
   } catch (e) {
-    status.textContent = "Failed to load cleanup info: " + e.message;
+    status.textContent = t("cleanup.loadFailed", { msg: e.message });
   }
 }
 
@@ -748,7 +812,7 @@ async function runCleanup(dryRun) {
   const hours = parseFloat($("#cleanup-max-age").value) || 1;
   btnRun.disabled = true;
   btnPrev.disabled = true;
-  status.textContent = dryRun ? "Previewing…" : "Cleaning…";
+  status.textContent = dryRun ? t("cleanup.previewing") : t("cleanup.cleaning");
   try {
     const data = await api("/api/cleanup/run", {
       method: "POST",
@@ -757,14 +821,19 @@ async function runCleanup(dryRun) {
     });
     const kept = data.kept || {};
     status.textContent = dryRun
-      ? `Preview: would delete ${data.deleted_count} file(s), freeing ${fmtBytes(data.freed_bytes)}. ` +
-        `${kept.referenced || 0} in use / ${kept.too_fresh || 0} too fresh kept.`
-      : `Deleted ${data.deleted_count} file(s), freed ${fmtBytes(data.freed_bytes)}. ` +
-        `${kept.referenced || 0} in use kept.`;
+      ? t("cleanup.previewDone", {
+          n: data.deleted_count, bytes: fmtBytes(data.freed_bytes),
+          inUse: kept.referenced || 0, fresh: kept.too_fresh || 0,
+        })
+      : t("cleanup.done", {
+          n: data.deleted_count, bytes: fmtBytes(data.freed_bytes),
+          inUse: kept.referenced || 0,
+        });
+    if (!dryRun) toast(t("cleanup.done", { n: data.deleted_count, bytes: fmtBytes(data.freed_bytes), inUse: kept.referenced || 0 }), "success");
     // Refresh the summary so the numbers reflect the cleanup just performed.
     openCleanup();
   } catch (e) {
-    status.textContent = "Cleanup failed: " + e.message;
+    status.textContent = t("cleanup.failed", { msg: e.message });
   } finally {
     btnRun.disabled = false;
     btnPrev.disabled = false;
@@ -809,7 +878,8 @@ async function loadFonts() {
   try {
     const data = await api("/api/fonts");
     const fonts = (data.fonts || []);
-    sel.innerHTML = '<option value="">Auto (default)</option>';
+    sel.innerHTML = '<option value=""></option>';
+    sel.options[0].textContent = t("workspace.autoFont");
     fonts.forEach((f) => {
       const opt = document.createElement("option");
       opt.value = f.name;
@@ -820,7 +890,57 @@ async function loadFonts() {
   } catch (e) { /* fonts unavailable; keep Auto */ }
 }
 
+function prevPage() {
+  const s = state.sel;
+  if (s && s.pageIndex > 0) { s.pageIndex--; renderTabs(); renderPage(); }
+}
+
+function nextPage() {
+  const s = state.sel;
+  if (s && s.pageIndex < s.pages.length - 1) { s.pageIndex++; renderTabs(); renderPage(); }
+}
+
+/* Re-render dynamic parts after a locale switch (static markup is handled by
+   I18N.applyDocument()). */
+function onLocaleChanged() {
+  updateAdapterUI();
+  setGlobalStatus();
+  renderJobs();
+  if (state.sel) {
+    const job = jobById(state.sel.jobId);
+    $("#editing-job").textContent = job ? t("workspace.editing", { name: job.filename }) : "";
+    if (state.sel.pages.length) renderPage();
+  }
+}
+
 async function init() {
+  // --- locale: saved preference > browser language ---
+  const browserLocale = (navigator.language || "en").toLowerCase().indexOf("zh") === 0 ? "zh" : "en";
+  const savedLocale = getPref(PREFS.locale, null);
+  I18N.setLocale(savedLocale || browserLocale, false);
+  const langSel = $("#lang-select");
+  if (langSel) langSel.value = I18N.locale;
+
+  // --- theme: saved preference > auto ---
+  state.themePref = getPref(PREFS.theme, "auto");
+  applyTheme(state.themePref);
+  const themeSel = $("#theme-select");
+  if (themeSel) themeSel.value = state.themePref;
+
+  // --- restore other UI preferences ---
+  const savedAdapter = getPref(PREFS.adapter, null);
+  if (savedAdapter) $("#adapter").value = savedAdapter;
+  const savedLang = getPref(PREFS.tessLang, "");
+  if (savedLang) $("#tess-lang").value = savedLang;
+  const savedConc = getPref(PREFS.concurrency, null);
+  if (savedConc) $("#concurrency").value = savedConc;
+  const savedZoom = parseFloat(getPref(PREFS.zoom, ""));
+  if (savedZoom >= 50 && savedZoom <= 200) {
+    state.zoom = savedZoom;
+    $("#zoom").value = String(savedZoom);
+  }
+  state.embedFont = getPref(PREFS.embedFont, "");
+
   // 有任务运行时关闭标签页 → 浏览器原生关闭确认提示（任意一个任务在跑都会提示）。
   window.addEventListener("beforeunload", (e) => {
     if (!anyRunning()) return;
@@ -837,9 +957,14 @@ async function init() {
   drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
   $("#file-input").addEventListener("change", (e) => handleFile(e.target.files[0]));
 
-  $("#btn-prev").onclick = () => { const s = state.sel; if (s && s.pageIndex > 0) { s.pageIndex--; renderTabs(); renderPage(); } };
-  $("#btn-next").onclick = () => { const s = state.sel; if (s && s.pageIndex < s.pages.length - 1) { s.pageIndex++; renderTabs(); renderPage(); } };
-  $("#zoom").oninput = (e) => { state.zoom = parseFloat(e.target.value); renderPage(); };
+  $("#btn-prev").onclick = prevPage;
+  $("#btn-next").onclick = nextPage;
+  $("#zoom").oninput = (e) => {
+    state.zoom = parseFloat(e.target.value);
+    $("#zoom-label").textContent = state.zoom + "%";
+    setPref(PREFS.zoom, e.target.value);
+    renderPage();
+  };
   $("#btn-embed").onclick = embed;
   $("#btn-preview").onclick = previewOverlay;
   $("#btn-dataset").onclick = downloadDataset;
@@ -856,11 +981,43 @@ async function init() {
   $("#btn-settings-cancel").onclick = () => $("#settings-modal").classList.add("hidden");
   $("#settings-modal").onclick = (e) => { if (e.target === $("#settings-modal")) $("#settings-modal").classList.add("hidden"); };
   $("#adapter").onchange = updateAdapterUI;
-  $("#embed-font").onchange = (e) => {
+
+  // --- language / theme switchers ---
+  langSel.addEventListener("change", (e) => I18N.setLocale(e.target.value));
+  themeSel.addEventListener("change", (e) => {
+    state.themePref = e.target.value;
+    setPref(PREFS.theme, state.themePref);
+    applyTheme(state.themePref);
+  });
+  MEDIA_DARK.addEventListener("change", () => applyTheme(state.themePref));
+
+  // --- persist per-control preferences ---
+  $("#adapter").addEventListener("change", () => setPref(PREFS.adapter, $("#adapter").value));
+  $("#tess-lang").addEventListener("change", () => setPref(PREFS.tessLang, $("#tess-lang").value.trim()));
+  $("#concurrency").addEventListener("change", () => setPref(PREFS.concurrency, $("#concurrency").value));
+  $("#embed-font").addEventListener("change", (e) => {
     state.embedFont = e.target.value;
+    setPref(PREFS.embedFont, state.embedFont);
     if (state.sel) state.sel.embedded = false;
     setStatus("dirty", "running");
-  };
+  });
+
+  // --- keyboard shortcuts: Ctrl/Cmd+Enter = embed; ←/→ = page navigation ---
+  document.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+      e.preventDefault();
+      if (!document.querySelector(".modal:not(.hidden)")) embed();
+      return;
+    }
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    if (e.key === "ArrowLeft") prevPage();
+    else if (e.key === "ArrowRight") nextPage();
+  });
+
+  // Re-render dynamic UI when the language changes.
+  document.addEventListener("i18n:changed", onLocaleChanged);
+
   updateAdapterUI();
   loadFonts();
 
