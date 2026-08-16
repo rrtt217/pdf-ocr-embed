@@ -1,15 +1,16 @@
 """Temporary-file cleanup for `work/`, `output/` and `uploads/`.
 
-The server holds OCR jobs **in memory only**: restarting drops all job state,
-but the per-job working files (`work/<job_id>/` — the uploaded source PDF plus
-rendered page PNGs), embedded results and overlay PNGs (`output/`) stay on disk
-forever unless something removes them.  A single 500-page scan can leave
+Job state lives in `work/<job_id>/job.json` and is restored at startup
+(see ``ocr_service.restore_jobs``), so every restored job's files stay
+protected.  Orphaned files only arise when a state file is deleted or
+corrupt (or an upload/embed produced files no job references), and would
+otherwise stay on disk forever — a single 500-page scan can leave
 hundreds of MB of page renders behind.
 
 This module:
   - inventories unreferenced temp files (age + size),
   - deletes those older than a configurable age — NEVER touching anything a
-    live job still references,
+    live or restored job still references,
   - re-runs automatically on a background daemon thread.
 
 Settings (via ``backend.config.resolve()``, from ``backend/ocr_config.toml``):
@@ -31,6 +32,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from backend import ocr_cache
 from backend.config import resolve
 
 log = logging.getLogger(__name__)
@@ -257,6 +259,18 @@ def start_background_cleanup() -> threading.Thread:
     return _thread
 
 
+def _purge_ocr_cache() -> None:
+    """Expire old OCR-cache entries on the same background cadence."""
+    try:
+        result = ocr_cache.purge_expired()
+        if result["removed"]:
+            log.info("auto-cleanup: OCR cache purged %d entr%s (%.1f MB)",
+                     result["removed"], "y" if result["removed"] == 1 else "ies",
+                     result["freed_bytes"] / _MB)
+    except Exception:  # noqa: BLE001
+        log.exception("auto-cleanup: OCR cache purge failed")
+
+
 def stop_background_cleanup() -> None:
     """Signal the background loop to exit (used on server shutdown)."""
     _stop.set()
@@ -272,6 +286,7 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: initial pass failed")
+        _purge_ocr_cache()
     while not _stop.is_set():
         if _stop.wait(interval_hours() * 3600.0):
             break
@@ -282,3 +297,4 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: pass failed")
+        _purge_ocr_cache()

@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_service
+from backend import config, ocr_cache, ocr_service
 from backend.logging_config import recent_logs, setup_logging
 from backend.sources.factory import available_adapters
 
@@ -37,6 +37,9 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Bring back jobs persisted in work/<job_id>/job.json so a restart
+    # resumes the task list (completed pages / embeds survive for retry).
+    ocr_service.restore_jobs()
     # Keep orphaned temp files from accumulating: periodically delete
     # unreferenced files older than cleanup_max_age_hours.
     cleanup_mod.start_background_cleanup()
@@ -75,6 +78,11 @@ class EmbedModel(BaseModel):
     model: Optional[str] = None
     pages: Optional[list] = None
     embed_font: Optional[str] = None   # system font name / path for the text layer
+    # --- output optimization (see backend/pdf_processing.optimize_images) ---
+    img_mode: Optional[str] = None      # none | jpeg | gray-jpeg
+    img_quality: Optional[int] = None   # 1..100 JPEG quality
+    img_downscale: Optional[int] = None # 2 (half) | 4 (quarter) raster dims
+    linearize: bool = False             # web-first / linearized PDF
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -128,6 +136,20 @@ def run_cleanup(payload: CleanupModel) -> dict:
         force=payload.force,
         dry_run=payload.dry_run,
     )
+
+
+
+
+@app.get("/api/cache")
+def cache_status() -> dict:
+    """Status of the cross-job OCR result cache (entries, hits/misses, TTL)."""
+    return ocr_cache.status()
+
+
+@app.post("/api/cache/clear")
+def cache_clear() -> dict:
+    """Drop every OCR cache entry (never touches OCR results in job state)."""
+    return ocr_cache.clear()
 
 
 @app.get("/api/settings")
@@ -330,7 +352,11 @@ def update_page(job_id: str, page_index: int, payload: dict) -> dict:
 
 @app.get("/api/pages/{job_id}/{page_index}/image")
 def page_image(job_id: str, page_index: int):
+    # Cache-hit pages skip the pre-render phase; render their preview lazily
+    # the first time the WebUI asks for it.
     path = ocr_service.page_preview_path(job_id, page_index)
+    if path is None:
+        path = ocr_service.ensure_page_image(job_id, page_index)
     if path is None:
         raise HTTPException(status_code=404, detail="Page image not found")
     return FileResponse(path, media_type="image/png")
@@ -439,7 +465,10 @@ def embed(job_id: str, payload: EmbedModel):
     embed_font = _resolve_embed_font(payload.embed_font)
     # embed_job filters out None entries, so partial results work too.
     try:
-        out_path = ocr_service.embed_job(job_id, pages, embed_font=embed_font)
+        out_path, img_stats = ocr_service.embed_job(
+            job_id, pages, embed_font=embed_font,
+            img_mode=payload.img_mode, img_quality=payload.img_quality,
+            img_downscale=payload.img_downscale, linearize=payload.linearize)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
@@ -449,6 +478,7 @@ def embed(job_id: str, payload: EmbedModel):
         "filename": out_path.name,
         "url": f"/api/download/{job_id}.pdf",
         "font": embed_font.name,
+        "images": img_stats,
     }
 
 

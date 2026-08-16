@@ -529,6 +529,47 @@ label input, label select {
   .block .fs-row { min-width: 0; width: 100%; }
 }
 
+/* Confidence review (editor pane) */
+.conf-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 4px 0 10px;
+}
+.conf-toolbar input[type=number] { width: 64px; }
+.conf-toolbar .hint { margin: 0; }
+.conf-badge {
+  font-size: 0.75em; padding: 1px 6px; border-radius: 8px;
+  border: 1px solid transparent; white-space: nowrap;
+}
+.conf-badge.conf-low { color: var(--danger-text); background: var(--danger-bg); border-color: var(--danger-border); }
+.conf-badge.conf-med { color: #8a5a00; background: #fff4dd; border-color: #f2d08a; }
+.conf-badge.conf-high { color: var(--ok-text); background: var(--ok-bg); border-color: var(--ok-border); }
+.conf-badge.conf-na { opacity: 0.55; }
+.block.block-low { border-left: 3px solid var(--danger); }
+.page-tab .tab-badge {
+  font-size: 0.68em; background: var(--danger); color: #fff;
+  border-radius: 8px; padding: 0 5px; margin-left: 4px;
+}
+/* Output options (embed bar) */
+.embed-opts summary { cursor: pointer; color: var(--accent); user-select: none; }
+.embed-opts-grid {
+  display: flex; gap: 14px; flex-wrap: wrap; align-items: center;
+  margin-top: 8px; padding: 8px 10px;
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.embed-opts-grid .inline-label { margin: 0; }
+
+/* OCR result cache panel (inside the cleanup modal) */
+.cache-panel {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.cache-panel h3 { margin: 0 0 6px; }
+.cache-panel .cache-actions { margin-top: 8px; }
+#cache-summary { margin: 6px 0; color: var(--text); }
+#cache-summary .hint { margin-top: 2px; }
+#cache-status { min-height: 1.2em; margin-top: 6px; font-size: 0.9em; color: var(--ok-text); }
+
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }

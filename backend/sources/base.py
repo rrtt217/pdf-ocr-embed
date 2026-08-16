@@ -41,6 +41,17 @@ class OcrSource(ABC):
     def close(self) -> None:
         """Release any adapter-held resources."""
 
+    def cache_fingerprint(self) -> Dict[str, Any]:
+        """Settings that affect OCR output (used for the result-cache key).
+
+        Returns a small JSON-safe dict.  The base implementation carries only
+        the adapter class name; engines whose output depends on constructor
+        settings must override this so that a changed setting misses the cache.
+        Values are only ever *hashed* into a cache key (see
+        ``backend.ocr_cache.build_key``) — never persisted or logged directly.
+        """
+        return {"engine": type(self).__name__}
+
 
 def map_normalized_to_pixels(x: float, y: float, width: int, height: int) -> "tuple[float, float]":
     """Map a normalized 0..1000 canvas coordinate to original pixel space.

@@ -36,6 +36,14 @@
 - **并行 OCR**：支持并指定并行数，多页并发调用 OCR 引擎（线程池），显著加快多页文档处理。
 - **单页 WebUI**：左侧可编辑文本块，右侧页面预览 + bbox 高亮框，设置表单、嵌入按钮、进度条、
   并行数输入框。
+- **置信度审阅视图**：每个文本块带置信度徽标（85/60 分档绿/黄/红），低置信块红描边；
+  「只看低置信度」过滤 + 可调阈值（默认 60%），页 tab 角标显示该页低置信块数。
+  未回报置信度的引擎（API 类）会在界面提示，Tesseract 提供逐块置信度。
+- **输出优化**：嵌入时可对页面图片**重压 JPEG / 灰度 JPEG**、**降采样**（1/2、1/4），
+  仅当新编码更小时才替换（软掩码图自动跳过）；可选**线性化**（当前构建不支持时自动回退
+  普通保存并在结果注明）。嵌入完成显示「图片：重压 N 张，省 X」。
+- **任务持久化**：任务状态实时写入 `work/<job_id>/job.json`（含已完成页与嵌入结果），
+  服务重启自动恢复；崩溃中的任务恢复为 stopped，可直接重跑剩余页或下载部分结果。
 - **国际化（i18n）**：内置**英文 / 中文**两套界面，页头可随时切换（`frontend/i18n.js`），
   默认跟随浏览器语言；切换语言不刷新页面即时生效。
 - **浅色 / 深色 / 自适应主题**：页头切换，选择记忆在 localStorage；自适应跟随系统
@@ -171,6 +179,8 @@ uvicorn backend.main:app --port 8000
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
 | GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
 | POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
+| GET  | `/api/cache` | OCR 结果缓存状态（条目数/字节/命中与未命中计数、TTL、开关） |
+| POST | `/api/cache/clear` | 清空全部 OCR 缓存（不影响任务内已识别的结果） |
 
 ---
 
@@ -197,11 +207,14 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
+├── tests/                      # pytest 测试（坐标映射/解析器/缓存等纯函数）
+├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # 面向 AI 编码代理的项目指南（含如何编写 OCR adapter）
-└── DESIGN.md
+├── DESIGN.md
+└── FEATURE_IDEAS.md  # 新功能脑暴清单（候选 roadmap，非排期承诺）
 ```
 
 ---
@@ -228,14 +241,30 @@ pdf-ocr-embed/
   也可调用 `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。
 - **中途停止**：OCR 运行中可点击 **Stop** 按钮或调用 `POST /api/ocr/stop/{job_id}` 停止。
   已完成的页保留，停止后可点 **Download partial** 下载部分嵌入的 PDF，或 **Retry remaining** 跑完剩余页。
+- **OCR 结果缓存**：同一 PDF 页 + 相同引擎与参数的结果，按内容哈希缓存到
+  `cache/ocr/`（键 = 源 PDF 哈希 + 页码 + 渲染参数 + 引擎指纹，绝不落盘任何密钥或
+  原图）。重复 OCR 直接命中，省时省钱、且错误的缓存条目会被自动丢弃。TTL
+  `ocr_cache_max_age_hours`（默认 720h），`ocr_cache_enabled = false` 可整体关闭；
+  后台清理循环会顺带过期清理，`GET /api/cache` 看命中统计、`POST /api/cache/clear`
+  一键清空。缓存只存**识别原文**，用户在页面上做的文字/字体修改完全不受影响。
+  **命中即跳过渲染**：重新上传同一文档时，缓存命中的页不需要重新渲染 PNG
+  （预览图在首次查看时按需补渲染）。SSE 进度分 `render`（预处理渲染）与
+  `ocr`（识别）两个阶段推送，处理大文件时进度条在渲染阶段就持续前进。
+- **输出优化细节**：图片重压是**有损**的——只影响背景扫描图、不影响文字层；
+  软掩码（透明）图片与「重压后反而变大」的图片一律保持原样。统计随
+  `/api/embed` 响应返回（`images.replaced / saved_bytes / attempted / skipped`）。
+  本机 MuPDF 构建已移除线性化：勾选时自动降级普通保存并置
+  `images.linearized = false`，不影响其余功能。
 - **调试日志**：后端全链路 logging（`backend/ocr_config.toml` 的 `log_level` 控制级别，
   默认 INFO，设 DEBUG 看详细）。WebUI 右上角 **Logs** 按钮可实时查看后端日志，
   或调用 `GET /api/logs`。
-- **临时文件清理**：任务只在内存中保存——服务重启后 `work/<job_id>/`（源 PDF + 每页渲染图）
-  与 `output/`（嵌入结果、缩略图、overlay）会变成无人引用的孤儿文件，长期堆积占用磁盘。
-  后端在**启动时**与每 `cleanup_interval_hours`（默认 6h）自动删除
-  未被任何存活任务引用、且超过 `cleanup_max_age_hours`（默认 168h=7 天）的临时文件
-  （两个值都在 `backend/ocr_config.toml` 中配置）；
+- **临时文件清理**：任务状态**持久化**在 `work/<job_id>/job.json` 并在启动时自动恢复，
+  重启不再丢任务（运行中崩溃的任务恢复为 stopped，已完成页保留，可用 Retry/下载部分结果）。
+  清理只针对**无任务引用**且超过 `cleanup_max_age_hours`（默认 168h=7 天）的孤儿文件
+  （如状态文件被删/损坏、失败上传的残留）；清理间隔 `cleanup_interval_hours`（默认 6h），
+  两个值都在 `backend/ocr_config.toml` 中配置；
   **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
   清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
+  同一弹窗内的 **OCR result cache** 区块显示缓存统计（条目数/占用/命中/未命中/TTL）
+  并提供 **Clear OCR cache** 一键清空（对应 `POST /api/cache/clear`）。
 - 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。

@@ -55,6 +55,8 @@ _FILE_KEYS = (
     "embed_font",
     # temp-file cleanup (see backend/cleanup.py)
     "cleanup_max_age_hours", "cleanup_interval_hours",
+    # OCR result cache (see backend/ocr_cache.py)
+    "ocr_cache_enabled", "ocr_cache_max_age_hours",
     # logging verbosity (see backend/logging_config.py)
     "log_level",
 )
@@ -72,6 +74,8 @@ _ENV_ALIASES = {
     "OCR_EMBED_FONT": "embed_font",
     "OCR_CLEANUP_MAX_AGE_HOURS": "cleanup_max_age_hours",
     "OCR_CLEANUP_INTERVAL_HOURS": "cleanup_interval_hours",
+    "OCR_CACHE_ENABLED": "ocr_cache_enabled",
+    "OCR_CACHE_MAX_AGE_HOURS": "ocr_cache_max_age_hours",
     "OCR_LOG_LEVEL": "log_level",
 }
 

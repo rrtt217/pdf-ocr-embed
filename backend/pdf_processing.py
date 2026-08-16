@@ -12,6 +12,7 @@ downward.
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -77,11 +78,24 @@ def render_page(page: fitz.Page) -> "tuple[fitz.Pixmap, int, int]":
 
 
 def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tuple[str, int, int]:
-    """Render page to PNG on disk. Returns (path, width_px, height_px)."""
+    """Render page to PNG on disk. Returns (path, width_px, height_px).
+
+    The PNG is written atomically (temp file + os.replace): the OCR pre-render
+    phase and the lazy on-demand preview render (cache-hit pages are rendered
+    only when first viewed) may race in practice, and no reader should ever
+    observe a half-written image.
+    """
     out_path.mkdir(parents=True, exist_ok=True)
     pix, w, h = render_page(page)
     png_path = out_path / f"page_{page_index:04d}.png"
-    pix.save(str(png_path))
+    tmp_path = out_path / f".page_{page_index:04d}.{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
+        pix.save(str(tmp_path), output="png")
+        os.replace(tmp_path, png_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     log.debug("rendered page %d -> %s (%dx%d)", page_index, png_path, w, h)
     return str(png_path), w, h
 
@@ -156,11 +170,20 @@ def _font_metrics(fontname: str) -> Tuple[float, float, float]:
 
 def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
                          out_dir: Optional[Path] = None,
-                         embed_font=None) -> Tuple[Path, Path]:
+                         embed_font=None,
+                         img_mode: Optional[str] = None,
+                         img_quality: Optional[int] = None,
+                         img_downscale: Optional[int] = None,
+                         linearize: bool = False) -> Tuple[Path, Path, dict]:
     """Embed editable OCR text into a copy of the PDF.
 
     Writes `<stem>_embedded.pdf`. Uses render_mode=3 so text is searchable /
-    selectable but invisible. Returns (output_path, thumb_path).
+    selectable but invisible.  Optional output tweaks:
+      - `img_mode` in {none, jpeg, gray-jpeg} recompresses page images when
+        it shrinks them (see ``optimize_images``),
+      - `img_downscale` (2 or 4) additionally halves/quarters the raster,
+      - `linearize` saves a web-first (linearized) PDF.
+    Returns (output_path, thumb_path, image_stats).
 
     ``embed_font`` is an optional backend.fonts.FontSpec; when given, the real
     system font is embedded (subset, for a small file) and used for measuring
@@ -215,21 +238,46 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
             doc.subset_fonts()
         except Exception as exc:  # noqa: BLE001
             log.warning("font subsetting skipped: %s", exc)
-        doc.save(str(out_file), garbage=4, deflate=True)
+
+        # Optional image recompression (size win on scanned input).
+        img_stats = optimize_images(
+            doc, (img_mode or "none").strip().lower(), img_quality or 75,
+            img_downscale)
+
+        linear_done = False
+        if linearize:
+            try:
+                doc.save(str(out_file), deflate=True, linear=True)
+                linear_done = True
+            except Exception as exc:  # noqa: BLE001
+                # The bundled MuPDF may drop linearization ("Linearisation is
+                # no longer supported") — degrade gracefully, never fail the
+                # embed over a size/UX optimization.
+                log.warning("embed: linearization unavailable (%s), "
+                            "saving a normal PDF", exc)
+                doc.save(str(out_file), garbage=4, deflate=True)
+        else:
+            doc.save(str(out_file), garbage=4, deflate=True)
+        img_stats["linearized"] = linear_done
         log.info("embedded PDF saved: %s (%d pages, %d/%d blocks embedded)",
                  out_file, len(pages), total_blocks - skipped_blocks, total_blocks)
         if skipped_blocks:
             log.warning("embed: %d block(s) skipped due to errors", skipped_blocks)
-        # Render the first page as a preview thumbnail.
-        first = doc[0] if len(doc) else None
-        if first is not None:
-            pix = first.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
-            pix.save(str(thumb_file))
+        img_stats["saved_bytes"] = max(0, img_stats["before_bytes"]
+                                       - img_stats["after_bytes"])
     finally:
         doc.close()
         set_embed_font(prev_font)
 
-    return out_file, thumb_file
+    # The thumbnail must show the FINAL bytes (post-optimization), so re-open
+    # the saved file instead of paging through the in-memory document.
+    with fitz.open(str(out_file)) as final:
+        first = final[0] if final.page_count else None
+        if first is not None:
+            pix = first.get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
+            pix.save(str(thumb_file))
+
+    return out_file, thumb_file, img_stats
 
 
 def _page_font_name(page: fitz.Page) -> str:
@@ -634,3 +682,78 @@ def _pixel_point_to_pdf(pt, page: fitz.Page, w_scale: float,
     x = pt[0] * w_scale
     y = pt[1] * h_scale
     return fitz.Point(x, y)
+
+
+def _recompress_image(data, mode, quality, downscale=None):
+    """Re-encode one image stream as (gray-)JPEG. Returns bytes or None.
+
+    ``downscale`` accepts 2 (halve) or 4 (quarter) pixel dimensions.
+    Images with an alpha channel are flattened onto the target colorspace
+    (JPEG has no alpha); anything un-decodable yields None so the caller
+    keeps the original stream untouched.
+    """
+    try:
+        pix = fitz.Pixmap(data)
+        if pix.alpha:
+            pix = fitz.Pixmap(pix, 0)  # drop alpha channel
+        # Pixmap.shrink(n) divides each dimension by 2**n.
+        steps = {2: 1, 4: 2}.get(int(downscale or 0), 0)
+        if steps and pix.width >= 32 and pix.height >= 32:
+            pix.shrink(steps)
+        if mode == "gray-jpeg":
+            pix = fitz.Pixmap(fitz.csGRAY, pix)
+        elif pix.n != 1:
+            # ICC-based RGB / CMYK and friends: JPEG-bytes only after a
+            # plain-DeviceRGB conversion (tobytes raises otherwise).
+            pix = fitz.Pixmap(fitz.csRGB, pix)
+        return pix.tobytes("jpeg", jpg_quality=int(quality))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def optimize_images(doc, mode='none', quality=75, downscale=None) -> dict:
+    """Recompress / downscale embedded images of *doc* when it helps.
+
+    Scanned PDFs are the bulk of the file weight; re-encoding their page
+    rasters to JPEG (optionally grayscale / downscaled) usually shrinks the
+    output several-fold without touching the invisible text layer.
+    Only replacements **smaller than the original** are applied; soft-masked
+    images (SMask) and failures are skipped and counted.
+    """
+    stats = {'attempted': 0, 'replaced': 0, 'skipped': 0,
+             'before_bytes': 0, 'after_bytes': 0, 'saved_bytes': 0}
+    if mode not in ('jpeg', 'gray-jpeg'):
+        return stats
+
+    for pno in range(doc.page_count):
+        page = doc[pno]
+        for item in page.get_images(full=True):
+            freq = item[0]
+            smask = item[1]
+            if smask > 0:
+                stats['skipped'] += 1  # SMask flattening can alter look
+                continue
+            try:
+                info = doc.extract_image(freq)
+                data = info.get('image') or b''
+                if not data:
+                    stats['skipped'] += 1
+                    continue
+                stats['attempted'] += 1
+                stats['before_bytes'] += len(data)
+                new_data = _recompress_image(data, mode, quality, downscale)
+                if new_data is None or len(new_data) >= len(data):
+                    stats['skipped'] += 1
+                    stats['after_bytes'] += len(data)
+                    continue
+                page.replace_image(freq, stream=new_data)
+                stats['replaced'] += 1
+                stats['after_bytes'] += len(new_data)
+            except Exception as exc:  # noqa: BLE001
+                stats['skipped'] += 1
+                log.warning('image optimize: page %d xref %d skipped: %s',
+                            pno, freq, exc)
+    stats['saved_bytes'] = max(0, stats['before_bytes'] - stats['after_bytes'])
+    return stats
+
+

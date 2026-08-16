@@ -49,6 +49,18 @@ nothing is hardcoded in the code.
   thread pool, significantly speeding up multi-page documents.
 - **Single-page WebUI** — editable text blocks on the left, page preview + bbox
   overlay on the right, settings form, embed button, progress bars, concurrency input.
+- **Confidence review** — every block shows a confidence badge (green/amber/red at
+  85/60), low-confidence blocks get a red outline; a "Low confidence only" filter
+  with an adjustable threshold (default 60%) and per-page badge counts on the tabs.
+  Engines that report no confidence (the API adapters) show a hint — Tesseract reports it.
+- **Output optimization** — optionally recompress page images to **JPEG / grayscale
+  JPEG** and **downscale** them (1/2, 1/4) at embed time; only replacements smaller
+  than the original are applied (soft-masked images are always kept). Optional
+  **linearization** degrades gracefully to a normal save where the bundled MuPDF
+  dropped it. Embed finishes with an "N image(s) replaced, saved X" note.
+- **Job persistence** — every job's state (finished pages, embed result) is written
+  to `work/<job_id>/job.json` in real time and restored on server start; crashed runs
+  revive as stopped with their completed pages ready to retry or partially download.
 - **i18n** — English & 中文 built in; switch anytime from the header
   (`frontend/i18n.js`), defaults to the browser language, applies instantly with no
   page refresh.
@@ -140,6 +152,8 @@ is not set). The mapping from environment variables to TOML keys is:
 | `OCR_EMBED_FONT` | `embed_font` |
 | `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
 | `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
+| `OCR_CACHE_ENABLED` | `ocr_cache_enabled` |
+| `OCR_CACHE_MAX_AGE_HOURS` | `ocr_cache_max_age_hours` |
 | `OCR_LOG_LEVEL` | `log_level` |
 
 ---
@@ -192,6 +206,8 @@ uvicorn backend.main:app --port 8000
 | GET | `/api/download/{job_id}.pdf` | Download the embedded result |
 | GET | `/api/cleanup` | Temp-file cleanup overview (unreferenced work/output/uploads counts + sizes) |
 | POST | `/api/cleanup/run` | Run/preview cleanup (`older_than_hours`, `dry_run` preview, `force` to ignore the age limit; in-use job files are never deleted) |
+| GET | `/api/cache` | OCR result-cache status (entries/bytes, hit and miss counts, TTL, enabled flag) |
+| POST | `/api/cache/clear` | Drop all cached OCR results (never touches OCR results held in job state) |
 
 ---
 
@@ -218,11 +234,14 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # EN + 中文 UI strings
+├── tests/                      # pytest suite (coordinate mapping / parsers / cache, ...)
+├── requirements-dev.txt        # dev dependencies (pytest)
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # agent-oriented project guide (incl. how to write an OCR adapter)
-└── DESIGN.md
+├── DESIGN.md
+└── FEATURE_IDEAS.md  # brainstormed candidates for future features (not a schedule)
 ```
 
 ---
@@ -257,17 +276,39 @@ pdf-ocr-embed/
   `POST /api/ocr/stop/{job_id}`). Completed pages are kept — download them as a
   partial `*_embedded.pdf` via **Download partial**, or finish the rest with
   **Retry remaining**.
+- **OCR result cache**: identical work (same PDF content + page + engine + settings)
+  is cached by content hash under `cache/ocr/` (key = source-PDF hash + page number +
+  render parameters + engine fingerprint; no secrets or page images are ever written).
+  Re-OCRing the same document hits the cache instead of re-calling the engine.
+  TTL comes from `ocr_cache_max_age_hours` (default 720h); `ocr_cache_enabled = false`
+  disables it entirely. The background cleanup loop also expires old entries;
+  `GET /api/cache` shows hit/miss stats and `POST /api/cache/clear` wipes the cache.
+  Only *pristine* recognition results are cached — your per-page edits are unaffected.
+  **Hits skip rendering entirely**: re-uploading the same document does not
+  re-rasterize any cached page (preview PNGs render lazily on first view).
+  SSE progress is split into a `render` (preprocessing) phase and an `ocr`
+  phase, so the progress bar keeps moving while large files are rasterized.
+- **Output-optimization notes**: image recompression is **lossy** — it only affects
+  the scanned background, never the text layer; soft-masked (transparent) images and
+  images that would grow are always kept. Per-run stats come back in the
+  `/api/embed` response (`images.replaced` / `saved_bytes` / `attempted` / `skipped`).
+  This MuPDF build dropped linearization: requesting it degrades to a normal save
+  with `images.linearized = false` — everything else is unaffected.
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.
-- **Temp file cleanup**: jobs live only in memory — after a server restart,
-  `work/<job_id>/` (source PDF + per-page renders) and `output/` (embeds, thumbnails,
-  overlays) become orphaned. The backend auto-deletes files that are not referenced by
-  any live job and are older than `cleanup_max_age_hours` (default 168h = 7 days),
-  at startup and every `cleanup_interval_hours` (default 6h); both values come from
-  `backend/ocr_config.toml`. Files in use are
+- **Temp file cleanup**: job state is **persisted** in `work/<job_id>/job.json` and
+  restored at startup, so a restart no longer loses tasks (a job that crashed mid-run
+  comes back as stopped — its completed pages are kept for Retry / partial download).
+  Cleanup only ever removes **unreferenced** files older than
+  `cleanup_max_age_hours` (default 168h = 7 days) — e.g. state files deleted/corrupt
+  or leftover upload fragments. It runs at startup and every
+  `cleanup_interval_hours` (default 6h); both values come from
+  `backend/ocr_config.toml`. Files referenced by a job are
   **never deleted**. The **Cleanup** button at the top-right of the WebUI shows a
   summary, lets you adjust the retention window and clean manually (Preview first,
   then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.
+  The same dialog's **OCR result cache** section shows cache stats (entries/size/
+  hits/misses/TTL) with a one-click **Clear OCR cache** button (`POST /api/cache/clear`).
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `backend/ocr_config.toml`) must
   not be committed to the repository.
