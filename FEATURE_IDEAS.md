@@ -71,7 +71,7 @@
     一次拖入多个 PDF 成任务队列，逐个 OCR，完成后统一打包 zip；
     复用现有多任务列表（服务端为唯一数据源）。
 
-11. **任务持久化到磁盘**（M）
+11. **任务持久化到磁盘**（M / ✅ 已实现于 `feat/03-job-persistence`：`work/<job_id>/job.json` 实时落盘，启动 `restore_jobs()` 恢复，崩溃中任务恢复为 stopped）
     任务已在内存中、重启即失（README 说明与限制）。把 job 状态落盘到
     `work/<job_id>/job.json`，启动时恢复，并与现有 cleanup 的「孤儿文件」
     逻辑联动（引用关系需一并持久化）。价值高：长文档 OCR 中断后不必重来。

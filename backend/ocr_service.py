@@ -1,7 +1,9 @@
 """OCR orchestration: upload -> per-page OCR -> editable pages -> embed.
 
 Holds in-memory job state (uploaded PDF path, per-page OcrPage, progress) and
-drives the SSE progress stream.
+drives the SSE progress stream.  Every job is also persisted to
+``work/<job_id>/job.json`` and restored at server startup, so an OCR pass
+interrupted by a restart can be resumed instead of re-uploaded.
 """
 from __future__ import annotations
 
@@ -9,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -40,11 +43,117 @@ _jobs_lock = threading.Lock()
 _STREAMS: Dict[str, Deque[dict]] = {}
 _streams_lock = threading.Lock()
 
+# File name of the on-disk job state inside each job's work dir.
+JOB_STATE_FILE = "job.json"
+
+# Keys that survive a restart (cancel_event is rebuilt on restore).
+_PERSIST_KEYS = (
+    "id", "filename", "pdf_path", "pdf_sha256", "img_dir",
+    "num_pages", "current", "status", "adapter", "concurrency",
+    "error", "embedded_path", "thumb_path", "created",
+)
+
 
 def ensure_dirs() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     pdf_processing.ensure_output_dir()
+
+
+def _state_path(job: dict) -> Path:
+    """Where a job's JSON state lives (inside its own work dir)."""
+    img_dir = Path(job["img_dir"])
+    if img_dir.name != str(job["id"]):
+        img_dir = WORK_DIR / str(job["id"])
+    return img_dir / JOB_STATE_FILE
+
+
+def _snapshot(job: dict) -> dict:
+    """Serializable copy of the job (pages keep their None placeholders)."""
+    return {k: job.get(k) for k in _PERSIST_KEYS if k in job}
+
+
+def _persist(job: dict) -> None:
+    """Atomically write the job state next to its source PDF.
+
+    Persistence is best-effort: a failing write is logged, never raised —
+    OCR progress must not die because the disk misbehaved.
+    """
+    try:
+        with _jobs_lock:
+            snap = _snapshot(job)
+            snap["pages"] = [p for p in job.get("pages", [])]
+        path = _state_path(job)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{JOB_STATE_FILE}.{uuid.uuid4().hex[:8]}.tmp"
+        tmp.write_text(json.dumps(snap, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        log.exception("persist: failed to save state for job %s", job.get("id"))
+
+
+def restore_jobs() -> int:
+    """Load persisted jobs from ``work/*/job.json`` at startup.
+
+    Jobs that crashed mid-run are restored as ``stopped`` (their completed
+    pages are kept, so a retry only re-runs the missing ones).  Corrupt or
+    unusable state files are skipped and left for the temp-file cleanup to
+    expire.  Returns the number of jobs restored.
+    """
+    ensure_dirs()
+    restored = 0
+    for state_file in sorted(WORK_DIR.glob(f"*/{JOB_STATE_FILE}")):
+        try:
+            data = json.loads(state_file.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or not data.get("id"):
+                raise ValueError("invalid state file")
+        except (OSError, ValueError) as exc:
+            log.warning("restore: skipping unreadable %s: %s", state_file, exc)
+            continue
+
+        job_id = str(data["id"])
+        pdf_ok = data.get("pdf_path") and Path(data["pdf_path"]).exists()
+        if not pdf_ok:
+            log.info("restore: job %s skipped (source PDF missing)", job_id)
+            continue
+
+        status = data.get("status", "stopped")
+        if status in ("running", "retrying"):
+            status = "stopped"  # crashed mid-run; completed pages kept
+        if data.get("embedded_path") and not Path(data["embedded_path"]).exists():
+            data["embedded_path"] = None
+        if data.get("thumb_path") and not Path(data["thumb_path"]).exists():
+            data["thumb_path"] = None
+
+        pages = data.get("pages")
+        if not isinstance(pages, list):
+            pages = []
+        job = {
+            k: data.get(k) for k in _PERSIST_KEYS if k in data
+        }
+        job["id"] = job_id
+        job["status"] = status
+        job["pages"] = pages
+        job["img_dir"] = data.get("img_dir") or str(WORK_DIR / job_id)
+        job["current"] = int(sum(1 for p in pages if p is not None))
+        job["num_pages"] = int(data.get("num_pages", 0) or len(pages))
+        job["cancel_event"] = threading.Event()
+        if "pdf_sha256" not in job:
+            try:
+                job["pdf_sha256"] = hashlib.sha256(
+                    Path(job["pdf_path"]).read_bytes()).hexdigest()
+            except OSError:
+                job["pdf_sha256"] = ""
+        with _jobs_lock:
+            _JOBS[job_id] = job
+        with _streams_lock:
+            _STREAMS[job_id] = deque(maxlen=1000)
+        restored += 1
+        log.info("restore: job %s loaded (%s, %d/%d pages done)",
+                 job_id, status, job["current"], job["num_pages"])
+    if restored:
+        log.info("restore: %d job(s) loaded from %s", restored, WORK_DIR)
+    return restored
 
 
 def create_job(filename: str, file_bytes: bytes) -> dict:
@@ -77,6 +186,7 @@ def create_job(filename: str, file_bytes: bytes) -> dict:
         }
     with _streams_lock:
         _STREAMS[job_id] = deque(maxlen=1000)
+    _persist(_JOBS[job_id])
     log.info("job %s created: filename=%s, size=%d bytes", job_id, safe_name, len(file_bytes))
     return _JOBS[job_id]
 
@@ -150,6 +260,7 @@ def clear_job(job_id: str) -> bool:
 def _set(job: dict, **kw) -> None:
     with _jobs_lock:
         job.update(kw)
+    _persist(job)  # state survives restarts
 
 
 def push_event(job_id: str, event: dict) -> None:
@@ -211,9 +322,11 @@ def update_page(job_id: str, page_index: int, page_dict: dict) -> List[dict]:
     if job is None:
         return []
     with _jobs_lock:
-        while len(job["pages"]) <= page_index:
-            job["pages"].append(None)
-        job["pages"][page_index] = page_dict
+        pages = job["pages"]
+        while len(pages) <= page_index:
+            pages.append(None)
+        pages[page_index] = page_dict
+    _persist(job)  # edits / OCR results survive restarts
     return [p for p in job["pages"] if p is not None]
 
 
@@ -239,10 +352,8 @@ def retry_job(job_id: str, adapter_name: str | None = None,
              job_id, already_done, len(missing), missing)
 
     # Reset status/error but KEEP successful page results.
-    with _jobs_lock:
-        job["status"] = "retrying"
-        job["error"] = None
-        job["cancel_event"].clear()
+    job["cancel_event"].clear()
+    _set(job, status="retrying", error=None)
     # Reset the SSE buffer.
     with _streams_lock:
         _STREAMS[job_id] = deque(maxlen=1000)

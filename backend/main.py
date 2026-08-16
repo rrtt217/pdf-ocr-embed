@@ -37,6 +37,9 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Bring back jobs persisted in work/<job_id>/job.json so a restart
+    # resumes the task list (completed pages / embeds survive for retry).
+    ocr_service.restore_jobs()
     # Keep orphaned temp files from accumulating: periodically delete
     # unreferenced files older than cleanup_max_age_hours.
     cleanup_mod.start_background_cleanup()
