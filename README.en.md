@@ -58,6 +58,9 @@ nothing is hardcoded in the code.
   than the original are applied (soft-masked images are always kept). Optional
   **linearization** degrades gracefully to a normal save where the bundled MuPDF
   dropped it. Embed finishes with an "N image(s) replaced, saved X" note.
+- **Job persistence** — every job's state (finished pages, embed result) is written
+  to `work/<job_id>/job.json` in real time and restored on server start; crashed runs
+  revive as stopped with their completed pages ready to retry or partially download.
 - **i18n** — English & 中文 built in; switch anytime from the header
   (`frontend/i18n.js`), defaults to the browser language, applies instantly with no
   page refresh.
@@ -294,12 +297,14 @@ pdf-ocr-embed/
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.
-- **Temp file cleanup**: jobs live only in memory — after a server restart,
-  `work/<job_id>/` (source PDF + per-page renders) and `output/` (embeds, thumbnails,
-  overlays) become orphaned. The backend auto-deletes files that are not referenced by
-  any live job and are older than `cleanup_max_age_hours` (default 168h = 7 days),
-  at startup and every `cleanup_interval_hours` (default 6h); both values come from
-  `backend/ocr_config.toml`. Files in use are
+- **Temp file cleanup**: job state is **persisted** in `work/<job_id>/job.json` and
+  restored at startup, so a restart no longer loses tasks (a job that crashed mid-run
+  comes back as stopped — its completed pages are kept for Retry / partial download).
+  Cleanup only ever removes **unreferenced** files older than
+  `cleanup_max_age_hours` (default 168h = 7 days) — e.g. state files deleted/corrupt
+  or leftover upload fragments. It runs at startup and every
+  `cleanup_interval_hours` (default 6h); both values come from
+  `backend/ocr_config.toml`. Files referenced by a job are
   **never deleted**. The **Cleanup** button at the top-right of the WebUI shows a
   summary, lets you adjust the retention window and clean manually (Preview first,
   then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.

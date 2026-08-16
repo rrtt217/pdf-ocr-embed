@@ -1,15 +1,16 @@
 """Temporary-file cleanup for `work/`, `output/` and `uploads/`.
 
-The server holds OCR jobs **in memory only**: restarting drops all job state,
-but the per-job working files (`work/<job_id>/` — the uploaded source PDF plus
-rendered page PNGs), embedded results and overlay PNGs (`output/`) stay on disk
-forever unless something removes them.  A single 500-page scan can leave
+Job state lives in `work/<job_id>/job.json` and is restored at startup
+(see ``ocr_service.restore_jobs``), so every restored job's files stay
+protected.  Orphaned files only arise when a state file is deleted or
+corrupt (or an upload/embed produced files no job references), and would
+otherwise stay on disk forever — a single 500-page scan can leave
 hundreds of MB of page renders behind.
 
 This module:
   - inventories unreferenced temp files (age + size),
   - deletes those older than a configurable age — NEVER touching anything a
-    live job still references,
+    live or restored job still references,
   - re-runs automatically on a background daemon thread.
 
 Settings (via ``backend.config.resolve()``, from ``backend/ocr_config.toml``):
