@@ -206,6 +206,28 @@ def _has_mask(key: str) -> bool:
     return "*" in key
 
 
+_REDACT_PLACEHOLDER = "[REDACTED]"
+
+
+def redact_secrets(text: str) -> str:
+    """Remove every configured ``api_key`` value from ``text``.
+
+    Frontend-facing surfaces (the debug-log endpoint and job/SSE error messages)
+    must never echo the API key, whether it came from the TOML file, a WebUI save
+    or an ``OCR_API_KEY`` / ``USTC_API_KEY`` environment variable.
+    """
+    if not text:
+        return text
+    secrets: set[str] = set()
+    for source in (_load_file_config(), _saved, _load_env()):
+        key = str(source.get("api_key", "") or "").strip()
+        if key:
+            secrets.add(key)
+    for secret in sorted(secrets, key=len, reverse=True):
+        text = text.replace(secret, _REDACT_PLACEHOLDER)
+    return text
+
+
 def apply_runtime_overrides(settings: Dict[str, Any]) -> None:
     """Apply WebUI-only (non-persisted) overrides for the current request/session."""
     for field in ("api_key", "base_url", "model", "provider"):

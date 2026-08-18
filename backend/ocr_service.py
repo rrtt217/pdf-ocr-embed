@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
-from backend.config import resolve
+from backend.config import redact_secrets, resolve
 
 import fitz  # PyMuPDF
 
@@ -544,8 +544,9 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
             _finish_stopped(job, job_id, num)
             return
         log.exception("job %s: run_ocr failed", job_id)
-        _set(job, status="error", error=str(exc))
-        push_event(job_id, {"type": "error", "message": str(exc)})
+        message = redact_secrets(str(exc))
+        _set(job, status="error", error=message)
+        push_event(job_id, {"type": "error", "message": message})
 
 
 def _finish_stopped(job, job_id: str, num: int) -> None:
@@ -726,13 +727,14 @@ def _ocr_pages_parallel(job, job_id, adapter_kwargs, page_specs,
         except Exception as exc:  # noqa: BLE001
             if cancel.is_set():
                 return spec["page_index"], None
-            log.warning("job %s: page %d failed: %s", job_id, spec["page_index"], exc)
+            message = redact_secrets(str(exc))
+            log.warning("job %s: page %d failed: %s", job_id, spec["page_index"], message)
             push_event(job_id, {
                 "type": "error_page",
                 "page_index": spec["page_index"],
-                "message": str(exc),
+                "message": message,
             })
-            return spec["page_index"], exc
+            return spec["page_index"], message
 
     errors = {}
     pool = ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="ocr")
