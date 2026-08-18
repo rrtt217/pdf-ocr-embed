@@ -51,6 +51,9 @@ _FILE_KEYS = (
     "tessdata_dir", "tess_cmd",
     # generic_openai adapter knob
     "generic_prompt",
+    # HTTP adapter retry / rate-limit knobs (see backend/sources/http_utils.py):
+    # shared by unlimited_ocr & generic_openai; do NOT affect OCR output.
+    "max_retries", "retry_base_delay", "retry_max_delay", "rate_limit_rps",
     # embedded-text font (system font name / path used for the text layer)
     "embed_font",
     # temp-file cleanup (see backend/cleanup.py)
@@ -71,6 +74,10 @@ _ENV_ALIASES = {
     "OCR_TESSDATA_DIR": "tessdata_dir",
     "OCR_TESS_CMD": "tess_cmd",
     "OCR_GENERIC_PROMPT": "generic_prompt",
+    "OCR_MAX_RETRIES": "max_retries",
+    "OCR_RETRY_BASE_DELAY": "retry_base_delay",
+    "OCR_RETRY_MAX_DELAY": "retry_max_delay",
+    "OCR_RATE_LIMIT_RPS": "rate_limit_rps",
     "OCR_EMBED_FONT": "embed_font",
     "OCR_CLEANUP_MAX_AGE_HOURS": "cleanup_max_age_hours",
     "OCR_CLEANUP_INTERVAL_HOURS": "cleanup_interval_hours",

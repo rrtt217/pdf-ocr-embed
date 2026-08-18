@@ -14,6 +14,8 @@
 # OCR_BASE_URL -> base_url, OCR_MODEL -> model, OCR_PROVIDER -> provider,
 # OCR_TESS_LANG/PSM/OEM/CONFIG -> tess_*, OCR_TESSDATA_DIR -> tessdata_dir,
 # OCR_TESS_CMD -> tess_cmd, OCR_GENERIC_PROMPT -> generic_prompt,
+# OCR_MAX_RETRIES -> max_retries, OCR_RETRY_BASE_DELAY -> retry_base_delay,
+# OCR_RETRY_MAX_DELAY -> retry_max_delay, OCR_RATE_LIMIT_RPS -> rate_limit_rps,
 # OCR_EMBED_FONT -> embed_font, OCR_CLEANUP_MAX_AGE_HOURS ->
 # cleanup_max_age_hours, OCR_CLEANUP_INTERVAL_HOURS -> cleanup_interval_hours,
 # OCR_LOG_LEVEL -> log_level.
@@ -34,6 +36,14 @@ tess_lang = "chi_sim"                        # e.g. "eng", "chi_sim", "chi_sim+e
 
 # --- Generic OpenAI adapter (any OpenAI-compatible vision model) ----------
 # generic_prompt = "..."                     # override the default bbox-JSON prompt
+
+# --- HTTP adapter retry + rate limiting (shared by unlimited & generic) ----
+# Applies to every API call; does NOT change OCR output (so it never affects
+# the result-cache key).  0 / absent disables that knobs' default.
+# max_retries = 3                           # retries after the first attempt (0 = no retry)
+# retry_base_delay = 1.0                    # initial backoff seconds (exponential, +jitter)
+# retry_max_delay = 30.0                    # upper bound on backoff delay
+# rate_limit_rps = 0                        # requests/second cap (0 = disabled)
 
 # --- Embedded-text font ----------------------------------------------------
 # embed_font = "Noto Sans SC"                # system font name or path for the text layer
