@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 
-from backend.config import resolve
+from backend.config import redact_secrets, resolve
 
 _LOG_BUFFER: deque[str] = deque(maxlen=1000)
 
@@ -48,9 +48,13 @@ def setup_logging() -> None:
 
 
 def recent_logs(n: int = 200) -> list[str]:
-    """Return up to the last `n` formatted log lines (oldest first)."""
+    """Return up to the last `n` formatted log lines (oldest first).
+
+    Lines are scrubbed with :func:`backend.config.redact_secrets` so the WebUI
+    debug panel can never echo an API key that happened to reach a log message.
+    """
     items = list(_LOG_BUFFER)
-    return items[-n:]
+    return [redact_secrets(line) for line in items[-n:]]
 
 
 def clear_logs() -> None:
