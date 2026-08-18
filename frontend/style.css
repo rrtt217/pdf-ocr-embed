@@ -187,6 +187,7 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   color: var(--text);
 }
 .toolbar button:disabled { opacity: .45; cursor: default; }
+.toolbar-sep { flex: 0 0 auto; width: 1px; height: 22px; background: var(--border); }
 #page-tabs { display: flex; gap: 6px; overflow-x: auto; }
 .page-tab {
   padding: 4px 10px;

@@ -63,6 +63,17 @@
         <label class="inline-label"><span data-i18n="upload.concurrency">Parallel OCR pages</span>
           <input id="concurrency" type="number" min="1" max="32" value="1" />
         </label>
+        <label class="inline-label"><span data-i18n="upload.pageStart">Page start</span>
+          <input id="page-start" type="number" min="1" placeholder="1" />
+        </label>
+        <label class="inline-label"><span data-i18n="upload.pageEnd">Page end</span>
+          <input id="page-end" type="number" min="1" placeholder="all" />
+        </label>
+        <label class="inline-check" data-i18n-title="upload.forceTitle">
+          <input id="retry-force" type="checkbox" />
+          <span data-i18n="upload.force">Re-run done pages</span>
+        </label>
+        <span class="hint" id="page-range-hint"></span>
         <span class="hint" id="adapter-hint"></span>
         <span class="hint" id="upload-msg"></span>
       </div>
@@ -85,6 +96,8 @@
         <button id="btn-prev" data-i18n-title="workspace.prev">◀</button>
         <span id="page-tabs"></span>
         <button id="btn-next" data-i18n-title="workspace.next">▶</button>
+        <span class="toolbar-sep"></span>
+        <button id="btn-reocr" class="warn" data-i18n="workspace.reOcrPage">Re-OCR this page</button>
         <span id="zoom-label"></span>
         <input id="zoom" type="range" min="50" max="200" value="100" />
       </div>

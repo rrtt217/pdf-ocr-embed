@@ -223,8 +223,21 @@ async def retry_ocr(
     psm: Optional[int] = Form(None),
     oem: Optional[int] = Form(None),
     prompt: Optional[str] = Form(None),
+    page_start: Optional[int] = Form(None),
+    page_end: Optional[int] = Form(None),
+    force: Optional[bool] = Form(False),
 ) -> dict:
-    """Re-run OCR on an already-uploaded job without re-uploading the PDF."""
+    """Re-run OCR on an already-uploaded job without re-uploading the PDF.
+
+    All fields are optional form fields so old clients keep working:
+      - adapter / concurrency / base_url / api_key / model / lang / psm /
+        oem / prompt — as before.
+      - page_start / page_end: a 1-based inclusive page range to run
+        (both optional; e.g. page_start=1,page_end=20 runs pages 1..20).
+      - force: boolean, default false — when true, already-successful pages in
+        the selected range are re-run too (A/B testing after switching
+        prompt/engine).
+    """
     job = ocr_service.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -235,12 +248,18 @@ async def retry_ocr(
                  ("oem", oem), ("prompt", prompt)):
         if v is not None and v != "":
             extra[k] = v
+    page_range = None
+    if page_start is not None or page_end is not None:
+        page_range = (page_start if page_start is not None else 1,
+                      page_end if page_end is not None else job.get("num_pages", 0))
     ok = ocr_service.retry_job(
         job_id, adapter_name=adapter or "unlimited",
-        extra_cfg=extra or None, concurrency=concurrency)
+        extra_cfg=extra or None, concurrency=concurrency,
+        page_range=page_range, force=bool(force))
     if not ok:
         raise HTTPException(status_code=409, detail="Job cannot be retried (missing file)")
-    log.info("retry scheduled for job %s (concurrency=%d)", job_id, concurrency)
+    log.info("retry scheduled for job %s (concurrency=%d, range=%s, force=%s)",
+             job_id, concurrency, page_range, force)
     return {"job_id": job_id, "filename": job["filename"], "status": "retrying",
             "concurrency": concurrency}
 

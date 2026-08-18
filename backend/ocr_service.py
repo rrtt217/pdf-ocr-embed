@@ -32,6 +32,42 @@ from backend.sources.factory import get_adapter
 
 log = logging.getLogger(__name__)
 
+
+def select_pages(num_pages: int, statuses, page_range=None, force: bool = False) -> list:
+    """Return the zero-based page indices to run for a job/pass.
+
+    Pure helper (unit-testable, no I/O). ``statuses`` is the job's per-page
+    result list where a truthy entry means the page already has a result
+    (None placeholders / a shorter list both mean "not done"); it may be
+    shorter than ``num_pages``.
+
+    ``page_range`` is an optional ``(start, end)`` pair, **1-based and
+    inclusive**, as a user would type it (e.g. ``(1, 20)`` selects pages
+    1..20). ``None`` means all pages. Out-of-range bounds are clamped to the
+    document; a reversed/empty range yields an empty selection.
+
+    ``force=False`` (default): already-done pages are skipped (the classic
+    retry semantics). ``force=True``: every selected page is included even if
+    it already has a result (used to re-run after switching prompt/engine).
+    """
+    num_pages = max(0, int(num_pages))
+    if page_range is None:
+        indices = list(range(num_pages))
+    else:
+        start = int(page_range[0])
+        end = int(page_range[1])
+        # Convert the 1-based inclusive range into zero-based indices.
+        s = max(0, start - 1)
+        e = min(num_pages - 1, end - 1)
+        if s > e:
+            return []
+        indices = list(range(s, e + 1))
+    if not force:
+        indices = [i for i in indices
+                   if i >= len(statuses) or not statuses[i]]
+    return indices
+
+
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 WORK_DIR = Path(__file__).resolve().parent.parent / "work"
 
@@ -331,11 +367,17 @@ def update_page(job_id: str, page_index: int, page_dict: dict) -> List[dict]:
 
 
 def retry_job(job_id: str, adapter_name: str | None = None,
-              extra_cfg: dict | None = None, concurrency: int = 1) -> bool:
-    """Re-run OCR for an existing job, **only for pages that are missing/failed**.
+              extra_cfg: dict | None = None, concurrency: int = 1,
+              page_range=None, force: bool = False) -> bool:
+    """Re-run OCR for an existing job.
 
-    Already-successful pages are preserved (this is the fix for the "99% done
-    then retry restarts from 0" bug). Returns True if a retry was scheduled.
+    By default (force=False, no page_range) only **missing/failed** pages are
+    re-run — already-successful pages are preserved (this is the fix for the
+    "99% done then retry restarts from 0" bug). ``page_range`` is an optional
+    ``(start, end)`` **1-based inclusive** page range restricting which pages
+    are considered; ``force=True`` makes already-successful selected pages
+    re-run too (e.g. after switching prompt/engine — A/B testing). Returns
+    True if a retry was scheduled.
     """
     job = get_job(job_id)
     if job is None:
@@ -345,11 +387,12 @@ def retry_job(job_id: str, adapter_name: str | None = None,
         log.warning("retry: job %s source PDF missing", job_id)
         return False
 
+    num = job.get("num_pages", 0) or len(job["pages"])
     already_done = sum(1 for p in job["pages"] if p is not None)
-    missing = [i for i in range(job.get("num_pages", 0) or len(job["pages"]))
-               if i >= len(job["pages"]) or job["pages"][i] is None]
-    log.info("retry job %s: %d pages already done, %d to re-run: %s",
-             job_id, already_done, len(missing), missing)
+    to_run = select_pages(num, job["pages"], page_range=page_range, force=force)
+    log.info("retry job %s: %d pages already done, %d scheduled (%s)%s",
+             job_id, already_done, len(to_run), to_run,
+             f", force={force}" if force else "")
 
     # Reset status/error but KEEP successful page results.
     job["cancel_event"].clear()
@@ -358,14 +401,14 @@ def retry_job(job_id: str, adapter_name: str | None = None,
     with _streams_lock:
         _STREAMS[job_id] = deque(maxlen=1000)
     push_event(job_id, {"type": "status", "status": "retrying",
-                        "message": f"Retrying {len(missing)} page(s), "
+                        "message": f"Retrying {len(to_run)} page(s), "
                                    f"{already_done} already done"})
     # Run OCR in a background thread so this call returns immediately and the
     # SSE progress stream can deliver updates in real time.
     t = threading.Thread(
         target=run_ocr,
         args=(job_id, adapter_name, extra_cfg, concurrency),
-        kwargs={"only_missing": True},
+        kwargs={"only_missing": True, "page_range": page_range, "force": force},
         daemon=True,
         name=f"ocr-retry-{job_id}",
     )
@@ -397,13 +440,18 @@ def stop_job(job_id: str) -> bool:
 
 def run_ocr(job_id: str, adapter_name: str | None = None,
             extra_cfg: dict | None = None, concurrency: int = 1,
-            only_missing: bool = False) -> None:
+            only_missing: bool = False, page_range=None,
+            force: bool = False) -> None:
     """Run the OCR pipeline for a job.
 
     Pages are processed concurrently using a thread pool sized by `concurrency`.
     When `only_missing` is True (retry path), pages that already have a result
     are skipped — only missing/failed pages are re-run, so a retry at 99% does
-    NOT restart from page 0.
+    NOT restart from page 0.  `page_range` is an optional ``(start, end)``
+    1-based inclusive range restricting which pages run; `force=True` re-runs
+    already-successful selected pages (A/B testing).  Skipped pages are never
+    re-rendered or re-recognized, and progress totals reflect only the pages
+    actually scheduled on top of the already-done base.
     """
     job = get_job(job_id)
     if job is None:
@@ -438,13 +486,13 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
             num = doc.page_count
             _set(job, num_pages=num)
 
-            # Decide which pages need OCR. On retry, skip pages that already
-            # have a result so we don't redo the 99% that succeeded.
-            if only_missing:
-                page_indices = [i for i in range(num)
-                                if i >= len(job["pages"]) or job["pages"][i] is None]
-            else:
-                page_indices = list(range(num))
+            # Decide which pages need OCR. The selection helper handles the
+            # optional 1-based page range and the force flag, while `only_missing`
+            # (legacy retry) keeps its "skip already-done pages" semantics. A
+            # fresh first run (only_missing=False) schedules every page.
+            force_effective = (not only_missing) or bool(force)
+            page_indices = select_pages(num, job["pages"], page_range=page_range,
+                                        force=force_effective)
 
             already_done = sum(1 for p in job["pages"] if p is not None)
             _set(job, current=already_done)
