@@ -94,6 +94,17 @@
 - `POST /api/embed` 接收（可编辑后的）OcrPage 列表 → 生成嵌入 PDF。
 - `GET /api/download/{job_id}.pdf` 下载结果。
 
+## 执行入口与可靠性
+- Web：`backend/main.py`（FastAPI）；无头 CLI：`backend/cli.py`
+  （`python -m backend.cli`），与 Web 共用 `ocr_service` / `pdf_processing` /
+  `config.resolve()` 同一套后端路径，无服务器也可批量处理。
+- HTTP adapter 的引擎调用走 `backend/sources/http_utils.py`：
+  429/5xx/瞬时网络错误按指数退避重试（尊重 `Retry-After`），并提供线程安全的
+  per-adapter 限速（`rate_limit_rps`）。
+- `POST /api/ocr/retry/{job_id}` 支持 `page_start` / `page_end` / `force`
+  （页范围 + 强制重跑已成功页，A/B 试跑用）；页选择逻辑集中在
+  `ocr_service.select_pages()`（纯函数，含单元测试）。
+
 ## 前端
 - 单页 WebApp（原生 JS / Vue 简洁优先）。
 - 左侧评论区：可编辑每块的文本；右侧实时预览 PDF 页 + 文本框高亮框。

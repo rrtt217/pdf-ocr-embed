@@ -76,7 +76,7 @@
     `work/<job_id>/job.json`，启动时恢复，并与现有 cleanup 的「孤儿文件」
     逻辑联动（引用关系需一并持久化）。价值高：长文档 OCR 中断后不必重来。
 
-12. **选定页范围 / 单页重跑**（S）
+12. **选定页范围 / 单页重跑**（S / ✅ 已实现于 `feat/12-page-range-rerun`：retry 接口新增 `page_start`/`page_end`/`force`，前端重试框页码范围 + 强制重跑 + 页内「重新 OCR 本页」）
     现有 retry 只补失败/缺失页；新增「只 OCR 第 N~M 页」与「选定已成功页强制
     重跑」（对调 prompt、换引擎后的 A/B 试跑非常有用）。涉及
     `backend/ocr_service.py` 与 upload/retry 参数。
@@ -90,7 +90,7 @@
     本地模式指定一个目录，新增 `.pdf` 自动走「OCR → 校验 → 嵌入 → 输出」，
     适合扫描仪/打印机工作流。配置进 TOML，前端只显示状态。
 
-15. **无头 CLI 模式**（S）
+15. **无头 CLI 模式**（S / ✅ 已实现于 `feat/15-headless-cli`：`python -m backend.cli`，argparse，`--adapter/--pages/--concurrency/--out/--no-embed/--max-tokens/--json`，复用 create_job→run_ocr→embed_job 同一条后端路径）
     `python -m backend.cli in.pdf --adapter tesseract --pages 1-20`，脚本化
     批量处理，复用 ocr_service/pdf_processing，WebUI 与 CLI 共享同一后端逻辑。
 
@@ -123,7 +123,7 @@
     优先覆盖 `sources/*` 的解析器与 `base.normalize_bbox` 等坐标纯函数，
     再覆盖 embed 的 y 轴翻转与缩放。这是所有后续功能的安全网。
 
-22. **调用侧自动重试 + 限速**（S）
+22. **调用侧自动重试 + 限速**（S / ✅ 已实现于 `feat/22-retry-ratelimit`：`backend/sources/http_utils.py` 指数退避+抖动、429 Retry-After、线程安全 `RateLimiter`；配置键 `max_retries`/`retry_base_delay`/`retry_max_delay`/`rate_limit_rps` + 对应 `OCR_*` 环境变量，仅作用于两个 HTTP adapter）
     `httpx` 对 429/5xx/瞬时网络错误做指数退避重试；per-adapter 速率上限与
     `concurrency` 联动。现有并发参数已经有了，缺的是失败自愈。
 
@@ -153,9 +153,9 @@
 
 | 批次 | 想法 | 理由 |
 | ---- | ---- | ---- |
-| P0 快赢 | #21 测试、#13 缓存、#12 页范围/单页重跑、#22 重试限速、#1 置信度视图、#18 输出优化 | 成本低、不碰核心不变式、立竿见影 |
-| P1 价值主力 | #11 任务持久化、#10 批量、#17 嵌后校验报告、#2 预处理、#6 块操作 | 覆盖核心用户流程的明显短板 |
-| P2 体验/扩展 | #7 查找替换、#8 历史、#15 CLI、#16 Webhook、#19/#20 导出与调试、#23/#24 运维 | 视反馈再排 |
+| P0 快赢 | #21 测试、#13 缓存、#1 置信度视图、#18 输出优化、#12 页范围/单页重跑、#22 重试限速 | 成本低、不碰核心不变式、立竿见影（均已实现） |
+| P1 价值主力 | #11 任务持久化、#10 批量、#17 嵌后校验报告、#2 预处理、#6 块操作 | 覆盖核心用户流程的明显短板（#11 已实现；剩余为首选下一批） |
+| P2 体验/扩展 | #7 查找替换、#8 历史、#16 Webhook、#19/#20 导出与调试、#23/#24 运维 | 视反馈再排（#15 CLI 已实现） |
 | P3 大块头/看场景 | #3 LLM 校对、#4 多引擎融合、#5 表格/公式、#14 监视文件夹、#25 桌面打包、#26 PWA、#27 账号 | 价值实但成本/风险高，宜先小原型 |
 
 ## 落地流程

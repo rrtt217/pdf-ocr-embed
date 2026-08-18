@@ -160,6 +160,22 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### 无头 CLI 模式（headless）
+
+不启动 Web 服务，直接用命令行完成「OCR → 嵌入」整条流水线（复用
+`backend.ocr_service` / `backend.pdf_processing` 同一套后端逻辑）：
+
+```bash
+python -m backend.cli book.pdf --adapter tesseract --pages 1-20 --concurrency 2
+python -m backend.cli book.pdf --adapter unlimited --no-embed --pages 1-5   # 只 OCR，打印每页文本
+python -m backend.cli book.pdf --adapter list                               # 列出可用引擎
+```
+
+参数：`--adapter`（默认 unlimited）、`--pages`（1 起；`"1-20"` / `"1,3,5-7"` / `"1-"` / `"-5"`）、
+`--concurrency`、`--out`（默认 `output/`）、`--no-embed`、`--max-tokens`（守卫 `< 32768`）、
+`--json`。输出 `<名>_embedded_<id>.pdf`。API key 等配置仍走 `resolve()`（TOML / 环境变量），
+不做任何硬编码。
+
 ### API 速览
 
 | 方法 | 路径 | 说明 |
@@ -168,7 +184,7 @@ uvicorn backend.main:app --port 8000
 | GET  | `/api/health` | 健康检查 + 可用 adapter |
 | GET/POST | `/api/settings` | 读取 / 保存 provider 配置（打码） |
 | POST | `/api/ocr/upload` | 上传 PDF → 后台逐页 OCR（支持 `concurrency` 并行数，`adapter` 引擎选择，`lang/psm/oem` 供 tesseract，`base_url/api_key/model` 供 API 类）→ 返回 job id |
-| POST | `/api/ocr/retry/{job_id}` | 对已上传但失败/中断的任务重跑 OCR（只跑缺失页，不重头开始；参数同 upload） |
+| POST | `/api/ocr/retry/{job_id}` | 对已上传但失败/中断的任务重跑 OCR（默认只跑缺失页，不重头开始；参数同 upload，另支持 `page_start`/`page_end` 页码范围、`force` 强制重跑已成功页） |
 | POST | `/api/ocr/stop/{job_id}` | 中途停止正在运行的 OCR（已完成页保留，可下载或重试剩余） |
 | GET  | `/api/logs` | 获取最近后端调试日志 |
 | GET  | `/api/ocr/stream/{job_id}` | SSE 进度流 |

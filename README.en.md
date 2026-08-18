@@ -187,6 +187,23 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### Headless CLI
+
+Run the whole "OCR → embed" pipeline from the command line without the web
+server (reuses the exact `backend.ocr_service` / `backend.pdf_processing`
+backend logic):
+
+```bash
+python -m backend.cli book.pdf --adapter tesseract --pages 1-20 --concurrency 2
+python -m backend.cli book.pdf --adapter unlimited --no-embed --pages 1-5   # OCR only, print per-page text
+python -m backend.cli book.pdf --adapter list                               # list available engines
+```
+
+Options: `--adapter` (default `unlimited`), `--pages` (1-based; `"1-20"` / `"1,3,5-7"` /
+`"1-"` / `"-5"`), `--concurrency`, `--out` (default `output/`), `--no-embed`,
+`--max-tokens` (guard `< 32768`), `--json`. Writes `<stem>_embedded_<id>.pdf`.
+Config (API keys etc.) still resolves via `resolve()` (TOML / env var), never hardcoded.
+
 ### API Overview
 
 | Method | Path | Description |
@@ -195,7 +212,7 @@ uvicorn backend.main:app --port 8000
 | GET | `/api/health` | Health check + available adapters |
 | GET/POST | `/api/settings` | Read / save provider config (masked) |
 | POST | `/api/ocr/upload` | Upload PDF → background per-page OCR (`concurrency`, `adapter` engine, `lang/psm/oem` for tesseract, `base_url/api_key/model` for API engines) → returns a job id |
-| POST | `/api/ocr/retry/{job_id}` | Re-run OCR for failed/interrupted jobs (only missing pages, not from scratch; params same as upload) |
+| POST | `/api/ocr/retry/{job_id}` | Re-run OCR for failed/interrupted jobs (default: only missing pages, not from scratch; params same as upload, plus optional `page_start`/`page_end` range and `force` to re-run already-successful pages) |
 | POST | `/api/ocr/stop/{job_id}` | Stop a running OCR job (completed pages are kept: download or retry the rest) |
 | GET | `/api/logs` | Recent backend debug logs |
 | GET | `/api/ocr/stream/{job_id}` | SSE progress stream |
