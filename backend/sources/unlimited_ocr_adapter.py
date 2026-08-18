@@ -19,6 +19,7 @@ import httpx
 from backend.config import resolve
 from backend.models import OcrBlock, OcrPage
 from backend.sources.base import OcrSource, normalize_bbox
+from backend.sources.http_utils import RateLimiter, post_json_with_retry
 
 log = logging.getLogger(__name__)
 
@@ -95,12 +96,28 @@ class UnlimitedOcrAdapter(OcrSource):
                          "https://api.llm.ustc.edu.cn/v1").rstrip("/")
         self.api_key = api_key or cfg.get("api_key") or ""
         self.model = model or cfg.get("model") or "unlimited-ocr"
+        # HTTP retry / rate-limit knobs (shared HTTP-adapter settings, see
+        # backend/sources/http_utils.py).  These do NOT affect OCR output, so
+        # they are intentionally absent from cache_fingerprint().
+        self.max_retries = int(cfg.get("max_retries") or 3)
+        self.retry_base_delay = float(cfg.get("retry_base_delay") or 1.0)
+        self.retry_max_delay = float(cfg.get("retry_max_delay") or 30.0)
+        self.rate_limit_rps = float(cfg.get("rate_limit_rps") or 0.0)
+        self._rate_limiter = (
+            RateLimiter.from_requests_per_second(self.rate_limit_rps)
+            if self.rate_limit_rps > 0 else None
+        )
 
     def _chat_url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
     def cache_fingerprint(self) -> dict:
-        """Output-affecting settings: endpoint, model, and key identity."""
+        """Output-affecting settings: endpoint, model, and key identity.
+
+        Retry / rate-limit knobs are deliberately NOT included: they change
+        call behavior but never the OCR output, so they must not alter the
+        result-cache key.
+        """
         import hashlib
         return {
             "engine": self.name,
@@ -125,7 +142,13 @@ class UnlimitedOcrAdapter(OcrSource):
         t0 = time.time()
         # All responses stream as a single line; pass a generous read timeout.
         with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
-            resp = client.post(url, json=payload, headers=headers)
+            resp = post_json_with_retry(
+                client, url, json=payload, headers=headers,
+                max_retries=self.max_retries,
+                base_delay=self.retry_base_delay,
+                max_delay=self.retry_max_delay,
+                rate_limiter=self._rate_limiter,
+            )
             log.debug("response %d in %.1fs (%d bytes)", resp.status_code,
                       time.time() - t0, len(resp.content))
             resp.raise_for_status()
