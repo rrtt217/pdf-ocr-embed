@@ -431,6 +431,96 @@ async function retryJob(jobId) {
   if (cfg.lang) fd.append("lang", cfg.lang);
   const c = Math.max(1, Math.min(32, parseInt($("#concurrency").value || "1", 10)));
   fd.append("concurrency", String(c));
+  // Page range (1-based inclusive) + force flag, off the shared controls.
+  const range = selectedPageRange();
+  if (range) {
+    fd.append("page_start", String(range.start));
+    if (range.end !== null) fd.append("page_end", String(range.end));
+  }
+  if ($("#retry-force") && $("#retry-force").checked) fd.append("force", "true");
+  try {
+    await api(`/api/ocr/retry/${jobId}`, { method: "POST", body: fd });
+    Object.assign(job, { status: "retrying", error: null });
+    renderJobs();
+    connectStream(jobId);
+  } catch (e) {
+    Object.assign(job, { status: "error", error: t("job.retryFailed", { msg: e.message }) });
+    renderJobs();
+  } finally {
+    job.busy = false;
+    renderJobs();
+  }
+}
+
+/* Read the shared page-range controls (upload-opts) and validate them.
+   Returns null when no range is selected (retry everything missing), or
+   {start, end} (1-based inclusive) when a valid range is set. */
+function selectedPageRange() {
+  const startEl = $("#page-start");
+  const endEl = $("#page-end");
+  if (!startEl || !endEl) return null;
+  const start = startEl.value === "" ? null : parseInt(startEl.value, 10);
+  const end = endEl.value === "" ? null : parseInt(endEl.value, 10);
+  if (start == null && end == null) return null;
+  const s = start == null ? 1 : start;
+  // end may stay null (open-ended -> the server fills up to the doc length).
+  const e = end === null ? null : end;
+  if (!Number.isFinite(s) || s < 1 || (e !== null && (e < 1 || s > e))) {
+    return null;  // invalid — caller should skip sending the range
+  }
+  return { start: s, end: e };
+}
+
+/* Show a live hint for the shared page-range controls and flag invalid values
+   (start>end, or out of range).  Invalid ranges are surfaced but do not break
+   retry — retryJob simply falls back to "retry missing pages". */
+function updatePageRangeHint() {
+  const hintEl = $("#page-range-hint");
+  if (!hintEl) return;
+  const startEl = $("#page-start");
+  const endEl = $("#page-end");
+  if (!startEl || !endEl) return;
+  const s = startEl.value === "" ? null : parseInt(startEl.value, 10);
+  const e = endEl.value === "" ? null : parseInt(endEl.value, 10);
+  if (s == null && e == null) { hintEl.textContent = ""; return; }
+
+  const sv = s == null ? 1 : s;
+  const invalidStart = !Number.isFinite(sv) || sv < 1;
+  const invalidEnd = e !== null && (!Number.isFinite(e) || e < 1);
+  const reversed = s !== null && e !== null && s > e;
+  if (invalidStart || invalidEnd || reversed) {
+    hintEl.textContent = t("upload.pageRangeInvalid");
+    return;
+  }
+  if (e === null) {
+    hintEl.textContent = t("upload.pageRangeOpenStart", { start: sv });
+  } else if (s === null) {
+    hintEl.textContent = t("upload.pageRangeOpenEnd", { end: e });
+  } else {
+    hintEl.textContent = t("upload.pageRangeOk", { start: s, end: e });
+  }
+}
+
+/* Re-run OCR for just the currently-viewed page, forcing it even if it
+   already has a result — the A/B test path after switching prompt/engine. */
+async function reOcrPage() {
+  const sel = state.sel;
+  if (!sel) return;
+  const page = sel.pages && sel.pages[sel.pageIndex];
+  if (!page) return;
+  const jobId = sel.jobId;
+  const job = jobById(jobId);
+  if (!job || job.busy) return;
+  const pageNo = page.page_index + 1;  // 1-based, user-facing
+  job.busy = true;
+  renderJobs();
+  const fd = new FormData();
+  const cfg = currentAdapterCfg();
+  fd.append("adapter", cfg.adapter);
+  if (cfg.lang) fd.append("lang", cfg.lang);
+  fd.append("page_start", String(pageNo));
+  fd.append("page_end", String(pageNo));
+  fd.append("force", "true");
   try {
     await api(`/api/ocr/retry/${jobId}`, { method: "POST", body: fd });
     Object.assign(job, { status: "retrying", error: null });
@@ -560,8 +650,13 @@ function renderTabs() {
 
 function renderPage() {
   const sel = state.sel;
-  if (!sel) return;
+  const reocrBtn = $("#btn-reocr");
+  if (!sel) {
+    if (reocrBtn) reocrBtn.disabled = true;
+    return;
+  }
   const page = sel.pages[sel.pageIndex];
+  if (reocrBtn) reocrBtn.disabled = !page;
   if (!page) return;
 
   const img = $("#preview-img");
@@ -1047,6 +1142,7 @@ function nextPage() {
    I18N.applyDocument()). */
 function onLocaleChanged() {
   updateAdapterUI();
+  updatePageRangeHint();
   setGlobalStatus();
   renderJobs();
   if (state.sel) {
@@ -1132,6 +1228,12 @@ async function init() {
 
   $("#btn-prev").onclick = prevPage;
   $("#btn-next").onclick = nextPage;
+  $("#btn-reocr").onclick = reOcrPage;
+  // Re-validate the page-range inputs as the user types (disable on bad ranges).
+  ["#page-start", "#page-end"].forEach((sel) => {
+    const input = $(sel);
+    if (input) input.addEventListener("input", updatePageRangeHint);
+  });
   $("#zoom").oninput = (e) => {
     state.zoom = parseFloat(e.target.value);
     $("#zoom-label").textContent = state.zoom + "%";
@@ -1215,6 +1317,7 @@ async function init() {
   document.addEventListener("i18n:changed", onLocaleChanged);
 
   updateAdapterUI();
+  updatePageRangeHint();
   loadFonts();
 
   try { await api("/api/health"); setStatus("online"); }
