@@ -144,11 +144,16 @@ def resolve() -> Dict[str, str]:
     merged.update(_saved)            # WebUI-saved values win over the file
     merged.update(_load_env())       # environment variables override both
 
-    provider = merged.get("provider", "ustc")
+    provider = merged.get("provider") or "ustc"
     preset = PROVIDER_PRESETS.get(provider)
     if preset:
-        merged.setdefault("base_url", preset["base_url"])
-        merged.setdefault("model", preset["model"])
+        # An empty string is not an explicit override -- it is what the WebUI
+        # writes when a field is cleared.  Treat it as absent so clearing a
+        # field really falls back to the provider preset (see README).
+        if not merged.get("base_url"):
+            merged["base_url"] = preset["base_url"]
+        if not merged.get("model"):
+            merged["model"] = preset["model"]
 
     return merged
 

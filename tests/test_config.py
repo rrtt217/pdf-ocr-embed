@@ -47,3 +47,15 @@ def test_bool_coercion():
     assert config._as_str(True) == "true"
     assert config._as_str(False) == "false"
     assert config._as_str(720) == "720"
+
+
+def test_empty_string_falls_back_to_preset(monkeypatch):
+    """A WebUI save writes empty strings for cleared fields; resolve() must
+    treat them as absent so the provider preset fills base_url/model again."""
+    monkeypatch.setattr(config, "_saved", {})
+    monkeypatch.setattr(config, "_load_file_config",
+                        lambda: {"provider": "ustc", "base_url": "", "model": ""})
+    monkeypatch.setattr(config, "_load_env", lambda: {})
+    cfg = config.resolve()
+    assert cfg["base_url"] == "https://api.llm.ustc.edu.cn/v1"
+    assert cfg["model"] == "unlimited-ocr"
