@@ -44,6 +44,9 @@
   普通保存并在结果注明）。嵌入完成显示「图片：重压 N 张，省 X」。
 - **任务持久化**：任务状态实时写入 `work/<job_id>/job.json`（含已完成页与嵌入结果），
   服务重启自动恢复；崩溃中的任务恢复为 stopped，可直接重跑剩余页或下载部分结果。
+- **批量上传 + 打包下载**：一次拖入/选择多个 PDF，每个文件自动成为独立 OCR 任务
+  （并行运行，各自有卡片与 SSE 进度）；在任务列表勾选已嵌入完成的任务，一键把它们的
+  嵌入式 PDF 打包成一个 ZIP 下载（服务端逐文件流式打包，不整包读入内存）。
 - **国际化（i18n）**：内置**英文 / 中文**两套界面，页头可随时切换（`frontend/i18n.js`），
   默认跟随浏览器语言；切换语言不刷新页面即时生效。
 - **浅色 / 深色 / 自适应主题**：页头切换，选择记忆在 localStorage；自适应跟随系统
@@ -172,6 +175,18 @@ uvicorn backend.main:app --port 8000
 完全一致，因此所有块 bbox 的像素坐标语义不变。开关既可写进
 `backend/ocr_config.toml`，也支持 `OCR_PREPROCESS_*` 环境变量（最高优先级）。
 仅对新渲染的页面生效（命中 OCR 缓存的页面不重新渲染、不预处理）。
+### 批量上传与打包下载
+
+上传区支持一次拖入或选择**多个 PDF**（单个上传依旧可用）。每个文件都会成为
+**独立任务**：各自拥有卡片、SSE 进度流与持久化状态，可并行运行——没有单独的
+队列管理器。所有上传并发发出后，列表直接从服务端 `/api/jobs` 回拉（服务端始终
+是任务列表的唯一数据源），运行中的任务各自接上 SSE 进度。
+
+任务完成并点击 **Embed invisible text** 嵌入后，其卡片上会出现**勾选框**：勾选
+任意多个已嵌入完成的任务，再点任务列表右上角的 **⬇ Download ZIP**，即可把它们的
+嵌入式 PDF（按源文件名命名，重名自动加序号）打包成一个 ZIP 下载。打包由服务端从
+磁盘逐文件流式写入（对应 `GET /api/ocr/zip?jobs=id1,id2,...`），不会把整个 ZIP
+读入内存；请求的任务中没有任何嵌入结果时返回 404，有结果的任务会正常包含在内。
 
 ### 无头 CLI 模式（headless）
 
@@ -197,6 +212,7 @@ python -m backend.cli book.pdf --adapter list                               # �
 | GET  | `/api/health` | 健康检查 + 可用 adapter |
 | GET/POST | `/api/settings` | 读取 / 保存 provider 配置（打码） |
 | POST | `/api/ocr/upload` | 上传 PDF → 后台逐页 OCR（支持 `concurrency` 并行数，`adapter` 引擎选择，`lang/psm/oem` 供 tesseract，`base_url/api_key/model` 供 API 类）→ 返回 job id |
+| GET  | `/api/ocr/zip?jobs=id1,id2` | 把所选任务的嵌入式 PDF 打包成一个 ZIP 下载（`jobs` 为逗号分隔的任务 id；请求的任务全都没有嵌入结果时返回 404） |
 | POST | `/api/ocr/retry/{job_id}` | 对已上传但失败/中断的任务重跑 OCR（默认只跑缺失页，不重头开始；参数同 upload，另支持 `page_start`/`page_end` 页码范围、`force` 强制重跑已成功页） |
 | POST | `/api/ocr/stop/{job_id}` | 中途停止正在运行的 OCR（已完成页保留，可下载或重试剩余） |
 | GET  | `/api/logs` | 获取最近后端调试日志 |
@@ -296,4 +312,8 @@ pdf-ocr-embed/
   清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
   同一弹窗内的 **OCR result cache** 区块显示缓存统计（条目数/占用/命中/未命中/TTL）
   并提供 **Clear OCR cache** 一键清空（对应 `POST /api/cache/clear`）。
+- **批量上传 / ZIP 打包（#10）**：多文件上传各自成任务（复用并行能力，无队列管理器）；
+  ZIP 成员按源文件名命名、重名自动加 ` (2)` 序号；打包只包含**已嵌入**且文件仍在
+  磁盘上的任务（`job["embedded_path"]`），其余跳过，全部无结果时返回 404。临时 ZIP
+  写在系统临时目录、随响应流式返回，发送完成后由后台任务删除，不残留孤儿文件。
 - 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。

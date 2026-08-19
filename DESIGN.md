@@ -115,6 +115,20 @@
 - 左侧评论区：可编辑每块的文本；右侧实时预览 PDF 页 + 文本框高亮框。
 - 保存 / 嵌入按钮。
 
+## 批量上传 + 队列 + 打包下载（#10）
+- 上传区支持一次拖入/选择多个 PDF；**每个文件独立成任务**（独立 id、卡片、SSE、
+  持久化），复用现有多任务并行能力，**不做单独的队列管理器**；服务端 `/api/jobs`
+  始终是任务列表唯一数据源，前端并发发出所有上传后直接回拉列表并各自订阅进度。
+- `POST /api/ocr/upload` 同时接受旧字段 `file`（单个，向后兼容）与新字段 `files`
+  （可多个，按对象身份去重）；多文件时返回 `{"jobs": [{job_id, filename, status}, ...]}`，
+  单文件时仍带顶层 `job_id` / `filename` / `status`（老前端不破坏）。
+- `GET /api/ocr/zip?jobs=id1,id2,...`：把所选任务的**嵌入式输出 PDF**
+  （`job["embedded_path"]`）按源文件名打包成一个 ZIP。打包逻辑集中在
+  `backend/batch.py`（纯函数、可单测）：`collect_embedded` 只保留确有嵌入结果的
+  任务，`build_zip` 用 `zipfile` + `copyfileobj` 把每个成员**分块从磁盘流式写入**
+  （ZIP 不整包进内存），重名成员自动加序号；全部无结果时返回 404。临时 ZIP 放
+  系统临时目录，以 `FileResponse` 流式返回，响应发送完成后由后台任务删除。
+
 ## 质量要求
 - 代码可运行，README 写清依赖、配置方式（外部 key / provider）与启动命令。
 - 后端统一走 OcrSource 抽象，不能只写死 Unlimited-OCR。

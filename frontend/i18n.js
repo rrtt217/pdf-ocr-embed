@@ -49,6 +49,9 @@ const I18N_DICT = {
     // --- upload ---
     "upload.drop": "Drop a scanned PDF here",
     "upload.orClick": "or click to choose a file. Pages are rasterized, OCR'd, and made searchable.",
+    "upload.orClickMulti": "or click to choose one or more PDFs. Each becomes its own job — pages are rasterized, OCR'd, and made searchable.",
+    "upload.multiStarted": "{n} jobs started — OCR is running.",
+    "upload.failedSome": "{n} upload(s) failed: {msg}",
     "upload.engine": "OCR engine",
     "upload.engine.unlimited": "Unlimited OCR (API)",
     "upload.engine.tesseract": "Tesseract (local)",
@@ -73,6 +76,10 @@ const I18N_DICT = {
     // --- jobs ---
     "jobs.title": "Jobs",
     "jobs.hint": "All tasks on the server — close this page and come back anytime, they survive.",
+    "jobs.zip": "⬇ Download ZIP",
+    "jobs.zipSel": "⬇ Download ZIP ({n})",
+    "jobs.zipTitle": "Package the embedded PDFs of the selected jobs into one ZIP archive",
+    "job.zipSelect": "Include this PDF in the ZIP download",
     "job.stop": "Stop",
     "job.stopping": "Stopping…",
     "job.retry": "Retry",
@@ -249,6 +256,9 @@ const I18N_DICT = {
     // --- upload ---
     "upload.drop": "将扫描版 PDF 拖到这里",
     "upload.orClick": "或点击选择文件。每页会被栅格化、OCR 识别并生成可搜索的文字层。",
+    "upload.orClickMulti": "或点击选择一个或多个 PDF。每个文件都会成为独立任务——逐页栅格化、OCR 识别并生成可搜索的文字层。",
+    "upload.multiStarted": "已启动 {n} 个任务——OCR 处理中。",
+    "upload.failedSome": "{n} 个上传失败：{msg}",
     "upload.engine": "OCR 引擎",
     "upload.engine.unlimited": "Unlimited OCR（API）",
     "upload.engine.tesseract": "Tesseract（本地）",
@@ -273,6 +283,10 @@ const I18N_DICT = {
     // --- jobs ---
     "jobs.title": "任务",
     "jobs.hint": "服务器上的全部任务——关闭页面后随时回来，任务依然保留。",
+    "jobs.zip": "⬇ 打包下载 ZIP",
+    "jobs.zipSel": "⬇ 打包下载 ZIP（{n}）",
+    "jobs.zipTitle": "将勾选任务（已嵌入）的 PDF 打包成一个 ZIP 下载",
+    "job.zipSelect": "将此 PDF 加入打包下载",
     "job.stop": "停止",
     "job.stopping": "停止中…",
     "job.retry": "重试",

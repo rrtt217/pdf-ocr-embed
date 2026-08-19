@@ -227,6 +227,17 @@ def create_job(filename: str, file_bytes: bytes) -> dict:
     return _JOBS[job_id]
 
 
+def create_jobs(files: list) -> list:
+    """Create one independent job per ``(filename, file_bytes)`` pair (#10).
+
+    Batch upload is deliberately *not* a queue manager: each file becomes its
+    own job with its own id, card, state, SSE stream and persistence, exactly
+    as if it had been uploaded alone.  Returns the job dicts in input order so
+    callers can map each submitted file to its job id.
+    """
+    return [create_job(filename, file_bytes) for filename, file_bytes in files]
+
+
 def get_job(job_id: str) -> Optional[dict]:
     with _jobs_lock:
         return _JOBS.get(job_id)
