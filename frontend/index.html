@@ -182,6 +182,20 @@
       <label><span data-i18n="settings.apikey">API Key</span>
         <input id="set-apikey" type="password" placeholder="sk-… (masked if already set)" />
       </label>
+      <fieldset class="settings-group" id="preprocess-group">
+        <legend data-i18n="settings.preprocessTitle">OCR input preprocessing</legend>
+        <p class="hint" data-i18n-html="settings.preprocessHint"></p>
+        <label class="inline-check"><input id="set-preprocess-enabled" type="checkbox" />
+          <span data-i18n="settings.preprocessEnabled">Enable preprocessing</span></label>
+        <label class="inline-check"><input id="set-preprocess-grayscale" type="checkbox" />
+          <span data-i18n="settings.preprocessGrayscale">Grayscale</span></label>
+        <label class="inline-check"><input id="set-preprocess-denoise" type="checkbox" />
+          <span data-i18n="settings.preprocessDenoise">Denoise (median filter)</span></label>
+        <label class="inline-check"><input id="set-preprocess-contrast" type="checkbox" />
+          <span data-i18n="settings.preprocessContrast">Contrast stretch</span></label>
+        <label class="inline-check"><input id="set-preprocess-binarize" type="checkbox" />
+          <span data-i18n="settings.preprocessBinarize">Binarize (Otsu threshold)</span></label>
+      </fieldset>
       <div class="modal-actions">
         <button id="btn-settings-save" class="primary" data-i18n="settings.save">Save</button>
         <button id="btn-settings-cancel" data-i18n="settings.cancel">Cancel</button>

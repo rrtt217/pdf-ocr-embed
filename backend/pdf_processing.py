@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+from PIL import Image, ImageFilter, ImageOps  # OCR-input preprocessing (#2)
 
 from backend.models import OcrBlock, OcrPage
 
@@ -77,6 +78,117 @@ def render_page(page: fitz.Page) -> "tuple[fitz.Pixmap, int, int]":
     return pix, pix.width, pix.height
 
 
+# ---------------------------------------------------------------------------
+# OCR-input image preprocessing (feature #2)
+#
+# Scanned pages are often skewed, noisy and grey.  Before OCR we can clean the
+# rendered page image with PIL-only operations (grayscale, contrast
+# enhancement, denoising, optional binarization).  HARD INVARIANT: the
+# preprocessing must NEVER change the image dimensions — every block bbox is an
+# integer in this image's raw pixel space, so a resize would silently break all
+# coordinates.  All ops below are dimension-preserving by construction.
+# ---------------------------------------------------------------------------
+
+def preprocess_image(img: "PIL.Image.Image", opts: dict | None = None) -> "PIL.Image.Image":
+    """Apply OCR-input cleaning steps to a rendered page image.
+
+    ``opts`` may carry explicit flags (``enabled``, ``grayscale``, ``denoise``,
+    ``contrast``, ``binarize``) — used by tests and the CLI.  When omitted, the
+    flags are read from ``backend.config.resolve()`` (preprocess_* keys).
+
+    Returns a new image with EXACTLY the same width/height as the input.
+    """
+    if opts is None:
+        opts = _preprocess_opts_from_config()
+    if not opts.get("enabled"):
+        return img
+    out = img
+    if opts.get("grayscale"):
+        if out.mode != "L":
+            out = out.convert("L")
+    if opts.get("denoise"):
+        # Light median filter removes salt-and-pepper scanner noise without
+        # smearing text edges (unlike a strong blur).
+        out = out.filter(ImageFilter.MedianFilter(size=3))
+    if opts.get("contrast"):
+        # Stretch the histogram; white/black-cutoff variants increase
+        # discrimination of faint grey-on-grey text.
+        out = ImageOps.autocontrast(out, cutoff=1)
+    if opts.get("binarize"):
+        # Simple adaptive-ish threshold: Otsu on the luminance histogram
+        # (mode "L" first), then map into a black/white image.
+        if out.mode != "L":
+            out = out.convert("L")
+        thresh = _otsu_threshold(out)
+        out = out.point(lambda p: 255 if p > thresh else 0)
+    if out.size != img.size:
+        # Defensive: never return a resized image (coordinate invariant).
+        log.warning("preprocess changed image size %s -> %s; reverting to input",
+                    img.size, out.size)
+        return img
+    return out
+
+
+# Short flag names used by ``preprocess_image()``'s opts dict, mapped to the
+# flat config keys (backend.config.PREPROCESS_*).  Flag defaults come from
+# ``config.PREPROCESS_DEFAULTS`` — the single source of truth.
+_FLAG_KEYS = {
+    "preprocess_enabled": "enabled",
+    "preprocess_grayscale": "grayscale",
+    "preprocess_denoise": "denoise",
+    "preprocess_contrast": "contrast",
+    "preprocess_binarize": "binarize",
+}
+
+
+def _preprocess_opts_from_config() -> dict:
+    """Read the preprocess_* toggle flags from the effective config.
+
+    Config is resolved through ``backend.config.resolve()`` (never
+    ``os.environ`` directly); the master switch defaults OFF, the common trio
+    (grayscale/denoise/contrast) defaults ON when preprocessing is enabled.
+    """
+    from backend.config import PREPROCESS_DEFAULTS, resolve
+    cfg = resolve()
+    return {
+        short: _cfg_bool(cfg.get(flat), PREPROCESS_DEFAULTS[flat])
+        for flat, short in _FLAG_KEYS.items()
+    }
+
+
+def _cfg_bool(raw: object, default: bool) -> bool:
+    """Parse a config string/bool into a boolean (lenient)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _otsu_threshold(img: "PIL.Image.Image") -> int:
+    """Compute an Otsu threshold on a grayscale image's histogram."""
+    hist = img.histogram()  # 256 bins for mode "L"
+    total = sum(hist)
+    if total == 0:
+        return 128
+    weight_bg, sum_bg = 0, 0.0
+    best_var, best_t = 0.0, 128
+    for t in range(256):
+        weight_bg += hist[t]
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum(x * hist[x] for x in range(t + 1, 256))) / weight_fg
+        var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var > best_var:
+            best_var, best_t = var, t
+    return best_t
+
+
 def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tuple[str, int, int]:
     """Render page to PNG on disk. Returns (path, width_px, height_px).
 
@@ -90,14 +202,51 @@ def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tup
     png_path = out_path / f"page_{page_index:04d}.png"
     tmp_path = out_path / f".page_{page_index:04d}.{uuid.uuid4().hex[:8]}.tmp"
     try:
-        # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
-        pix.save(str(tmp_path), output="png")
+        opts = preprocess_options()
+        if _opts_enabled(opts):
+            # Clean the raster before it becomes OCR input.  Applying the
+            # pipeline here means tesseract, both API adapters and the WebUI
+            # preview all see the exact same (preprocessed) pixels.
+            img = _pixmap_to_image(pix)
+            img = preprocess_image(img, opts)
+            img.save(str(tmp_path), format="PNG")
+        else:
+            # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
+            pix.save(str(tmp_path), output="png")
         os.replace(tmp_path, png_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
     log.debug("rendered page %d -> %s (%dx%d)", page_index, png_path, w, h)
     return str(png_path), w, h
+
+
+def _pixmap_to_image(pix: "fitz.Pixmap") -> "PIL.Image.Image":
+    """Wrap a PyMuPDF pixmap as a PIL image (stride-aware, zero-copy).
+
+    Page renders are RGB with alpha=False; single-channel gray is handled too.
+    Any other layout (RGBA/CMYK/...) goes through a PNG round-trip so we never
+    mis-read the sample bytes.
+    """
+    n = pix.n
+    if n == 1:
+        return Image.frombuffer("L", (pix.width, pix.height), pix.samples,
+                                "raw", "L", pix.stride, 1)
+    if n == 3:
+        return Image.frombuffer("RGB", (pix.width, pix.height), pix.samples,
+                                "raw", "RGB", pix.stride, 1)
+    import io
+    buf = io.BytesIO(pix.tobytes("png"))
+    return Image.open(buf).convert("RGB")
+
+
+def preprocess_options() -> dict:
+    """Public alias for the config-driven preprocessing flags."""
+    return _preprocess_opts_from_config()
+
+
+def _opts_enabled(opts: dict) -> bool:
+    return bool(opts.get("enabled"))
 
 
 def pixel_to_pdf(point: Tuple[float, float], page: fitz.Page,

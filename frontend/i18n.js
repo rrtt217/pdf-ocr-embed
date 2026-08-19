@@ -159,6 +159,13 @@ const I18N_DICT = {
     "settings.saved": "Saved.",
     "settings.loadFailed": "Failed to load settings: {msg}",
     "settings.saveFailed": "Save failed: {msg}",
+    "settings.preprocessTitle": "OCR input preprocessing",
+    "settings.preprocessHint": "Applied to the page image <em>before</em> OCR to lift recognition quality on noisy / grey scans. Image dimensions never change, so block coordinates stay valid. Applies to newly rendered pages.",
+    "settings.preprocessEnabled": "Enable preprocessing",
+    "settings.preprocessGrayscale": "Grayscale",
+    "settings.preprocessDenoise": "Denoise (median filter)",
+    "settings.preprocessContrast": "Contrast stretch",
+    "settings.preprocessBinarize": "Binarize (Otsu threshold)",
 
     // --- cleanup ---
     "cleanup.title": "Temporary file cleanup",
@@ -352,6 +359,13 @@ const I18N_DICT = {
     "settings.saved": "已保存。",
     "settings.loadFailed": "加载设置失败：{msg}",
     "settings.saveFailed": "保存失败：{msg}",
+    "settings.preprocessTitle": "OCR 输入图像预处理",
+    "settings.preprocessHint": "在 <em>OCR 之前</em>对页面图像进行增强，改善扫描件的倾斜、噪点与发灰问题。不会改变图像尺寸，块坐标始终有效。仅对新渲染的页面生效。",
+    "settings.preprocessEnabled": "启用预处理",
+    "settings.preprocessGrayscale": "灰度化",
+    "settings.preprocessDenoise": "去噪（中值滤波）",
+    "settings.preprocessContrast": "对比度增强",
+    "settings.preprocessBinarize": "二值化（Otsu 阈值）",
 
     // --- cleanup ---
     "cleanup.title": "临时文件清理",

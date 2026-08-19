@@ -913,6 +913,18 @@ function downloadDataset() {
 }
 
 /* ---------- settings ---------- */
+const PREPROCESS_IDS = {
+  "preprocess_enabled": "set-preprocess-enabled",
+  "preprocess_grayscale": "set-preprocess-grayscale",
+  "preprocess_denoise": "set-preprocess-denoise",
+  "preprocess_contrast": "set-preprocess-contrast",
+  "preprocess_binarize": "set-preprocess-binarize",
+};
+const PREPROCESS_DEFAULTS = {
+  preprocess_enabled: false, preprocess_grayscale: true,
+  preprocess_denoise: true, preprocess_contrast: true, preprocess_binarize: false,
+};
+
 async function openSettings() {
   $("#settings-modal").classList.remove("hidden");
   $("#settings-status").textContent = "";
@@ -922,6 +934,10 @@ async function openSettings() {
     $("#set-baseurl").value = s.base_url || "";
     $("#set-model").value = s.model || "";
     $("#set-apikey").value = s.has_api_key ? s.api_key_masked : "";
+    Object.keys(PREPROCESS_IDS).forEach((key) => {
+      const elm = $(PREPROCESS_IDS[key]);
+      if (elm) elm.checked = s[key] !== undefined ? !!s[key] : !!PREPROCESS_DEFAULTS[key];
+    });
   } catch (e) {
     $("#settings-status").textContent = t("settings.loadFailed", { msg: e.message });
   }
@@ -934,6 +950,10 @@ async function saveSettings() {
     model: $("#set-model").value.trim(),
     api_key: $("#set-apikey").value.trim(),
   };
+  Object.keys(PREPROCESS_IDS).forEach((key) => {
+    const elm = $(PREPROCESS_IDS[key]);
+    if (elm) payload[key] = elm.checked;
+  });
   try {
     await api("/api/settings", {
       method: "POST",
