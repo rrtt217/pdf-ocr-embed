@@ -61,6 +61,10 @@ nothing is hardcoded in the code.
 - **Job persistence** — every job's state (finished pages, embed result) is written
   to `work/<job_id>/job.json` in real time and restored on server start; crashed runs
   revive as stopped with their completed pages ready to retry or partially download.
+- **Batch upload + ZIP download** — drop/select several PDFs at once: each file
+  becomes its own independent job (parallel cards + SSE progress); once embedded,
+  tick any finished jobs and one click packages their embedded PDFs into a single
+  ZIP (streamed member by member from disk, never fully loaded into RAM).
 - **i18n** — English & 中文 built in; switch anytime from the header
   (`frontend/i18n.js`), defaults to the browser language, applies instantly with no
   page refresh.
@@ -187,6 +191,24 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### Batch upload & ZIP download
+
+The upload zone accepts **multiple PDFs** in one drag or file-picker (single-file
+uploads still work exactly as before). Every file becomes an **independent job** —
+its own card, SSE progress stream and persisted state, running in parallel; there
+is no separate queue manager. All uploads fire concurrently, then the job list is
+refreshed from the server (`/api/jobs` — the single source of truth) and each
+running job subscribes to its own EventSource.
+
+Once a job has been embedded (**Embed invisible text**), its card gains a
+**checkbox**: tick any number of finished jobs and click **⬇ Download ZIP** at the
+top-right of the job list to download their embedded PDFs as a single ZIP archive
+(members are named after the source PDFs, with colliding names auto-suffixed).
+The server packages it by streaming each file straight from disk
+(`GET /api/ocr/zip?jobs=id1,id2,...`), so the archive is never buffered in RAM;
+it returns 404 when none of the requested jobs have embedded results yet — jobs
+that do have results are always included.
+
 ### Headless CLI
 
 Run the whole "OCR → embed" pipeline from the command line without the web
@@ -212,6 +234,7 @@ Config (API keys etc.) still resolves via `resolve()` (TOML / env var), never ha
 | GET | `/api/health` | Health check + available adapters |
 | GET/POST | `/api/settings` | Read / save provider config (masked) |
 | POST | `/api/ocr/upload` | Upload PDF → background per-page OCR (`concurrency`, `adapter` engine, `lang/psm/oem` for tesseract, `base_url/api_key/model` for API engines) → returns a job id |
+| GET | `/api/ocr/zip?jobs=id1,id2` | Package the embedded PDFs of the selected jobs into one ZIP (`jobs` = comma-separated job ids; 404 when none of them have embedded results yet) |
 | POST | `/api/ocr/retry/{job_id}` | Re-run OCR for failed/interrupted jobs (default: only missing pages, not from scratch; params same as upload, plus optional `page_start`/`page_end` range and `force` to re-run already-successful pages) |
 | POST | `/api/ocr/stop/{job_id}` | Stop a running OCR job (completed pages are kept: download or retry the rest) |
 | GET | `/api/logs` | Recent backend debug logs |
@@ -327,5 +350,12 @@ pdf-ocr-embed/
   then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.
   The same dialog's **OCR result cache** section shows cache stats (entries/size/
   hits/misses/TTL) with a one-click **Clear OCR cache** button (`POST /api/cache/clear`).
+- **Batch upload / ZIP packaging (#10)**: multi-file uploads each become their own
+  job (reusing the parallel worker pool — no queue manager); ZIP members are named
+  after the source PDFs (colliding names get a ` (2)` suffix). Only **embedded**
+  jobs whose output file still exists (`job["embedded_path"]`) are packaged; the
+  rest are skipped, and a 404 is returned when none qualify. The temp archive lives
+  in the system temp dir, is served back as a streaming `FileResponse` and deleted
+  by a background task once the response has been sent — no orphan files are left.
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `backend/ocr_config.toml`) must
   not be committed to the repository.
