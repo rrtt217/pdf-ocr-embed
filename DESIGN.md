@@ -115,6 +115,12 @@
   仅 `build_report()` 触碰 PyMuPDF 且全程只读、出错返回 `ok:false` 而非抛错。
   `POST /api/embed` 响应携带 `report`，另有 `GET /api/validation/{job_id}`
   按需重跑（对存储页校验——浏览器内未重新嵌入的编辑不反映在内，属预期限制）。
+- 块操作（#6）：纯前端。`frontend/app.js` 在 `state.sel` 上维护每会话的
+  `selection`（当前页选中块索引集合）、`undoStack`（结构编辑前的 blocks 快照）、
+  `drawMode` / `pendingDraw`（叠加层绘制新块）；`#overlay-canvas` 捕获
+  pointer 事件做移动/缩放/绘制，全部 bbox 变更经 `clampBbox` 夹取为页面内
+  **整数像素**坐标并保持 `x1<=x2`、`y1<=y2`。结构性编辑仍走「嵌入时发送整页」
+  的既有路径，无后端改动、无持久化（撤销仅会话内）。
 
 ## 前端
 - 单页 WebApp（原生 JS / Vue 简洁优先）。

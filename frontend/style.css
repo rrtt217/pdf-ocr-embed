@@ -231,6 +231,10 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   background: var(--panel);
 }
 .block .meta { flex: 1 0 auto; min-width: 110px; order: 0; }
+/* Click-to-select a block for merge / overlay ops (#6) */
+.block .meta.selectable { cursor: pointer; border-radius: 4px; }
+.block .meta.selectable:hover { background: rgba(47, 111, 237, 0.10); }
+.block.selected .meta.selectable { background: rgba(47, 111, 237, 0.12); }
 .block .badge {
   display: inline-block;
   font-size: 11px;
@@ -269,6 +273,24 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   padding: 4px 10px;
 }
 .block .del:hover { background: var(--danger-border); }
+/* Per-block action row (Split / delete) — #6 */
+.block .ops-row {
+  order: 1;
+  flex-shrink: 0;
+  align-self: flex-start;
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.block .ops-row button { cursor: pointer; }
+/* Selected block highlight (#6) — also shown on the overlay canvas */
+.block.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
+}
+.block:focus { outline: none; }
+.block:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .block .fs-row {
   flex: 1 1 100%;
   order: 3;
@@ -300,6 +322,20 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   color: var(--muted);
   line-height: 1.6;
 }
+/* Block-operations toolbar (Merge / Add block / Undo) — #6 */
+.block-ops {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-bottom: 2px;
+}
+.block-ops button.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-color: var(--accent);
+}
+.block-ops .ops-hint { margin: 0; }
 .embed-bar .spacer { flex: 1; }
 
 #preview-wrap { position: relative; }
@@ -310,8 +346,13 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   inset: 0;
   width: 100%;
   height: 100%;
-  pointer-events: none;
+  /* Interactive overlay (#6): drag blocks, resize via corner handles,
+     draw new blocks. JS toggles the .grabbing cursor while moving. */
+  pointer-events: auto;
+  cursor: crosshair;
+  touch-action: none;
 }
+#overlay-canvas.grabbing { cursor: grabbing; }
 
 .embed-bar {
   display: flex;
