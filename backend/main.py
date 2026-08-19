@@ -2,7 +2,8 @@
 
 Endpoints:
   POST /api/settings            save or read provider config (masked)
-  POST /api/ocr/upload          upload PDF -> background OCR -> job id
+  POST /api/ocr/upload          upload one or more PDFs -> background OCR -> job id(s)
+  GET  /api/ocr/zip?jobs=...    download selected jobs' embedded PDFs as a ZIP
   GET  /api/ocr/stream/{job_id} SSE stream of progress/status events
   GET  /api/pages/{job_id}/{i}/image   page preview image
   GET  /api/pages/{job_id}      get all page OCR data
@@ -15,9 +16,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,7 +28,9 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
+from backend import batch
 from backend import cleanup as cleanup_mod
 from backend import config, ocr_cache, ocr_service
 from backend.logging_config import recent_logs, setup_logging
@@ -174,7 +179,8 @@ def save_settings(payload: SettingsModel) -> dict:
 
 @app.post("/api/ocr/upload")
 async def upload_pdf(
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),
     adapter: Optional[str] = Form("unlimited"),
     concurrency: Optional[int] = Form(1),
     base_url: Optional[str] = Form(None),
@@ -187,14 +193,28 @@ async def upload_pdf(
     # generic_openai adapter knob
     prompt: Optional[str] = Form(None),
 ) -> dict:
-    contents = await file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Empty file")
+    """Upload one or more PDFs; each file becomes its own OCR job (#10).
 
-    job = ocr_service.create_job(file.filename or "upload.pdf", contents)
+    Both a single ``file`` field (legacy clients) and a repeated ``files``
+    field (batch upload) are accepted; the two are merged and deduplicated.
+    Every file is read into memory, gets its own job (id, card, SSE stream,
+    persistence) and is OCR'd concurrently with the same per-request knobs —
+    there is no separate queue manager.
 
-    # Per-request overrides for this job only (not persisted).
-    ocr_service._set(job, adapter=adapter or "unlimited")
+    Response: ``{"jobs": [{job_id, filename, status}, ...], concurrency}``.
+    When exactly one file was uploaded a backward-compatible top-level
+    ``job_id`` / ``filename`` / ``status`` is also included.
+    """
+    uploads: List[UploadFile] = []
+    seen: set = set()
+    for uf in list(files or ()) + ([file] if file is not None else []):
+        if id(uf) in seen:  # same file supplied via both fields — keep once
+            continue
+        seen.add(id(uf))
+        uploads.append(uf)
+    if not uploads:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+
     concurrency = max(1, int(concurrency or 1))
     extra = {}
     for k, v in (("base_url", base_url), ("api_key", api_key),
@@ -204,11 +224,75 @@ async def upload_pdf(
             extra[k] = v
 
     loop = asyncio.get_running_loop()
-    loop.run_in_executor(
-        None, ocr_service.run_ocr, job["id"], adapter, extra or None, concurrency)
-    log.info("upload job %s: %s, concurrency=%d", job["id"], job["filename"], concurrency)
-    return {"job_id": job["id"], "filename": job["filename"], "status": "running",
-            "concurrency": concurrency}
+    jobs = []
+    for uf in uploads:
+        contents = await uf.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Empty file")
+        job = ocr_service.create_job(uf.filename or "upload.pdf", contents)
+        # Per-request overrides for this job only (not persisted).
+        ocr_service._set(job, adapter=adapter or "unlimited")
+        loop.run_in_executor(
+            None, ocr_service.run_ocr, job["id"], adapter,
+            extra or None, concurrency)
+        log.info("upload job %s: %s, concurrency=%d",
+                 job["id"], job["filename"], concurrency)
+        jobs.append({
+            "job_id": job["id"],
+            "filename": job["filename"],
+            "status": "running",
+        })
+
+    result: dict = {"jobs": jobs, "concurrency": concurrency}
+    if len(jobs) == 1:
+        # Backward-compatible single-file shape for older frontend clients.
+        result.update({
+            "job_id": jobs[0]["job_id"],
+            "filename": jobs[0]["filename"],
+            "status": "running",
+        })
+    else:
+        result["count"] = len(jobs)
+    return result
+
+
+@app.get("/api/ocr/zip")
+def zip_download(jobs: str):
+    """Download the embedded PDFs of selected jobs as one ZIP archive (#10).
+
+    ``jobs`` is a comma-separated list of job ids.  Only jobs that already
+    have an embedded output on disk are included; a 404 is returned when none
+    of the requested jobs have results.  The archive is built on disk member
+    by member (each embedded PDF streamed straight from disk, so the archive
+    is never held in RAM) and served back as a streaming ``FileResponse``; the
+    temporary archive is deleted in the background once the response is sent.
+    """
+    job_ids = [j.strip() for j in jobs.split(",") if j.strip()]
+    if not job_ids:
+        raise HTTPException(status_code=400, detail="No job ids provided")
+
+    entries = batch.collect_embedded(job_ids)
+    if not entries:
+        raise HTTPException(
+            status_code=404,
+            detail="None of the requested jobs have an embedded result yet")
+    if len(entries) < len(job_ids):
+        log.info("zip: %d job(s) requested, %d have embedded results",
+                 len(job_ids), len(entries))
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+    os.close(fd)
+    try:
+        batch.build_zip(tmp_path, entries)
+    except Exception:  # noqa: BLE001
+        os.unlink(tmp_path)
+        raise
+    return FileResponse(
+        tmp_path,
+        media_type="application/zip",
+        filename=batch.default_zip_name(),
+        background=BackgroundTask(os.unlink, tmp_path),
+    )
 
 
 @app.post("/api/ocr/retry/{job_id}")
