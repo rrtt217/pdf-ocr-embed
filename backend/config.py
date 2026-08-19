@@ -68,11 +68,21 @@ _FILE_KEYS = (
 )
 
 # Preprocessing flags (flat keys, mirrored in _FILE_KEYS / _ENV_ALIASES).
-# Defaults are all OFF; the WebUI settings modal toggles them per-page render.
+# The master switch defaults OFF; when a user enables preprocessing, the common
+# trio (grayscale + denoise + contrast) is on by default and binarize stays
+# opt-in.  Single source of truth — the render pipeline
+# (backend/pdf_processing._preprocess_opts_from_config) reads the same defaults.
 _PREPROCESS_KEYS = (
     "preprocess_enabled", "preprocess_grayscale", "preprocess_denoise",
     "preprocess_contrast", "preprocess_binarize",
 )
+PREPROCESS_DEFAULTS: Dict[str, bool] = {
+    "preprocess_enabled": False,
+    "preprocess_grayscale": True,
+    "preprocess_denoise": True,
+    "preprocess_contrast": True,
+    "preprocess_binarize": False,
+}
 
 # Map environment variables -> resolved config field names.  These restore the
 # legacy OCR_* names as highest-priority overrides for the running process.
@@ -189,7 +199,7 @@ def resolve() -> Dict[str, str]:
 def get_effective_settings() -> Dict[str, Any]:
     """Return a safe, masked view of the current effective settings for the WebUI."""
     cfg = resolve()
-    preprocess = {k: as_bool(cfg.get(k, False)) for k in _PREPROCESS_KEYS}
+    preprocess = {k: as_bool(cfg.get(k, PREPROCESS_DEFAULTS[k])) for k in _PREPROCESS_KEYS}
     return {
         "provider": cfg.get("provider", "ustc"),
         "base_url": cfg.get("base_url", ""),
@@ -214,11 +224,18 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
         api_key = prev.get("api_key", _saved.get("api_key", ""))
 
     # Start from the existing file so a WebUI save does not drop unrelated keys.
+    # Only fields actually present in the payload are written, so a save that
+    # carries just the preprocessing toggles never clears the provider fields
+    # (or a previously configured api_key / custom base_url).
     data: Dict[str, str] = dict(prev)
-    data["api_key"] = api_key
-    data["base_url"] = str(settings.get("base_url", "")).strip().rstrip("/")
-    data["model"] = str(settings.get("model", "")).strip()
-    data["provider"] = str(settings.get("provider", "ustc")).strip()
+    if "api_key" in settings:
+        data["api_key"] = api_key
+    if "base_url" in settings:
+        data["base_url"] = str(settings.get("base_url", "")).strip().rstrip("/")
+    if "model" in settings:
+        data["model"] = str(settings.get("model", "")).strip()
+    if "provider" in settings:
+        data["provider"] = str(settings.get("provider", "ustc")).strip()
 
     # Persist the preprocessing toggles from the WebUI payload.  Only keys the
     # client actually sent are written; anything absent keeps its previous

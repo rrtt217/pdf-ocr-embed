@@ -68,6 +68,12 @@ class SettingsModel(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None
     adapter: Optional[str] = None
+    # --- OCR-input image preprocessing toggles (feature #2) ---
+    preprocess_enabled: Optional[bool] = None
+    preprocess_grayscale: Optional[bool] = None
+    preprocess_denoise: Optional[bool] = None
+    preprocess_contrast: Optional[bool] = None
+    preprocess_binarize: Optional[bool] = None
 
 
 class EmbedModel(BaseModel):
@@ -159,6 +165,15 @@ def get_settings() -> dict:
 
 @app.post("/api/settings")
 def save_settings(payload: SettingsModel) -> dict:
+    # Include any preprocessing toggles the WebUI sent (kept when saving the
+    # provider fields and when only the toggles changed without an API key).
+    preprocess = {}
+    for key in ("preprocess_enabled", "preprocess_grayscale",
+                "preprocess_denoise", "preprocess_contrast",
+                "preprocess_binarize"):
+        value = getattr(payload, key, None)
+        if value is not None:
+            preprocess[key] = value
     if payload.api_key is not None:
         # Persist via config.save (handles masked-key preservation).
         data = {
@@ -166,8 +181,13 @@ def save_settings(payload: SettingsModel) -> dict:
             "base_url": payload.base_url or "",
             "model": payload.model or "",
             "api_key": payload.api_key,
+            **preprocess,
         }
         return config.save(data)
+    if preprocess:
+        # Only the preprocessing toggles changed — persist just those keys;
+        # config.save preserves every other field (provider, api_key, ...).
+        return config.save(dict(preprocess))
     # Read-only display mode.
     return config.get_effective_settings()
 

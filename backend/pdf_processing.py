@@ -129,16 +129,30 @@ def preprocess_image(img: "PIL.Image.Image", opts: dict | None = None) -> "PIL.I
     return out
 
 
+# Short flag names used by ``preprocess_image()``'s opts dict, mapped to the
+# flat config keys (backend.config.PREPROCESS_*).  Flag defaults come from
+# ``config.PREPROCESS_DEFAULTS`` — the single source of truth.
+_FLAG_KEYS = {
+    "preprocess_enabled": "enabled",
+    "preprocess_grayscale": "grayscale",
+    "preprocess_denoise": "denoise",
+    "preprocess_contrast": "contrast",
+    "preprocess_binarize": "binarize",
+}
+
+
 def _preprocess_opts_from_config() -> dict:
-    """Read the preprocess_* toggle flags from the effective config."""
-    from backend.config import resolve
+    """Read the preprocess_* toggle flags from the effective config.
+
+    Config is resolved through ``backend.config.resolve()`` (never
+    ``os.environ`` directly); the master switch defaults OFF, the common trio
+    (grayscale/denoise/contrast) defaults ON when preprocessing is enabled.
+    """
+    from backend.config import PREPROCESS_DEFAULTS, resolve
     cfg = resolve()
     return {
-        "enabled": _cfg_bool(cfg.get("preprocess_enabled"), False),
-        "grayscale": _cfg_bool(cfg.get("preprocess_grayscale"), True),
-        "denoise": _cfg_bool(cfg.get("preprocess_denoise"), True),
-        "contrast": _cfg_bool(cfg.get("preprocess_contrast"), True),
-        "binarize": _cfg_bool(cfg.get("preprocess_binarize"), False),
+        short: _cfg_bool(cfg.get(flat), PREPROCESS_DEFAULTS[flat])
+        for flat, short in _FLAG_KEYS.items()
     }
 
 
@@ -208,9 +222,22 @@ def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tup
 
 
 def _pixmap_to_image(pix: "fitz.Pixmap") -> "PIL.Image.Image":
-    """Wrap a PyMuPDF pixmap as a PIL image (RGB, stride-aware)."""
-    return Image.frombuffer(
-        "RGB", (pix.width, pix.height), pix.samples, "raw", "RGB", pix.stride, 1)
+    """Wrap a PyMuPDF pixmap as a PIL image (stride-aware, zero-copy).
+
+    Page renders are RGB with alpha=False; single-channel gray is handled too.
+    Any other layout (RGBA/CMYK/...) goes through a PNG round-trip so we never
+    mis-read the sample bytes.
+    """
+    n = pix.n
+    if n == 1:
+        return Image.frombuffer("L", (pix.width, pix.height), pix.samples,
+                                "raw", "L", pix.stride, 1)
+    if n == 3:
+        return Image.frombuffer("RGB", (pix.width, pix.height), pix.samples,
+                                "raw", "RGB", pix.stride, 1)
+    import io
+    buf = io.BytesIO(pix.tobytes("png"))
+    return Image.open(buf).convert("RGB")
 
 
 def preprocess_options() -> dict:

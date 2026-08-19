@@ -56,5 +56,17 @@ cleanup_interval_hours = 6                   # background cleanup re-run interva
 ocr_cache_enabled = true                 # reuse results of identical page+engine work
 ocr_cache_max_age_hours = 720            # cache entry TTL (default 30 days)
 
+# --- OCR-input image preprocessing (feature #2) -------------------------------
+# Applied to the rendered page image BEFORE OCR (PIL only).  Never changes the
+# image dimensions, so block bboxes keep their pixel-space meaning.  The WebUI
+# Settings modal mirrors these same flags.
+# preprocess_enabled = false             # master switch (default off)
+# preprocess_grayscale = true            # convert to grayscale first
+# preprocess_denoise = true              # light median filter (scanner noise)
+# preprocess_contrast = true             # histogram stretch (autocontrast)
+# preprocess_binarize = false            # Otsu threshold -> black/white
+# Environment overrides: OCR_PREPROCESS_ENABLED, OCR_PREPROCESS_GRAYSCALE,
+# OCR_PREPROCESS_DENOISE, OCR_PREPROCESS_CONTRAST, OCR_PREPROCESS_BINARIZE.
+
 # --- Logging (see backend/logging_config.py) -------------------------------
 log_level = "INFO"                           # "DEBUG" | "INFO" | "WARNING" | "ERROR"
