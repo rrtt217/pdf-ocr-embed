@@ -9,6 +9,7 @@ Endpoints:
   GET  /api/pages/{job_id}      get all page OCR data
   POST /api/pages/{job_id}/{i}  update an editable page (optional)
   POST /api/embed/{job_id}      embed (possibly edited) pages -> *_embedded.pdf
+  GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
 """
 from __future__ import annotations
@@ -32,7 +33,7 @@ from starlette.background import BackgroundTask
 
 from backend import batch
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_cache, ocr_service
+from backend import config, ocr_cache, ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
 from backend.sources.factory import available_adapters
 
@@ -596,13 +597,31 @@ def embed(job_id: str, payload: EmbedModel):
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
+    # Post-embed validation (#17): compare the freshly baked output against the
+    # exact pages that were embedded (payload pages if provided, else stored).
+    # Never fails the embed — a broken report is surfaced as ok:false instead.
+    report = _build_embed_report(out_path, pages)
     return {
         "status": "embedded",
         "filename": out_path.name,
         "url": f"/api/download/{job_id}.pdf",
         "font": embed_font.name,
         "images": img_stats,
+        "report": report,
     }
+
+
+def _build_embed_report(out_path: Path, pages: list) -> dict:
+    """Best-effort report for the POST /api/embed response (never raises)."""
+    from backend.models import dict_to_page
+    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
+    if not ocr_pages:
+        return {"ok": False, "error": "no embeddable pages to validate"}
+    try:
+        return validation.build_report(str(out_path), ocr_pages)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("validation after embed failed")
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/api/fonts")
@@ -624,6 +643,39 @@ def download(job_id: str):
         media_type="application/pdf",
         filename=Path(path).name,
     )
+
+
+@app.get("/api/validation/{job_id}")
+def validation_report(job_id: str):
+    """Re-validate an embedded output on demand: extract its text with
+    PyMuPDF and compare it against the stored OCR pages.
+
+    Returns the same report shape as the one baked into the embed response
+    (``{"ok", "generated_at", "threshold", "summary", "pages"}``).  404 when
+    the job or its embedded output is missing, 409 when the file cannot be
+    opened/extracted (extraction failure -> a report with ``ok: false``).
+
+    Accepted limitation: validation compares against the pages STORED in the
+    job, so edits the user made in-browser but never re-embedded are not
+    reflected here — the embedded output is validated against the source that
+    was most recently baked in, which is the honest baseline for "can I trust
+    this PDF".
+    """
+    from backend.models import dict_to_page
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    embedded = job.get("embedded_path")
+    if not embedded or not Path(embedded).exists():
+        raise HTTPException(status_code=404, detail="No embedded output yet")
+    pages = [dict_to_page(p) for p in ocr_service.get_pages(job_id)
+             if isinstance(p, dict)]
+    if not pages:
+        raise HTTPException(status_code=404, detail="No OCR pages to validate against")
+    report = validation.build_report(embedded, pages)
+    if not report.get("ok"):
+        raise HTTPException(status_code=409, detail=report.get("error", "validation failed"))
+    return report
 
 
 # Serve static frontend assets (css/js) if present — with no-cache so JS

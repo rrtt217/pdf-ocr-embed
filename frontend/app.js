@@ -637,6 +637,9 @@ async function selectJob(jobId) {
   if (label) label.textContent = job ? t("workspace.editing", { name: job.filename }) : "";
   $("#download-link").classList.add("hidden");
   $("#embed-status").textContent = "";
+  // The report belongs to the previous job's embed — hide it on selection.
+  hideReport();
+  $("#report-status").textContent = "";
   renderJobs();
   $("#workspace").classList.remove("hidden");
   await refreshSelectedPages();
@@ -651,6 +654,7 @@ function setSelectedJob(sel) {
     $("#blocks").innerHTML = "";
     $("#download-link").classList.add("hidden");
     $("#embed-status").textContent = "";
+    hideReport();
   }
   renderJobs();
 }
@@ -666,6 +670,8 @@ async function refreshSelectedPages() {
     const job = jobById(sel.jobId);
     if (job) Object.assign(job, { current: pages.length, total: data.total || job.total });
     $("#btn-embed").disabled = !pages.length;
+    const vBtn = $("#btn-validate");
+    if (vBtn) vBtn.disabled = !data.has_embedded;
     if (!pages.length) {
       $("#blocks").innerHTML = "";
       $("#blocks").appendChild(
@@ -894,12 +900,138 @@ async function embed() {
     $("#embed-status").textContent = t("embed.done") + extra;
     const job = jobById(sel.jobId);
     if (job) { job.has_embedded = true; renderJobs(); }
+    const vBtn = $("#btn-validate");
+    if (vBtn) vBtn.disabled = false;
+    // The embed response carries the post-embed validation report (#17):
+    // store it and show it right away when it was computed successfully.
+    sel.lastReport = out.report || null;
+    if (out.report && out.report.ok) {
+      showReport(out.report);
+    } else if (out.report && out.report.error) {
+      hideReport();
+      $("#report-status").textContent = t("report.error", { msg: out.report.error });
+    }
     toast(t("toast.embedDone"), "success");
   } catch (e) {
     $("#embed-status").textContent = t("embed.failed", { msg: e.message });
     toast(t("embed.failed", { msg: e.message }), "error");
   } finally {
     $("#btn-embed").disabled = false;
+  }
+}
+
+/* ---------- post-embed validation report (#17) ---------- */
+function hideReport() {
+  const panel = $("#report-panel");
+  if (panel) panel.classList.add("hidden");
+  const st = $("#report-status");
+  if (st) st.textContent = "";
+}
+
+function _pct(v, fallback = null) {
+  if (v === null || v === undefined || Number.isNaN(Number(v))) return fallback === null ? t("report.na") : fallback;
+  return Math.round(Number(v) * 100) + "%";
+}
+
+function showReport(report) {
+  const panel = $("#report-panel");
+  const status = $("#report-status");
+  if (!panel) return;
+  if (!report || report.ok === false) {
+    hideReport();
+    if (status) status.textContent = t("report.error", { msg: (report && report.error) || "?" });
+    return;
+  }
+  const summary = report.summary || {};
+  const sumBox = $("#report-summary");
+  if (sumBox) {
+    sumBox.innerHTML = "";
+    const avg = summary.avg_coverage !== undefined ? summary.avg_coverage : (summary.avg || 0);
+    const thr = summary.threshold !== undefined ? summary.threshold : 0.6;
+    const low = (summary.low_coverage_pages || []).length;
+    const covLine = t("report.avgCoverage", { pct: _pct(avg) })
+      + " · " + (low > 0
+        ? t("report.lowPages", { n: low, pct: _pct(thr) })
+        : t("report.allPass"));
+    sumBox.appendChild(el("div", "report-line", covLine));
+    const cb = summary.conf_buckets || {};
+    sumBox.appendChild(el("div", "report-line",
+      t("report.confBucket", { low: cb.low || 0, med: cb.medium || 0, high: cb.high || 0 })));
+    sumBox.appendChild(el("div", "report-line", t("report.blocks", { n: summary.total_blocks || 0 })));
+  }
+  const wrap = $("#report-table-wrap");
+  if (wrap) {
+    wrap.innerHTML = "";
+    const rows = report.pages || [];
+    if (!rows.length) {
+      wrap.appendChild(el("div", "hint", t("report.noPages")));
+    } else {
+      const table = document.createElement("table");
+      table.className = "report-table";
+      const thead = document.createElement("thead");
+      const htr = document.createElement("tr");
+      [t("report.page"), t("report.coverage"), t("report.colChars"),
+       t("report.colWords"), t("report.conf"), t("report.flags")]
+        .forEach((h) => {
+          const th = document.createElement("th");
+          th.textContent = h;
+          htr.appendChild(th);
+        });
+      thead.appendChild(htr);
+      table.appendChild(thead);
+      const tbody = document.createElement("tbody");
+      rows.forEach((r) => {
+        const tr = document.createElement("tr");
+        if (r.flags && r.flags.low_coverage) tr.classList.add("row-low");
+        const td = (txt) => {
+          const c = document.createElement("td");
+          c.textContent = txt;
+          return c;
+        };
+        tr.appendChild(td(String((r.page_index ?? 0) + 1)));
+        tr.appendChild(td(r.flags && r.flags.empty_source ? t("report.na") : _pct(r.coverage)));
+        tr.appendChild(td(r.embedded_chars + " / " + r.source_chars));
+        tr.appendChild(td(r.embedded_words + " / " + r.source_words));
+        const c = r.conf || {};
+        const confTxt = c.count ? t("report.confLine", {
+          avg: _pct(c.avg), min: _pct(c.min), max: _pct(c.max),
+        }) : t("report.na");
+        tr.appendChild(td(confTxt));
+        const flags = [];
+        if (r.flags) {
+          if (r.flags.empty_source) flags.push(t("report.flagEmptySource"));
+          if (r.flags.empty_embedded) flags.push(t("report.flagEmptyEmbedded"));
+          if (r.flags.low_coverage) flags.push(t("report.flagLowCoverage"));
+        }
+        tr.appendChild(td(flags.join(", ") || t("report.ok")));
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      wrap.appendChild(table);
+    }
+  }
+  panel.classList.remove("hidden");
+  if (status) status.textContent = "";
+}
+
+async function validateJob() {
+  const sel = state.sel;
+  const status = $("#report-status");
+  if (!sel) return;
+  const job = jobById(sel.jobId);
+  if (status) status.textContent = t("report.busy");
+  try {
+    if (!job || !job.has_embedded) {
+      hideReport();
+      if (status) status.textContent = t("report.noEmbed");
+      return;
+    }
+    const data = await api(`/api/validation/${sel.jobId}`);
+    sel.lastReport = data;
+    showReport(data);
+  } catch (e) {
+    hideReport();
+    if (status) status.textContent = t("report.error", { msg: e.message });
   }
 }
 
@@ -1320,6 +1452,13 @@ async function init() {
   $("#btn-embed").onclick = embed;
   $("#btn-preview").onclick = previewOverlay;
   $("#btn-dataset").onclick = downloadDataset;
+  // --- post-embed validation report (#17) ---
+  const vBtn = $("#btn-validate");
+  if (vBtn) vBtn.onclick = validateJob;
+  const rBtn = $("#btn-revalidate");
+  if (rBtn) rBtn.onclick = validateJob;
+  const cBtn = $("#btn-report-close");
+  if (cBtn) cBtn.onclick = hideReport;
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
   $("#btn-cache-clear").onclick = clearOcrCache;

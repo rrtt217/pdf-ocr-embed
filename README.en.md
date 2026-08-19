@@ -222,6 +222,24 @@ The server packages it by streaming each file straight from disk
 (`GET /api/ocr/zip?jobs=id1,id2,...`), so the archive is never buffered in RAM;
 it returns 404 when none of the requested jobs have embedded results yet — jobs
 that do have results are always included.
+### Post-embed validation & quality report
+
+After embedding, the backend re-opens the embedded PDF with PyMuPDF, extracts
+its text layer and compares it page-by-page against the OCR source
+(`backend/validation.py`) — the "can I trust this PDF?" closed loop:
+
+- Per-page **coverage** (tolerant token overlap + character consecutiveness so
+  line-wrapping does not hurt), source/embedded character and word counts, and
+  confidence stats (min/avg/max, bucketed <60% / 60–80% / ≥80%).
+- Summary: average coverage, pages below the threshold (60% by default),
+  empty-source pages, total block count.
+- CJK / space-less scripts are tokenized per glyph, so coverage is meaningful
+  for Chinese and Japanese too.
+
+Usage: the embed response carries a `report`; you can also hit the workspace
+**Validate** button to re-run `GET /api/validation/{job_id}` anytime. Validation
+only reads artifacts — it never modifies the embedded file and never fails an
+embed (a broken report is surfaced as `ok:false` without blocking download).
 
 ### Headless CLI
 

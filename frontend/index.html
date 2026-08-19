@@ -161,12 +161,27 @@
         </details>
         <button id="btn-preview" class="small" data-i18n="workspace.previewOverlay" data-i18n-title="workspace.previewOverlayTitle">Preview overlay</button>
         <button id="btn-embed" class="primary" disabled data-i18n="workspace.embed" data-i18n-title="workspace.embedTitle">Embed invisible text</button>
+        <button id="btn-validate" class="small" disabled data-i18n="workspace.validate" data-i18n-title="workspace.validateTitle">Validate</button>
         <a id="download-link" class="hidden" download></a>
         <span id="embed-status"></span>
         <span class="spacer"></span>
         <button id="btn-dataset" class="small" data-i18n="workspace.downloadDataset" data-i18n-title="workspace.downloadDatasetTitle">Download dataset (JSON)</button>
       </div>
       <p class="embed-hint" id="embed-hint" data-i18n-html="workspace.hint"></p>
+    </section>
+
+    <!-- Post-embed validation report (#17): extracted-vs-source quality view -->
+    <section id="report-panel" class="card hidden">
+      <div class="row">
+        <h3 data-i18n="report.title">Embed validation report</h3>
+        <div class="report-actions">
+          <button id="btn-revalidate" class="small" data-i18n="report.refresh">Re-validate</button>
+          <button id="btn-report-close" class="small" data-i18n="report.close">Close</button>
+        </div>
+      </div>
+      <div id="report-summary" class="report-summary"></div>
+      <div id="report-table-wrap"></div>
+      <p id="report-status" class="hint"></p>
     </section>
   </main>
 

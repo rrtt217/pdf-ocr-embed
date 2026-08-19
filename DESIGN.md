@@ -109,6 +109,12 @@
   由 `preprocess_*` 配置开关控制。**尺寸不变**是硬约束——预处理前后宽高完全
   一致，因此块 bbox 像素坐标语义永不改变；预处理只发生在 OCR 输入的渲染
   路径（含按需预览补渲染），命中缓存的页面不渲染、不预处理。
+- 嵌后校验（#17）：`backend/validation.py` 用 PyMuPDF 抽取嵌入 PDF 的文字层，
+  与 OCR 源页逐页比对，输出页级覆盖率（token 重叠 × 字符连续度的几何平均）、
+  字数、置信度统计与汇总；比较数学全部为纯函数（可脱离 PDF 单测），
+  仅 `build_report()` 触碰 PyMuPDF 且全程只读、出错返回 `ok:false` 而非抛错。
+  `POST /api/embed` 响应携带 `report`，另有 `GET /api/validation/{job_id}`
+  按需重跑（对存储页校验——浏览器内未重新嵌入的编辑不反映在内，属预期限制）。
 
 ## 前端
 - 单页 WebApp（原生 JS / Vue 简洁优先）。
