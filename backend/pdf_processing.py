@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+from PIL import Image, ImageFilter, ImageOps  # OCR-input preprocessing (#2)
 
 from backend.models import OcrBlock, OcrPage
 
@@ -187,14 +188,38 @@ def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tup
     png_path = out_path / f"page_{page_index:04d}.png"
     tmp_path = out_path / f".page_{page_index:04d}.{uuid.uuid4().hex[:8]}.tmp"
     try:
-        # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
-        pix.save(str(tmp_path), output="png")
+        opts = preprocess_options()
+        if _opts_enabled(opts):
+            # Clean the raster before it becomes OCR input.  Applying the
+            # pipeline here means tesseract, both API adapters and the WebUI
+            # preview all see the exact same (preprocessed) pixels.
+            img = _pixmap_to_image(pix)
+            img = preprocess_image(img, opts)
+            img.save(str(tmp_path), format="PNG")
+        else:
+            # The .tmp suffix hides the format from PyMuPDF — say it explicitly.
+            pix.save(str(tmp_path), output="png")
         os.replace(tmp_path, png_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
     log.debug("rendered page %d -> %s (%dx%d)", page_index, png_path, w, h)
     return str(png_path), w, h
+
+
+def _pixmap_to_image(pix: "fitz.Pixmap") -> "PIL.Image.Image":
+    """Wrap a PyMuPDF pixmap as a PIL image (RGB, stride-aware)."""
+    return Image.frombuffer(
+        "RGB", (pix.width, pix.height), pix.samples, "raw", "RGB", pix.stride, 1)
+
+
+def preprocess_options() -> dict:
+    """Public alias for the config-driven preprocessing flags."""
+    return _preprocess_opts_from_config()
+
+
+def _opts_enabled(opts: dict) -> bool:
+    return bool(opts.get("enabled"))
 
 
 def pixel_to_pdf(point: Tuple[float, float], page: fitz.Page,
