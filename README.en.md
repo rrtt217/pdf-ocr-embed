@@ -187,6 +187,25 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### Post-embed validation & quality report
+
+After embedding, the backend re-opens the embedded PDF with PyMuPDF, extracts
+its text layer and compares it page-by-page against the OCR source
+(`backend/validation.py`) — the "can I trust this PDF?" closed loop:
+
+- Per-page **coverage** (tolerant token overlap + character consecutiveness so
+  line-wrapping does not hurt), source/embedded character and word counts, and
+  confidence stats (min/avg/max, bucketed <60% / 60–80% / ≥80%).
+- Summary: average coverage, pages below the threshold (60% by default),
+  empty-source pages, total block count.
+- CJK / space-less scripts are tokenized per glyph, so coverage is meaningful
+  for Chinese and Japanese too.
+
+Usage: the embed response carries a `report`; you can also hit the workspace
+**Validate** button to re-run `GET /api/validation/{job_id}` anytime. Validation
+only reads artifacts — it never modifies the embedded file and never fails an
+embed (a broken report is surfaced as `ok:false` without blocking download).
+
 ### Headless CLI
 
 Run the whole "OCR → embed" pipeline from the command line without the web

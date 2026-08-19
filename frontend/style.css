@@ -320,6 +320,33 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   margin-top: 16px;
   flex-wrap: wrap;
 }
+/* Post-embed validation report (#17) */
+#report-panel .report-actions { display: flex; gap: 8px; }
+.report-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.report-line { font-size: 13px; color: var(--text); }
+.report-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.report-table th, .report-table td {
+  border: 1px solid var(--border);
+  padding: 5px 8px;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
+}
+.report-table th { background: var(--panel); }
+.report-table tr.row-low td { background: var(--danger-soft, rgba(232, 93, 58, 0.08)); }
+.report-table td:first-child { width: 3.5em; }
 button.primary {
   background: var(--accent);
   color: var(--accent-fg);

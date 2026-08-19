@@ -160,6 +160,20 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### 嵌后自动校验 + 质量报告
+
+嵌入完成后，后端会用 PyMuPDF 重新抽取嵌入输出的文字层，与 OCR 源文本逐页比对
+（`backend/validation.py`），给出一份「这份 PDF 能不能信」的报告：
+
+- 页级 **覆盖率**（容忍换行/标点差异的 token 重叠 + 字符连续度）、源/嵌字符数
+  与词数、置信度统计（min / avg / max，按 <60% / 60–80% / ≥80% 分桶）。
+- 汇总行：平均覆盖率、低于阈值（默认 60%）的页列表、无源文本页、总块数。
+- 中文/日文等无空格文字按单字分词，覆盖率对 CJK 同样有意义。
+
+使用：嵌入后响应自带 `report`；也可点工作区的 **Validate** 按钮随时
+`GET /api/validation/{job_id}` 重跑校验。校验只读 artifact，不修改嵌入文件，
+也不会让嵌入失败（校验出错时以 `ok:false` 呈现，不影响下载）。
+
 ### 无头 CLI 模式（headless）
 
 不启动 Web 服务，直接用命令行完成「OCR → 嵌入」整条流水线（复用
