@@ -187,6 +187,28 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### Block editing & operations (#6)
+
+The block list on the left and the preview pane on the right let you fix
+recognition results directly:
+
+- **Merge**: click a block's meta row to select several blocks (or Shift/Ctrl-click
+  on the preview), then hit **Merge** — bbox becomes the union, text is joined
+  with newlines.
+- **Split**: put the text caret in the middle of a block and click its **Split**
+  button — the block splits in two along its longer axis, proportionally to text
+  length (bboxes split accordingly).
+- **Add**: click **Add block**, then drag a rectangle on the preview (Esc cancels)
+  to create an empty text block; type its text on the left, then move/resize it.
+- **Move / Resize**: drag a block on the preview to move it; a resize handle sits
+  on the bottom-right corner of the selected block; with a block editor focused,
+  **arrow keys** nudge the bbox (Shift = 10 px).
+- **Undo**: every structural edit (add/delete/merge/split/move/resize) takes a
+  snapshot; the toolbar **Undo** steps back through them (session-only).
+- All bbox adjustments stay **integer pixel coordinates** clamped to the page
+  (`x1<=x2`, `y1<=y2`), consistent with the coordinate invariant; edits keep
+  using the existing "send the whole page at embed time" path.
+
 ### Headless CLI
 
 Run the whole "OCR → embed" pipeline from the command line without the web

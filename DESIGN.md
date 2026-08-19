@@ -104,6 +104,12 @@
 - `POST /api/ocr/retry/{job_id}` 支持 `page_start` / `page_end` / `force`
   （页范围 + 强制重跑已成功页，A/B 试跑用）；页选择逻辑集中在
   `ocr_service.select_pages()`（纯函数，含单元测试）。
+- 块操作（#6）：纯前端。`frontend/app.js` 在 `state.sel` 上维护每会话的
+  `selection`（当前页选中块索引集合）、`undoStack`（结构编辑前的 blocks 快照）、
+  `drawMode` / `pendingDraw`（叠加层绘制新块）；`#overlay-canvas` 捕获
+  pointer 事件做移动/缩放/绘制，全部 bbox 变更经 `clampBbox` 夹取为页面内
+  **整数像素**坐标并保持 `x1<=x2`、`y1<=y2`。结构性编辑仍走「嵌入时发送整页」
+  的既有路径，无后端改动、无持久化（撤销仅会话内）。
 
 ## 前端
 - 单页 WebApp（原生 JS / Vue 简洁优先）。

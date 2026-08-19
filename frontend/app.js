@@ -576,7 +576,14 @@ async function clearJob(jobId) {
 
 /* ---------- selected-job editor ---------- */
 async function selectJob(jobId) {
-  state.sel = { jobId, pages: [], pageIndex: 0, embedded: false };
+  state.sel = {
+    jobId, pages: [], pageIndex: 0, embedded: false,
+    // (#6) per-session editor extras shared across pages/handlers:
+    selection: { pageIndex: -1, indices: new Set() },  // selected block indices for a page
+    undoStack: [],       // snapshots of page.blocks before structural edits
+    drawMode: false,     // "draw a new block on the overlay" mode
+    pendingDraw: null,   // live rectangle while drawing a new block
+  };
   const job = jobById(jobId);
   const label = $("#editing-job");
   if (label) label.textContent = job ? t("workspace.editing", { name: job.filename }) : "";
@@ -608,6 +615,9 @@ async function refreshSelectedPages() {
     const pages = (data.pages || []).filter(Boolean);
     sel.status = data.status;
     sel.pages = pages;
+    // Fresh server data replaces the page objects — block-edit undo snapshots
+    // would point at stale references, so drop them (undo is per-session only).
+    if (sel.undoStack) sel.undoStack.length = 0;
     const job = jobById(sel.jobId);
     if (job) Object.assign(job, { current: pages.length, total: data.total || job.total });
     $("#btn-embed").disabled = !pages.length;
@@ -667,17 +677,23 @@ function renderPage() {
   state.sourceW = page.width;
   state.sourceH = page.height;
 
-  // Editor blocks
+  // Prune stale block selections when page/blocks change (#6).
+  sanitizeSelection();
+
+  // Editor blocks (+ block-ops toolbar: Merge / Add block / Undo)
   const blocksBox = $("#blocks");
   blocksBox.innerHTML = "";
+  blocksBox.appendChild(renderBlockOps());
   if (!page.blocks || page.blocks.length === 0) {
     blocksBox.appendChild(el("div", "", t("editor.noBlocks")));
   }
+  let visibleBlocks = 0;
   (page.blocks || []).forEach((block, bi) => {
     if (state.confFilter && !isLowConf(block)) return;
+    visibleBlocks++;
     blocksBox.appendChild(buildBlockEditor(block, bi));
   });
-  if (state.confFilter && blocksBox.childElementCount === 0
+  if (state.confFilter && visibleBlocks === 0
       && page.blocks && page.blocks.length) {
     blocksBox.appendChild(el("div", "embed-hint",
       t("editor.confNoLowOnPage", { p: state.confThreshold })));
@@ -715,7 +731,7 @@ function drawOverlay(page) {
   const sx = rect.width / page.width;
   const sy = rect.height / page.height;
 
-  (page.blocks || []).forEach((block) => {
+  (page.blocks || []).forEach((block, bi) => {
     const [x1, y1, x2, y2] = block.bbox;
     let color = block.kind === "image" ? "#7a5cff" : "#2f6fed";
     if (block.kind !== "image") {
@@ -723,15 +739,48 @@ function drawOverlay(page) {
       if (cls === "conf-low") color = "#e85d3a";
       else if (cls === "conf-med") color = "#f0a020";
     }
+    const selected = isBlockSelected(bi);
+    // Selected blocks get a soft fill + accent stroke + a resize handle.
+    if (selected) {
+      ctx.fillStyle = "rgba(47, 111, 237, 0.12)";
+      ctx.fillRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
+      color = "#2f6fed";
+      ctx.lineWidth = 3;
+    } else {
+      ctx.lineWidth = 2;
+    }
     ctx.strokeStyle = color;
+    ctx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
+    if (selected) {
+      // Bottom-right resize handle.
+      const h = 9;
+      ctx.fillStyle = "#2f6fed";
+      ctx.fillRect(x2 * sx - h, y2 * sy - h, h * 2, h * 2);
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x2 * sx - h, y2 * sy - h, h * 2, h * 2);
+    }
+  });
+
+  // Live rectangle while drawing a new block (drag on the overlay).
+  const pending = state.sel && state.sel.pendingDraw;
+  if (pending) {
+    const [x1, y1, x2, y2] = pending;
+    ctx.save();
+    ctx.setLineDash([6, 4]);
+    ctx.strokeStyle = "#2f6fed";
     ctx.lineWidth = 2;
     ctx.strokeRect(x1 * sx, y1 * sy, (x2 - x1) * sx, (y2 - y1) * sy);
-  });
+    ctx.restore();
+  }
 }
 
 function buildBlockEditor(block, bi) {
   const wrapper = el("div", "block");
   wrapper.dataset.bi = bi;
+  // (#6) keyboard focus enables arrow-key bbox nudge (shift = 10px).
+  wrapper.tabIndex = 0;
+  if (isBlockSelected(bi)) wrapper.classList.add("selected");
   const pct = confPct(block);
   if (confClass(pct) === "conf-low") wrapper.classList.add("block-low");
   const meta = el("div", "meta");
@@ -739,6 +788,13 @@ function buildBlockEditor(block, bi) {
   meta.appendChild(el("span", "conf-badge " + confClass(pct),
     pct === null ? t("editor.confNa") : Math.round(pct) + "%"));
   meta.appendChild(el("div", "coords", block.bbox.join(", ") + " px"));
+  // (#6) Click the meta row to toggle block selection (for merge / overlay ops).
+  meta.classList.add("selectable");
+  meta.title = t("editor.mergeTitle");
+  meta.onclick = (e) => {
+    e.stopPropagation();
+    toggleBlockSelect(bi);
+  };
 
   const textarea = document.createElement("textarea");
   textarea.value = block.text || block.caption || "";
@@ -754,14 +810,57 @@ function buildBlockEditor(block, bi) {
     setStatus("dirty", "running");
   };
 
+  // (#6) per-block ops row: Split (at textarea caret) + delete.
+  const opsRow = el("div", "ops-row");
+  const split = el("button", "small", t("editor.split"));
+  split.title = t("editor.splitTitle");
+  split.onclick = (e) => {
+    e.stopPropagation();
+    splitBlock(bi);
+  };
+  opsRow.appendChild(split);
   const del = el("button", "del", "✕");
   del.title = t("editor.removeBlock");
   del.onclick = () => {
     const sel = state.sel;
     if (!sel) return;
+    pushUndo();
     sel.pages[sel.pageIndex].blocks.splice(bi, 1);
+    if (sel.selection) sel.selection.indices.delete(bi);
+    sel.embedded = false;
+    setStatus("dirty", "running");
     renderPage();
   };
+  opsRow.appendChild(del);
+
+  // (#6) arrow-key bbox nudge when this block editor is focused.
+  wrapper.addEventListener("keydown", (e) => {
+    const moves = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
+    const mv = moves[e.key];
+    if (!mv) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const page = currentPage();
+    const sel = state.sel;
+    if (!page || !sel) return;
+    const b = page.blocks[bi];
+    if (!b) return;
+    if (!wrapper.dataset.nudgeUndone) {
+      pushUndo();
+      wrapper.dataset.nudgeUndone = "1";
+    }
+    const step = e.shiftKey ? 10 : 1;
+    b.bbox = clampBbox([
+      b.bbox[0] + mv[0] * step, b.bbox[1] + mv[1] * step,
+      b.bbox[2] + mv[0] * step, b.bbox[3] + mv[1] * step,
+    ], page);
+    sel.embedded = false;
+    setStatus("dirty", "running");
+    updateBlockCoords(bi);
+    drawOverlay(page);
+  });
+  // Reset the nudge-undo latch when focus leaves this block editor.
+  wrapper.addEventListener("focusout", () => { wrapper.dataset.nudgeUndone = ""; });
 
   // ---- Interactive font-size control (debug: too big / too small) ----
   if (block.font_scale == null) block.font_scale = 1.0;
@@ -797,9 +896,363 @@ function buildBlockEditor(block, bi) {
 
   wrapper.appendChild(meta);
   wrapper.appendChild(textarea);
+  wrapper.appendChild(opsRow);
   wrapper.appendChild(fsRow);
-  wrapper.appendChild(del);
   return wrapper;
+}
+
+/* ---------- block operations (#6): select / merge / split / add / undo ---------- */
+function currentPage() {
+  const sel = state.sel;
+  if (!sel || !sel.pages || !sel.pages.length) return null;
+  return sel.pages[sel.pageIndex] || null;
+}
+
+function cloneBlocks(blocks) {
+  return (blocks || []).map((b) => ({ ...b, bbox: [...b.bbox] }));
+}
+
+function pushUndo() {
+  const sel = state.sel;
+  const page = currentPage();
+  if (!sel || !page) return;
+  sel.undoStack.push({ pageIndex: sel.pageIndex, blocks: cloneBlocks(page.blocks) });
+  if (sel.undoStack.length > 50) sel.undoStack.shift();
+}
+
+function undoLast() {
+  const sel = state.sel;
+  const snap = sel && sel.undoStack.pop();
+  if (!snap) return;
+  const page = currentPage();
+  if (!page || sel.pageIndex !== snap.pageIndex) {
+    // Snapshot belongs to a different page — push it back and keep going.
+    sel.undoStack.push(snap);
+    return;
+  }
+  page.blocks = cloneBlocks(snap.blocks);
+  sel.embedded = false;
+  setStatus("dirty", "running");
+  renderPage();
+  toast(t("editor.undoDone"), "success");
+}
+
+function sanitizeSelection() {
+  const sel = state.sel;
+  const page = currentPage();
+  if (!sel || !page) return;
+  if (sel.selection.pageIndex !== sel.pageIndex) {
+    sel.selection = { pageIndex: sel.pageIndex, indices: new Set() };
+    return;
+  }
+  const total = (page.blocks || []).length;
+  for (const i of [...sel.selection.indices]) {
+    if (i < 0 || i >= total) sel.selection.indices.delete(i);
+  }
+}
+
+function isBlockSelected(bi) {
+  const sel = state.sel;
+  return !!(sel && sel.selection &&
+    sel.selection.pageIndex === sel.pageIndex && sel.selection.indices.has(bi));
+}
+
+function toggleBlockSelect(bi) {
+  const sel = state.sel;
+  if (!sel) return;
+  if (sel.selection.pageIndex !== sel.pageIndex) {
+    sel.selection = { pageIndex: sel.pageIndex, indices: new Set() };
+  }
+  if (sel.selection.indices.has(bi)) sel.selection.indices.delete(bi);
+  else sel.selection.indices.add(bi);
+  renderPage();
+}
+
+function selectedIndices() {
+  const sel = state.sel;
+  if (!sel || !sel.selection || sel.selection.pageIndex !== sel.pageIndex) return [];
+  return [...sel.selection.indices];
+}
+
+function updateBlockCoords(bi) {
+  const blockEl = document.querySelector(`.block[data-bi="${bi}"] .coords`);
+  const page = currentPage();
+  const b = page && page.blocks[bi];
+  if (blockEl && b) blockEl.textContent = b.bbox.join(", ") + " px";
+}
+
+function renderBlockOps() {
+  const sel = state.sel;
+  const bar = el("div", "block-ops");
+  const selected = selectedIndices();
+
+  const merge = el("button", "small", t("editor.merge"));
+  merge.title = t("editor.mergeTitle");
+  merge.disabled = selected.length < 2;
+  merge.onclick = mergeSelected;
+  bar.appendChild(merge);
+
+  const add = el("button", "small" + (sel && sel.drawMode ? " active" : ""), t("editor.addBlock"));
+  add.title = t("editor.addBlockTitle");
+  add.onclick = toggleDrawMode;
+  bar.appendChild(add);
+
+  const undo = el("button", "small", t("editor.undo"));
+  undo.title = t("editor.undoTitle");
+  undo.disabled = !(sel && sel.undoStack && sel.undoStack.length);
+  undo.onclick = () => undoLast();
+  bar.appendChild(undo);
+
+  if (sel && sel.drawMode) {
+    bar.appendChild(el("span", "hint ops-hint", t("editor.addBlockHint")));
+  }
+  return bar;
+}
+
+function mergeSelected() {
+  const sel = state.sel;
+  const page = currentPage();
+  if (!sel || !page) return;
+  const indices = selectedIndices().sort((a, b) => a - b);
+  if (indices.length < 2) return;
+  const blocks = page.blocks || [];
+  const chosen = indices.map((i) => blocks[i]).filter(Boolean);
+  if (chosen.length < 2) return;
+  const bbox = [
+    Math.min(...chosen.map((b) => b.bbox[0])),
+    Math.min(...chosen.map((b) => b.bbox[1])),
+    Math.max(...chosen.map((b) => b.bbox[2])),
+    Math.max(...chosen.map((b) => b.bbox[3])),
+  ];
+  const merged = {
+    kind: chosen[0].kind,
+    bbox,
+    text: chosen.map((b) => (b.text || b.caption || "")).filter((s) => s).join("\n"),
+    caption: "",
+    conf: chosen[0].conf,
+    font_scale: chosen[0].font_scale != null ? chosen[0].font_scale : 1.0,
+  };
+  pushUndo();
+  const newBlocks = blocks.filter((_, i) => !indices.includes(i));
+  newBlocks.push(merged);
+  page.blocks = newBlocks;
+  sel.embedded = false;
+  setStatus("dirty", "running");
+  sel.selection = { pageIndex: sel.pageIndex, indices: new Set([newBlocks.length - 1]) };
+  toast(t("editor.mergeDone", { n: chosen.length }), "success");
+  renderPage();
+}
+
+function splitBlock(bi) {
+  const sel = state.sel;
+  const page = currentPage();
+  if (!sel || !page) return;
+  const blocks = page.blocks || [];
+  const block = blocks[bi];
+  if (!block) return;
+  const ta = document.querySelector(`.block[data-bi="${bi}"] textarea`);
+  const pos = ta ? ta.selectionStart : -1;
+  const text = block.text || "";
+  if (pos <= 0 || pos >= text.length) {
+    toast(t("editor.splitNoop"), "info");
+    return;
+  }
+  const [x1, y1, x2, y2] = block.bbox;
+  const frac = Math.min(Math.max(pos / Math.max(text.length, 1), 0), 1);
+  const mk = (t1, bx) => ({
+    kind: block.kind, bbox: bx, text: t1, caption: "",
+    conf: block.conf, font_scale: block.font_scale != null ? block.font_scale : 1.0,
+  });
+  let parts;
+  if ((x2 - x1) >= (y2 - y1)) {
+    const midX = Math.min(Math.max(Math.round(x1 + (x2 - x1) * frac), x1 + 1), x2 - 1);
+    parts = [mk(text.slice(0, pos), [x1, y1, midX, y2]), mk(text.slice(pos), [midX, y1, x2, y2])];
+  } else {
+    const midY = Math.min(Math.max(Math.round(y1 + (y2 - y1) * frac), y1 + 1), y2 - 1);
+    parts = [mk(text.slice(0, pos), [x1, y1, x2, midY]), mk(text.slice(pos), [x1, midY, x2, y2])];
+  }
+  pushUndo();
+  page.blocks = [...blocks.slice(0, bi), ...parts, ...blocks.slice(bi + 1)];
+  sel.embedded = false;
+  setStatus("dirty", "running");
+  sel.selection = { pageIndex: sel.pageIndex, indices: new Set([bi, bi + 1]) };
+  toast(t("editor.splitDone"), "success");
+  renderPage();
+}
+
+function toggleDrawMode() {
+  const sel = state.sel;
+  if (!sel) return;
+  sel.drawMode = !sel.drawMode;
+  if (!sel.drawMode) sel.pendingDraw = null;
+  renderPage();
+}
+
+/* ---- interactive overlay: move / resize / draw-new-block ---- */
+let dragState = null;
+
+function clampBbox(bbox, page) {
+  let [x1, y1, x2, y2] = bbox.map((v) => Math.round(v));
+  x1 = Math.max(0, Math.min(page.width, x1));
+  y1 = Math.max(0, Math.min(page.height, y1));
+  x2 = Math.max(0, Math.min(page.width, x2));
+  y2 = Math.max(0, Math.min(page.height, y2));
+  if (x2 <= x1) x2 = Math.min(page.width, x1 + 1);
+  if (y2 <= y1) y2 = Math.min(page.height, y1 + 1);
+  return [x1, y1, x2, y2];
+}
+
+function overlayPoint(e) {
+  const img = $("#preview-img");
+  const page = currentPage();
+  if (!img.complete || !img.naturalWidth || !page) return null;
+  const rect = img.getBoundingClientRect();
+  const px = Math.round(((e.clientX - rect.left) / rect.width) * page.width);
+  const py = Math.round(((e.clientY - rect.top) / rect.height) * page.height);
+  return { px, py, page, rect };
+}
+
+function blockAt(px, py) {
+  const page = currentPage();
+  if (!page) return -1;
+  const blocks = page.blocks || [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    const [x1, y1, x2, y2] = blocks[i].bbox;
+    if (px >= x1 && px <= x2 && py >= y1 && py <= y2) return i;
+  }
+  return -1;
+}
+
+function overlayPointerDown(e) {
+  const sel = state.sel;
+  if (!sel) return;
+  const p = overlayPoint(e);
+  if (!p) return;
+  e.preventDefault();
+  const { px, py, page, rect } = p;
+  const selected = selectedIndices();
+  dragState = { pageIndex: sel.pageIndex, snapshot: cloneBlocks(page.blocks) };
+
+  if (sel.drawMode) {
+    // Drawing a brand-new block: rectangle from this point.
+    dragState.mode = "draw";
+    dragState.x1 = px; dragState.y1 = py;
+    sel.pendingDraw = [px, py, px, py];
+    return;
+  }
+
+  // Resize when the pointer is near a selected block's bottom-right handle.
+  const HANDLE = 10; // device px around the handle
+  for (const i of selected) {
+    const b = page.blocks[i];
+    if (!b) continue;
+    const hx = (b.bbox[2] * rect.width) / page.width;
+    const hy = (b.bbox[3] * rect.height) / page.height;
+    if (Math.abs(e.clientX - rect.left - hx) <= HANDLE &&
+        Math.abs(e.clientY - rect.top - hy) <= HANDLE) {
+      dragState.mode = "resize";
+      dragState.index = i;
+      dragState.origin = [...b.bbox];
+      $("#overlay-canvas").classList.add("grabbing");
+      return;
+    }
+  }
+
+  const bi = blockAt(px, py);
+  if (bi >= 0) {
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey && !isBlockSelected(bi)) {
+      sel.selection = { pageIndex: sel.pageIndex, indices: new Set([bi]) };
+      renderPage();
+    } else if (e.shiftKey || e.ctrlKey || e.metaKey) {
+      const was = isBlockSelected(bi);
+      if (sel.selection.pageIndex !== sel.pageIndex) {
+        sel.selection = { pageIndex: sel.pageIndex, indices: new Set() };
+      }
+      if (was) sel.selection.indices.delete(bi);
+      else sel.selection.indices.add(bi);
+      renderPage();
+    }
+    dragState.mode = "move";
+    dragState.index = bi;
+    dragState.startPx = px;
+    dragState.startPy = py;
+    dragState.origin = [...page.blocks[bi].bbox];
+    $("#overlay-canvas").classList.add("grabbing");
+  } else if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    sel.selection = { pageIndex: sel.pageIndex, indices: new Set() };
+    renderPage();
+  }
+}
+
+function overlayPointerMove(e) {
+  const sel = state.sel;
+  if (!sel || !dragState) return;
+  const p = overlayPoint(e);
+  if (!p) return;
+  e.preventDefault();
+  const { px, py, page } = p;
+  if (dragState.mode === "draw") {
+    sel.pendingDraw = clampBbox(
+      [Math.min(dragState.x1, px), Math.min(dragState.y1, py),
+       Math.max(dragState.x1, px), Math.max(dragState.y1, py)], page);
+    drawOverlay(page);
+  } else if (dragState.mode === "move") {
+    const b = page.blocks[dragState.index];
+    if (!b) return;
+    const dx = px - dragState.startPx;
+    const dy = py - dragState.startPy;
+    b.bbox = clampBbox([
+      dragState.origin[0] + dx, dragState.origin[1] + dy,
+      dragState.origin[2] + dx, dragState.origin[3] + dy,
+    ], page);
+    drawOverlay(page);
+  } else if (dragState.mode === "resize") {
+    const b = page.blocks[dragState.index];
+    if (!b) return;
+    b.bbox = clampBbox(
+      [dragState.origin[0], dragState.origin[1], px, py], page);
+    drawOverlay(page);
+  }
+}
+
+function overlayPointerUp() {
+  const sel = state.sel;
+  const canvas = $("#overlay-canvas");
+  if (canvas) canvas.classList.remove("grabbing");
+  if (!sel || !dragState) return;
+  const st = dragState;
+  dragState = null;
+  const page = currentPage();
+  if (!page) return;
+  const changed = (b, before) => b && b.bbox.join(",") !== before.join(",");
+  if (st.mode === "draw") {
+    const rect = sel.pendingDraw;
+    if (rect && (rect[2] - rect[0]) >= 8 && (rect[3] - rect[1]) >= 8) {
+      pushUndo();
+      page.blocks.push({
+        kind: "text", bbox: rect, text: "", caption: "",
+        conf: null, font_scale: 1.0,
+      });
+      sel.selection = { pageIndex: sel.pageIndex, indices: new Set([page.blocks.length - 1]) };
+      sel.drawMode = false;
+      sel.embedded = false;
+      setStatus("dirty", "running");
+      toast(t("editor.blockAdded"), "success");
+    }
+    sel.pendingDraw = null;
+    renderPage();
+    return;
+  }
+  if ((st.mode === "move" || st.mode === "resize") && st.index != null) {
+    const b = page.blocks[st.index];
+    if (changed(b, st.origin)) {
+      sel.undoStack.push({ pageIndex: st.pageIndex, blocks: st.snapshot });
+      if (sel.undoStack.length > 50) sel.undoStack.shift();
+      sel.embedded = false;
+      setStatus("dirty", "running");
+    }
+    renderPage();
+  }
 }
 
 /* ---------- embed (selected job) ---------- */
@@ -1243,6 +1696,16 @@ async function init() {
   $("#btn-embed").onclick = embed;
   $("#btn-preview").onclick = previewOverlay;
   $("#btn-dataset").onclick = downloadDataset;
+
+  // --- interactive overlay for block operations (#6) ---
+  const ocv = $("#overlay-canvas");
+  if (ocv) {
+    ocv.addEventListener("pointerdown", overlayPointerDown);
+    ocv.addEventListener("pointermove", overlayPointerMove);
+    ocv.addEventListener("pointerup", overlayPointerUp);
+    ocv.addEventListener("pointercancel", overlayPointerUp);
+    ocv.addEventListener("pointerleave", overlayPointerUp);
+  }
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
   $("#btn-cache-clear").onclick = clearOcrCache;
@@ -1309,6 +1772,8 @@ async function init() {
     }
     const tag = (e.target.tagName || "").toLowerCase();
     if (tag === "input" || tag === "textarea" || tag === "select") return;
+    // (#6) A focused block editor owns the arrow keys (bbox nudge).
+    if (e.target.closest && e.target.closest(".block")) return;
     if (e.key === "ArrowLeft") prevPage();
     else if (e.key === "ArrowRight") nextPage();
   });
