@@ -225,11 +225,12 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
   border-radius: 8px;
   padding: 8px;
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   align-items: flex-start;
   background: var(--panel);
 }
-.block .meta { min-width: 110px; flex-shrink: 0; }
+.block .meta { flex: 1 0 auto; min-width: 110px; order: 0; }
 .block .badge {
   display: inline-block;
   font-size: 11px;
@@ -241,36 +242,40 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 }
 .block .coords { font-size: 11px; color: var(--muted); }
 .block textarea {
-  flex: 1;
+  flex: 1 1 100%;
+  order: 2;
   width: 100%;
-  min-height: 40px;
+  min-height: 96px;
   resize: vertical;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px;
+  padding: 8px;
   font-family: inherit;
-  font-size: 13px;
+  font-size: 14px;
+  line-height: 1.5;
   background: var(--panel);
   color: var(--text);
 }
 .block textarea.edit { border-color: var(--accent); }
 .block .del {
+  order: 1;
+  flex-shrink: 0;
   align-self: flex-start;
   border: none;
   background: var(--danger-bg);
   color: var(--danger-text);
   border-radius: 5px;
   cursor: pointer;
-  padding: 2px 8px;
+  padding: 4px 10px;
 }
 .block .del:hover { background: var(--danger-border); }
 .block .fs-row {
+  flex: 1 1 100%;
+  order: 3;
   display: flex;
   align-items: center;
   gap: 6px;
-  align-self: stretch;
-  min-width: 230px;
-  flex-shrink: 0;
+  min-width: 0;
   font-size: 12px;
   color: var(--muted);
   padding-top: 6px;
