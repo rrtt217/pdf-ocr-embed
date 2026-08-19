@@ -58,6 +58,7 @@ function setPref(key, value) {
 const state = {
   jobs: [],     // job summaries: {id, filename, status, current, total, error, has_embedded, created, busy}
   sel: null,    // editor session for the selected job: {jobId, pages, pageIndex, embedded}
+  zipSel: new Set(),  // job ids ticked for the "Download ZIP" batch action
   zoom: 100,
   es: {},       // jobId -> EventSource
   logTimer: null,
@@ -191,47 +192,85 @@ function currentAdapterCfg() {
   return cfg;
 }
 
-async function handleFile(file) {
-  const msg = $("#upload-msg");
-  if (msg) msg.textContent = "";
-  if (!file || !file.name.toLowerCase().endsWith(".pdf")) {
-    setStatus("error", "error");
-    if (msg) msg.textContent = t("upload.notPdf");
-    return;
-  }
+async function uploadOne(file, cfg, concurrency) {
   const fd = new FormData();
-  fd.append("file", file);
-  const cfg = currentAdapterCfg();
+  fd.append("files", file);            // multi-file field (a single file works too)
   fd.append("adapter", cfg.adapter);
   if (cfg.lang) fd.append("lang", cfg.lang);
-  const concurrency = Math.max(1, Math.min(32, parseInt($("#concurrency").value || "1", 10)));
   fd.append("concurrency", String(concurrency));
+  return api("/api/ocr/upload", { method: "POST", body: fd });
+}
+
+/* Batch upload: drop/select one or more PDFs. Each file becomes its own job
+   on the server (own card + SSE); we fire every upload concurrently — no N
+   sequential awaits blocking the UI — then refresh the authoritative job list
+   from the server and let it re-connect the per-job streams. */
+async function handleFiles(fileList) {
+  const msg = $("#upload-msg");
+  if (msg) msg.textContent = "";
+  const files = Array.from(fileList || []).filter(
+    (f) => f && f.name && f.name.toLowerCase().endsWith(".pdf"));
+  if (files.length === 0) {
+    if (fileList && fileList.length) {
+      setStatus("error", "error");
+      if (msg) msg.textContent = t("upload.notPdf");
+    }
+    return;
+  }
+  const cfg = currentAdapterCfg();
+  const concurrency = Math.max(1, Math.min(32,
+    parseInt($("#concurrency").value || "1", 10)));
 
   setStatus("uploading", "running");
-  try {
-    const data = await api("/api/ocr/upload", { method: "POST", body: fd });
-    state.jobs.unshift({
-      id: data.job_id,
-      filename: data.filename || file.name,
-      status: "running",
-      current: 0,
-      total: 0,
-      error: null,
-      has_embedded: false,
-      created: Date.now() / 1000,
-      busy: false,
-    });
-    renderJobs();
-    connectStream(data.job_id);
-    selectJob(data.job_id);
-    setStatus("running", "running");
-    if (msg) msg.textContent = "";
+  const settled = await Promise.allSettled(
+    files.map((f) => uploadOne(f, cfg, concurrency)));
+
+  // The server is the single source of truth for what jobs exist — reload it
+  // (this also connects EventSources for every running job and re-renders).
+  await loadJobs();
+
+  const ok = settled.filter((r) => r.status === "fulfilled");
+  const failed = settled.filter((r) => r.status === "rejected");
+  if (ok.length === 1) {
+    selectJob(ok[0].value.job_id);
     toast(t("upload.started"), "success");
-  } catch (e) {
-    setStatus("error", "error");
-    if (msg) msg.textContent = t("upload.failed", { msg: e.message });
-    toast(t("upload.failed", { msg: e.message }), "error");
+  } else if (ok.length > 1) {
+    toast(t("upload.multiStarted", { n: ok.length }), "success");
   }
+  if (failed.length) {
+    const errMsg = (failed[0].reason && failed[0].reason.message) || "";
+    if (msg) msg.textContent = t("upload.failedSome", { n: failed.length, msg: errMsg });
+    toast(t("upload.failedSome", { n: failed.length, msg: errMsg }), "error");
+  }
+  setStatus(anyRunning() ? "running" : "idle",
+            anyRunning() ? "running" : "");
+}
+
+/* ---------- ZIP download of selected embedded jobs ---------- */
+function updateZipButton() {
+  const btn = $("#btn-zip");
+  if (!btn) return;
+  const n = state.zipSel.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? t("jobs.zipSel", { n }) : t("jobs.zip");
+}
+
+function toggleZipSel(jobId, checked) {
+  if (checked) state.zipSel.add(jobId);
+  else state.zipSel.delete(jobId);
+  updateZipButton();
+}
+
+function downloadZip() {
+  const n = state.zipSel.size;
+  if (!n) return;
+  const a = el("a");
+  a.href = "/api/ocr/zip?jobs=" + encodeURIComponent(Array.from(state.zipSel).join(","));
+  a.download = "ocr_results.zip";
+  a.rel = "noopener";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 /* ---------- jobs: list + per-job SSE ---------- */
@@ -240,11 +279,17 @@ async function loadJobs() {
     const data = await api("/api/jobs");
     state.jobs = (data.jobs || []).map((j) => Object.assign(j, { busy: false }));
     state.jobs.sort((a, b) => (b.created || 0) - (a.created || 0));
+    // Drop ZIP selections whose job is gone or no longer embedded.
+    state.zipSel = new Set(Array.from(state.zipSel).filter((id) => {
+      const j = jobById(id);
+      return j && j.has_embedded;
+    }));
     // Drop streams for jobs that no longer exist server-side.
     Object.keys(state.es).forEach((id) => {
       if (!jobById(id)) { state.es[id].close(); delete state.es[id]; }
     });
     renderJobs();
+    updateZipButton();
     // Subscribe to every still-running job with its own EventSource.
     state.jobs.forEach((j) => {
       if (RUNNING_STATUSES.has(j.status)) connectStream(j.id);
@@ -327,6 +372,14 @@ function jobCard(job) {
     actions.appendChild(edit);
   }
   if (job.has_embedded) {
+    const zipSel = el("label", "job-zip-sel");
+    zipSel.title = t("job.zipSelect");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = state.zipSel.has(job.id);
+    cb.onchange = () => toggleZipSel(job.id, cb.checked);
+    zipSel.appendChild(cb);
+    actions.appendChild(zipSel);
     const a = el("a", "download-link", t("job.embeddedPdf"));
     a.href = `/api/download/${job.id}.pdf`;
     a.download = "";
@@ -569,6 +622,8 @@ async function clearJob(jobId) {
   } catch (e) { /* job may already be gone — still reset the UI */ }
   if (state.es[jobId]) { state.es[jobId].close(); delete state.es[jobId]; }
   state.jobs = state.jobs.filter((j) => j.id !== jobId);
+  state.zipSel.delete(jobId);
+  updateZipButton();
   if (state.sel && state.sel.jobId === jobId) setSelectedJob(null);
   renderJobs();
   setGlobalStatus();
@@ -1143,6 +1198,7 @@ function nextPage() {
 function onLocaleChanged() {
   updateAdapterUI();
   updatePageRangeHint();
+  updateZipButton();   // the job ZIP button label is locale-dependent (count)
   setGlobalStatus();
   renderJobs();
   if (state.sel) {
@@ -1223,8 +1279,9 @@ async function init() {
     drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("dragover"); }));
   ["dragleave", "drop"].forEach((ev) =>
     drop.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.remove("dragover"); }));
-  drop.addEventListener("drop", (e) => handleFile(e.dataTransfer.files[0]));
-  $("#file-input").addEventListener("change", (e) => handleFile(e.target.files[0]));
+  drop.addEventListener("drop", (e) => handleFiles(e.dataTransfer.files));
+  $("#file-input").addEventListener("change", (e) => handleFiles(e.target.files));
+  $("#btn-zip").onclick = downloadZip;
 
   $("#btn-prev").onclick = prevPage;
   $("#btn-next").onclick = nextPage;
@@ -1318,6 +1375,7 @@ async function init() {
 
   updateAdapterUI();
   updatePageRangeHint();
+  updateZipButton();
   loadFonts();
 
   try { await api("/api/health"); setStatus("online"); }

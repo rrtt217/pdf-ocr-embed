@@ -44,10 +44,10 @@
   <main>
     <!-- Upload / landing -->
     <section id="upload-zone" class="card">
-      <input type="file" id="file-input" accept="application/pdf" hidden />
+      <input type="file" id="file-input" accept="application/pdf" multiple hidden />
       <label id="drop-zone" for="file-input">
         <strong data-i18n="upload.drop">Drop a scanned PDF here</strong>
-        <span data-i18n="upload.orClick">or click to choose a file. Pages are rasterized, OCR'd, and made searchable.</span>
+        <span data-i18n="upload.orClickMulti">or click to choose one or more PDFs. Each becomes its own job — pages are rasterized, OCR'd, and made searchable.</span>
       </label>
       <div class="upload-opts">
         <label class="inline-label"><span data-i18n="upload.engine">OCR engine</span>
@@ -80,11 +80,20 @@
     </section>
 
     <!-- Jobs: everything the server knows about, running or finished.
-         Several jobs can run in parallel; each has its own card + live SSE. -->
+         Several jobs can run in parallel; each has its own card + live SSE.
+         Finished jobs with an embedded output can be ticked and packaged
+         together into a single ZIP download. -->
     <section id="jobs-section" class="card hidden">
       <div class="row">
         <h2 data-i18n="jobs.title">Jobs</h2>
         <span class="hint" data-i18n="jobs.hint">All tasks on the server — close this page and come back anytime, they survive.</span>
+        <span aria-hidden="true" style="flex: 1"></span>
+        <button
+          id="btn-zip"
+          class="small"
+          disabled
+          data-i18n="jobs.zip"
+          data-i18n-title="jobs.zipTitle">⬇ Download ZIP</button>
       </div>
       <div id="jobs-list"></div>
     </section>
