@@ -15,6 +15,9 @@ __pycache__/
 .venv/
 venv/
 
+# Git worktrees for parallel feature development
+.worktrees/
+
 # Logs / sample data
 opencode_run.log
 page15.pdf
