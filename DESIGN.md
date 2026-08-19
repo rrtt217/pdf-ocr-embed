@@ -104,6 +104,11 @@
 - `POST /api/ocr/retry/{job_id}` 支持 `page_start` / `page_end` / `force`
   （页范围 + 强制重跑已成功页，A/B 试跑用）；页选择逻辑集中在
   `ocr_service.select_pages()`（纯函数，含单元测试）。
+- OCR 输入图像预处理（#2）：`pdf_processing.preprocess_image()` 在新渲染的
+  页面 PNG 上执行 PIL 清洗（灰度 / 中值去噪 / autcontrast / Otsu 二值化），
+  由 `preprocess_*` 配置开关控制。**尺寸不变**是硬约束——预处理前后宽高完全
+  一致，因此块 bbox 像素坐标语义永不改变；预处理只发生在 OCR 输入的渲染
+  路径（含按需预览补渲染），命中缓存的页面不渲染、不预处理。
 
 ## 前端
 - 单页 WebApp（原生 JS / Vue 简洁优先）。

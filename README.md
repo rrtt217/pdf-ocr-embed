@@ -160,6 +160,19 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### 图像预处理（可选）
+
+扫描件常倾斜、发灰、带噪点，会显著拉低识别率。Settings 弹窗提供一组
+**PIL 预处理开关**（`preprocess_*`），在 OCR 之前对渲染出的页面图像做清洗：
+
+- `preprocess_enabled`（总开关，默认关）、`grayscale`（灰度化）、`denoise`
+  （中值滤波去噪）、`contrast`（直方图对比度拉伸）、`binarize`（Otsu 阈值二值化）。
+
+**不改变尺寸** 是硬约束：预处理只在新渲染的页面图像上执行，输出宽高与输入
+完全一致，因此所有块 bbox 的像素坐标语义不变。开关既可写进
+`backend/ocr_config.toml`，也支持 `OCR_PREPROCESS_*` 环境变量（最高优先级）。
+仅对新渲染的页面生效（命中 OCR 缓存的页面不重新渲染、不预处理）。
+
 ### 无头 CLI 模式（headless）
 
 不启动 Web 服务，直接用命令行完成「OCR → 嵌入」整条流水线（复用

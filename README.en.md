@@ -187,6 +187,21 @@ echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
+### Image preprocessing (optional)
+
+Scanned pages are often skewed, noisy and grey, which hurts recognition. The
+Settings dialog offers a set of **PIL preprocessing toggles** (`preprocess_*`)
+that clean the rendered page image before OCR:
+
+- `preprocess_enabled` (master switch, default off), `grayscale`, `denoise`
+  (median filter), `contrast` (histogram stretch), `binarize` (Otsu threshold).
+
+**Never changes dimensions**: preprocessing runs only on freshly rendered page
+images and preserves the exact input width/height, so every block bbox keeps its
+pixel-space meaning. Toggles can be set in `backend/ocr_config.toml` or via
+`OCR_PREPROCESS_*` environment variables (highest priority). Only newly rendered
+pages are affected (cache-hit pages are not re-rendered or preprocessed).
+
 ### Headless CLI
 
 Run the whole "OCR → embed" pipeline from the command line without the web
