@@ -77,6 +77,103 @@ def render_page(page: fitz.Page) -> "tuple[fitz.Pixmap, int, int]":
     return pix, pix.width, pix.height
 
 
+# ---------------------------------------------------------------------------
+# OCR-input image preprocessing (feature #2)
+#
+# Scanned pages are often skewed, noisy and grey.  Before OCR we can clean the
+# rendered page image with PIL-only operations (grayscale, contrast
+# enhancement, denoising, optional binarization).  HARD INVARIANT: the
+# preprocessing must NEVER change the image dimensions — every block bbox is an
+# integer in this image's raw pixel space, so a resize would silently break all
+# coordinates.  All ops below are dimension-preserving by construction.
+# ---------------------------------------------------------------------------
+
+def preprocess_image(img: "PIL.Image.Image", opts: dict | None = None) -> "PIL.Image.Image":
+    """Apply OCR-input cleaning steps to a rendered page image.
+
+    ``opts`` may carry explicit flags (``enabled``, ``grayscale``, ``denoise``,
+    ``contrast``, ``binarize``) — used by tests and the CLI.  When omitted, the
+    flags are read from ``backend.config.resolve()`` (preprocess_* keys).
+
+    Returns a new image with EXACTLY the same width/height as the input.
+    """
+    if opts is None:
+        opts = _preprocess_opts_from_config()
+    if not opts.get("enabled"):
+        return img
+    out = img
+    if opts.get("grayscale"):
+        if out.mode != "L":
+            out = out.convert("L")
+    if opts.get("denoise"):
+        # Light median filter removes salt-and-pepper scanner noise without
+        # smearing text edges (unlike a strong blur).
+        out = out.filter(ImageFilter.MedianFilter(size=3))
+    if opts.get("contrast"):
+        # Stretch the histogram; white/black-cutoff variants increase
+        # discrimination of faint grey-on-grey text.
+        out = ImageOps.autocontrast(out, cutoff=1)
+    if opts.get("binarize"):
+        # Simple adaptive-ish threshold: Otsu on the luminance histogram
+        # (mode "L" first), then map into a black/white image.
+        if out.mode != "L":
+            out = out.convert("L")
+        thresh = _otsu_threshold(out)
+        out = out.point(lambda p: 255 if p > thresh else 0)
+    if out.size != img.size:
+        # Defensive: never return a resized image (coordinate invariant).
+        log.warning("preprocess changed image size %s -> %s; reverting to input",
+                    img.size, out.size)
+        return img
+    return out
+
+
+def _preprocess_opts_from_config() -> dict:
+    """Read the preprocess_* toggle flags from the effective config."""
+    from backend.config import resolve
+    cfg = resolve()
+    return {
+        "enabled": _cfg_bool(cfg.get("preprocess_enabled"), False),
+        "grayscale": _cfg_bool(cfg.get("preprocess_grayscale"), True),
+        "denoise": _cfg_bool(cfg.get("preprocess_denoise"), True),
+        "contrast": _cfg_bool(cfg.get("preprocess_contrast"), True),
+        "binarize": _cfg_bool(cfg.get("preprocess_binarize"), False),
+    }
+
+
+def _cfg_bool(raw: object, default: bool) -> bool:
+    """Parse a config string/bool into a boolean (lenient)."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _otsu_threshold(img: "PIL.Image.Image") -> int:
+    """Compute an Otsu threshold on a grayscale image's histogram."""
+    hist = img.histogram()  # 256 bins for mode "L"
+    total = sum(hist)
+    if total == 0:
+        return 128
+    weight_bg, sum_bg = 0, 0.0
+    best_var, best_t = 0.0, 128
+    for t in range(256):
+        weight_bg += hist[t]
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum(x * hist[x] for x in range(t + 1, 256))) / weight_fg
+        var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var > best_var:
+            best_var, best_t = var, t
+    return best_t
+
+
 def render_page_to_file(page: fitz.Page, out_path: Path, page_index: int) -> Tuple[str, int, int]:
     """Render page to PNG on disk. Returns (path, width_px, height_px).
 

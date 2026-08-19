@@ -62,6 +62,16 @@ _FILE_KEYS = (
     "ocr_cache_enabled", "ocr_cache_max_age_hours",
     # logging verbosity (see backend/logging_config.py)
     "log_level",
+    # OCR-input image preprocessing (see backend/pdf_processing.preprocess_image)
+    "preprocess_enabled", "preprocess_grayscale", "preprocess_denoise",
+    "preprocess_contrast", "preprocess_binarize",
+)
+
+# Preprocessing flags (flat keys, mirrored in _FILE_KEYS / _ENV_ALIASES).
+# Defaults are all OFF; the WebUI settings modal toggles them per-page render.
+_PREPROCESS_KEYS = (
+    "preprocess_enabled", "preprocess_grayscale", "preprocess_denoise",
+    "preprocess_contrast", "preprocess_binarize",
 )
 
 # Map environment variables -> resolved config field names.  These restore the
@@ -84,6 +94,11 @@ _ENV_ALIASES = {
     "OCR_CACHE_ENABLED": "ocr_cache_enabled",
     "OCR_CACHE_MAX_AGE_HOURS": "ocr_cache_max_age_hours",
     "OCR_LOG_LEVEL": "log_level",
+    "OCR_PREPROCESS_ENABLED": "preprocess_enabled",
+    "OCR_PREPROCESS_GRAYSCALE": "preprocess_grayscale",
+    "OCR_PREPROCESS_DENOISE": "preprocess_denoise",
+    "OCR_PREPROCESS_CONTRAST": "preprocess_contrast",
+    "OCR_PREPROCESS_BINARIZE": "preprocess_binarize",
 }
 
 # In-memory overrides from the WebUI settings page (applied at runtime).
@@ -115,6 +130,19 @@ def _as_str(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     return str(value)
+
+
+def as_bool(value: Any) -> bool:
+    """Coerce a config value (string from file/env or JSON bool) to a boolean.
+
+    Accepts TOML booleans, JSON booleans, and string forms like "true"/"1"/"yes".
+    Anything unrecognized (including None and empty) is falsy.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def _load_env() -> Dict[str, str]:
@@ -161,12 +189,14 @@ def resolve() -> Dict[str, str]:
 def get_effective_settings() -> Dict[str, Any]:
     """Return a safe, masked view of the current effective settings for the WebUI."""
     cfg = resolve()
+    preprocess = {k: as_bool(cfg.get(k, False)) for k in _PREPROCESS_KEYS}
     return {
         "provider": cfg.get("provider", "ustc"),
         "base_url": cfg.get("base_url", ""),
         "model": cfg.get("model", ""),
         "api_key_masked": _mask_key(cfg.get("api_key", "")),
         "has_api_key": bool(cfg.get("api_key")),
+        **preprocess,
     }
 
 
@@ -189,6 +219,13 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     data["base_url"] = str(settings.get("base_url", "")).strip().rstrip("/")
     data["model"] = str(settings.get("model", "")).strip()
     data["provider"] = str(settings.get("provider", "ustc")).strip()
+
+    # Persist the preprocessing toggles from the WebUI payload.  Only keys the
+    # client actually sent are written; anything absent keeps its previous
+    # value (data already starts from the existing file).
+    for key in _PREPROCESS_KEYS:
+        if settings.get(key) is not None:
+            data[key] = "true" if as_bool(settings[key]) else "false"
 
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)
