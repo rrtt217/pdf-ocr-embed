@@ -211,13 +211,16 @@ def conf_stats(blocks: List[OcrBlock]) -> Dict[str, object]:
 def page_source_text(page: OcrPage) -> str:
     """The text actually embedded for a page (embeddable, non-empty blocks).
 
-    Mirrors ``pdf_processing.embed_invisible_text``: image-only blocks and
-    empty-text blocks are skipped, so validation compares against exactly the
-    source that was placed into the PDF.
+    Mirrors ``pdf_processing._text_blocks_to_place``: image-only blocks place
+    their caption when present (at ``caption_bbox`` / the image bbox), and
+    empty-text blocks place nothing, so validation compares against exactly
+    the source that was placed into the PDF.
     """
     parts = []
     for b in page.blocks:
         if b.kind in _SKIPPED_KINDS:
+            if (b.caption or "").strip():
+                parts.append(b.caption)
             continue
         if (b.text or "").strip():
             parts.append(b.text)

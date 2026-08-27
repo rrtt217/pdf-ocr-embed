@@ -134,3 +134,20 @@ def test_embed_with_optimize_and_linearize_returns_stats():
         # Linearization may be unavailable in the bundled MuPDF; the save
         # must never fail over it — the flag records what actually happened.
         assert isinstance(stats.get("linearized"), bool)
+
+
+def test_embed_writes_image_captions_into_text_layer():
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        src = _make_image_pdf(td)
+        page = OcrPage(page_index=0, width=400, height=400, blocks=[
+            OcrBlock(kind="text", bbox=[10, 10, 200, 30], text="hello searchable"),
+            OcrBlock(kind="image", bbox=[10, 40, 200, 220], text="",
+                     caption="Fig. 1 示例",
+                     caption_bbox=[10, 230, 200, 250]),
+        ])
+        out, _thumb, _stats = embed_invisible_text(str(src), [page], td)
+        with fitz.open(str(out)) as final:
+            text = final[0].get_text()
+        assert "hello searchable" in text
+        assert "Fig. 1 示例" in text

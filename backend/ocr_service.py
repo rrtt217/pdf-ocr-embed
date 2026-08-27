@@ -619,8 +619,8 @@ def _finish_stopped(job, job_id: str, num: int) -> None:
 
 # Per-adapter override keys accepted via the upload/retry API (form fields).
 _ADAPTER_PARAM_KEYS: Dict[str, tuple] = {
-    "unlimited": ("api_key", "base_url", "model"),
-    "generic_openai": ("api_key", "base_url", "model", "prompt"),
+    "unlimited": ("api_key", "base_url", "model", "max_tokens"),
+    "generic_openai": ("api_key", "base_url", "model", "prompt", "max_tokens"),
     "tesseract": ("lang", "psm", "oem", "config", "tessdata_dir", "tess_cmd"),
 }
 

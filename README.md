@@ -296,7 +296,10 @@ pdf-ocr-embed/
 ## 说明与限制
 
 - bbox 为 `[x1,y1,x2,y2]` 整数，adapter 内部把归一化画布换算为真实像素，前端/嵌入统一用像素坐标。
-- `max_tokens` 已设为 16384（必须 < 32768，否则 API 400）。
+- `max_tokens` 默认 16384（必须 < 32768，否则 API 400）。可通过 CLI
+  `--max-tokens N` 提高（API 引擎）；响应若被截断（`finish_reason=length` 或
+  `completion_tokens >= max_tokens`），该页按**失败**处理并给出明确错误，
+  重试即可补跑，不会把残缺结果当作成功缓存。
 - 像素 → PDF 坐标做了 y 轴翻转（PDF 原点左下、像素原点左上），并用页面 rect 与渲染宽高比例缩放。
 - **Tesseract adapter（本地，无 key）**：
   - 语言通过 `backend/ocr_config.toml` 的 `tess_lang`（或 WebUI 上传区）配置，
@@ -306,7 +309,11 @@ pdf-ocr-embed/
     tessdata 不在默认位置时用 `tessdata_dir`。
   - 每行文本聚合成一个 block，自动识别 heading / equation / text，输出置信度。
 - **generic_openai adapter（任意 OpenAI 兼容视觉模型）**：与 unlimited 相同
-   的 api_key/base_url/model 配置，`generic_prompt` 可覆盖默认的 bbox-JSON 提示词。
+  的 api_key/base_url/model 配置，`generic_prompt` 可覆盖默认的 bbox-JSON 提示词。
+- **unlimited adapter 结果处理**：`table` 块的 HTML 会转换成行列文本（不再把
+  `<tr>/<td>` 标签写进文本层）；公式/表格单元格会收紧模型的分词空格
+  （`X _ p`→`X_p`、`f (x)`→`f(x)`）；相邻单个数字之间不会自动合并；
+  `image_caption` 图注连同其 bbox（`caption_bbox`）保留并嵌入到文字层。
 - **并行数（concurrency）**：上传时可指定，WebUI 上传区有输入框，或调用
   `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。后端用线程池并发处理各页，
   `concurrency=1` 即顺序执行。注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。

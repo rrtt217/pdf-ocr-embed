@@ -73,14 +73,15 @@ def test_conf_stats_normalizes_units_and_buckets():
     assert s["block_count"] == 4
 
 
-def test_page_source_text_skips_image_and_empty_blocks():
+def test_page_source_text_matches_what_gets_embedded():
     page = OcrPage(page_index=0, width=100, height=100, blocks=[
         OcrBlock(kind="text", bbox=[1, 1, 5, 5], text="alpha"),
+        # image kind embeds its caption (not the empty text)
         OcrBlock(kind="image", bbox=[1, 1, 5, 5], text="", caption="fig"),
         OcrBlock(kind="table", bbox=[1, 1, 5, 5], text="beta"),
         OcrBlock(kind="text", bbox=[1, 1, 5, 5], text="   "),
     ])
-    assert validation.page_source_text(page) == "alpha\nbeta"
+    assert validation.page_source_text(page) == "alpha\nfig\nbeta"
 
 
 def test_page_report_flags():

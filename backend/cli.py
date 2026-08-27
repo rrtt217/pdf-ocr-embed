@@ -114,9 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="OCR only: print per-page recognized text to stdout "
                              "instead of embedding.")
     parser.add_argument("--max-tokens", type=int, default=None, metavar="N",
-                        help=f"Validation guard: must satisfy 0 < N < {MAX_TOKENS_LIMIT} "
-                             f"(enforced by this CLI; the backend API exposes no "
-                             f"max_tokens knob).")
+                        help=f"Max completion tokens per page (0 < N < {MAX_TOKENS_LIMIT}; "
+                             f"applies to API adapters; raise it if dense pages hit "
+                             f"the 'OCR output truncated' error).")
     parser.add_argument("--json", action="store_true",
                         help="Print a final machine-readable JSON summary to stdout.")
     return parser
@@ -190,8 +190,9 @@ def _run(args: argparse.Namespace) -> int:
             ocr_service.update_page(job_id, i, {"_headless_skip": True})
 
     try:
-        ocr_service.run_ocr(job_id, args.adapter, concurrency=args.concurrency,
-                            only_missing=True)
+        extra_cfg = {"max_tokens": args.max_tokens} if args.max_tokens else None
+        ocr_service.run_ocr(job_id, args.adapter, extra_cfg=extra_cfg,
+                            concurrency=args.concurrency, only_missing=True)
     except UnavailableError as exc:
         print(f"error: adapter '{args.adapter}' unavailable: {exc}",
               file=sys.stderr)

@@ -22,6 +22,10 @@ class OcrBlock:
     bbox: List[int]
     text: str = ""
     caption: str = ""
+    # bbox of the caption string itself, when the engine reported one (e.g. the
+    # unlimited <|det|>image_caption marker).  Falls back to ``bbox`` when
+    # unset.  Integer raw-pixel, like ``bbox``.
+    caption_bbox: Optional[List[int]] = None
     conf: Optional[float] = None
     # Interactive per-block font-size gain for the debug tool (1.0 = auto).
     # When set, the embedded font size is derived font size * font_scale.
@@ -35,6 +39,8 @@ class OcrBlock:
         }
         if self.caption:
             d["caption"] = self.caption
+        if self.caption_bbox:
+            d["caption_bbox"] = self.caption_bbox
         if self.conf is not None:
             d["conf"] = self.conf
         if self.font_scale != 1.0:
@@ -48,11 +54,15 @@ class OcrBlock:
             font_scale = float(fs) if fs is not None else 1.0
         except (TypeError, ValueError):
             font_scale = 1.0
+        caption_bbox = data.get("caption_bbox") or None
+        if caption_bbox is not None:
+            caption_bbox = [int(float(v)) for v in caption_bbox]
         return cls(
             kind=data.get("kind", "text"),
             bbox=list(data.get("bbox", [0, 0, 0, 0])),
             text=data.get("text", ""),
             caption=data.get("caption", ""),
+            caption_bbox=caption_bbox,
             conf=data.get("conf"),
             font_scale=font_scale,
         )

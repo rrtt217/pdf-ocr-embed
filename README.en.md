@@ -343,7 +343,11 @@ pdf-ocr-embed/
 
 - bboxes are `[x1,y1,x2,y2]` integers; adapters convert normalized canvases back to
   real pixels; the frontend and embedding uniformly use pixel coordinates.
-- `max_tokens` is set to 16384 (must stay < 32768 or the API returns HTTP 400).
+- `max_tokens` defaults to 16384 (must stay < 32768 or the API returns HTTP 400).
+  Raise it via the CLI `--max-tokens N` (API engines). A truncated response
+  (`finish_reason=length`, or `completion_tokens >= max_tokens`) is treated as a
+  page **failure** with a clear error — retry re-runs it instead of silently
+  caching a partial result.
 - Pixel → PDF coordinates are flipped along the y axis (PDF origin is bottom-left,
   pixel origin top-left) and scaled by the page rect / rendered size.
 - **Tesseract adapter (local, no key)**:

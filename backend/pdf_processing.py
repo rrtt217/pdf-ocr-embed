@@ -15,7 +15,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageFilter, ImageOps  # OCR-input preprocessing (#2)
@@ -317,6 +317,31 @@ def _font_metrics(fontname: str) -> Tuple[float, float, float]:
     return (_DEFAULT_INK_FRACTION, _DEFAULT_LINE_HEIGHT, _DEFAULT_INK_UP)
 
 
+def _text_blocks_to_place(blocks: List[OcrBlock]) -> Iterator[OcrBlock]:
+    """Yield every block whose text must land in the PDF text layer.
+
+    Mirrors the old all-inline embedding loop but with one critical change:
+    image/image_ref blocks are not silently dropped — their caption (when the
+    engine reported one) is placed as a normal text line at the caption bbox,
+    so figure captions finally survive into searchable/copyable content.
+    """
+    for block in blocks:
+        if block.kind in ("image", "image_ref"):
+            if not (block.caption or "").strip():
+                continue
+            yield OcrBlock(
+                kind="image_caption",
+                bbox=block.caption_bbox or block.bbox,
+                text=block.caption,
+                caption_bbox=None,
+                font_scale=block.font_scale,
+            )
+            continue
+        if not (block.text or "").strip():
+            continue
+        yield block
+
+
 def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
                          out_dir: Optional[Path] = None,
                          embed_font=None,
@@ -371,9 +396,7 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
             # Indentation is preserved by the bbox start x (blob.x0) the text is
             # placed at — no per-page left margin is needed here.
 
-            for block in page_cfg.blocks:
-                if block.kind in ("image", "image_ref") or not block.text.strip():
-                    continue
+            for block in _text_blocks_to_place(page_cfg.blocks):
                 total_blocks += 1
                 try:
                     _insert_block(page, block, rect, w_scale, h_scale)
@@ -599,9 +622,7 @@ def render_overlay(pdf_bytes_path: str, pages: List[OcrPage],
         h_scale = rect.height / page_cfg.height if page_cfg.height else 1.0
 
         out_file = out_dir / f"overlay_{target:04d}.png"
-        for block in page_cfg.blocks:
-            if block.kind in ("image", "image_ref") or not block.text.strip():
-                continue
+        for block in _text_blocks_to_place(page_cfg.blocks):
             layout = _compute_block_layout(block, page, w_scale, h_scale,
                                            font_scale=block.font_scale)
             for x, y_base, line, fontsize, fontname in layout["lines"]:
