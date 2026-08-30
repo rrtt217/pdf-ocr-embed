@@ -15,6 +15,8 @@
 # OCR_TESS_LANG/PSM/OEM/CONFIG -> tess_*, OCR_TESSDATA_DIR -> tessdata_dir,
 # OCR_TESS_CMD -> tess_cmd, OCR_GENERIC_PROMPT -> generic_prompt,
 # OCR_MAX_RETRIES -> max_retries, OCR_RETRY_BASE_DELAY -> retry_base_delay,
+# OCR_UNLIMITED_BATCH_ENABLED -> unlimited_batch_enabled,
+# OCR_UNLIMITED_MAX_PAGES_PER_BATCH -> unlimited_max_pages_per_batch,
 # OCR_RETRY_MAX_DELAY -> retry_max_delay, OCR_RATE_LIMIT_RPS -> rate_limit_rps,
 # OCR_EMBED_FONT -> embed_font, OCR_CLEANUP_MAX_AGE_HOURS ->
 # cleanup_max_age_hours, OCR_CLEANUP_INTERVAL_HOURS -> cleanup_interval_hours,
@@ -36,6 +38,12 @@ tess_lang = "chi_sim"                        # e.g. "eng", "chi_sim", "chi_sim+e
 
 # --- Generic OpenAI adapter (any OpenAI-compatible vision model) ----------
 # generic_prompt = "..."                     # override the default bbox-JSON prompt
+
+# --- Unlimited adapter document-level (multi-page) parsing ----------------
+# Sends several page images in ONE request ("Multi page parsing."); responses
+# come back <PAGE>-separated.  Affects OCR output -> part of the cache key.
+# unlimited_batch_enabled = true            # master switch (false = per-page requests)
+# unlimited_max_pages_per_batch = 12        # pages per request (0 = auto default)
 
 # --- HTTP adapter retry + rate limiting (shared by unlimited & generic) ----
 # Applies to every API call; does NOT change OCR output (so it never affects

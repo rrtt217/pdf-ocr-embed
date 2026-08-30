@@ -1,6 +1,9 @@
 """<|det|> marker parsing: kinds, caption pairing, bbox remap, robustness."""
 from __future__ import annotations
 
+import pytest
+
+from backend.sources.base import PageSpec
 from backend.sources.unlimited_ocr_adapter import (
     UnlimitedOcrAdapter,
     _clean_math_spacing,
@@ -157,3 +160,308 @@ def test_parser_version_changes_cache_fingerprint():
     old = dict(fp, parser_version=fp["parser_version"] - 1)
     import backend.ocr_cache as ocr_cache
     assert ocr_cache.build_key(fp) != ocr_cache.build_key(old)
+
+
+# ---------------------------------------------------------------------------
+# Document-level (multi-page) parsing: <PAGE> splitting + batch recognition
+# ---------------------------------------------------------------------------
+
+def _adapter(**kw):
+    """Adapter instance without network/config side effects.
+
+    ``_post`` and ``_encode_image`` are stubbed so tests exercise the batch
+    logic (payload building, <PAGE> splitting, truncation fallback) only.
+    """
+    a = UnlimitedOcrAdapter.__new__(UnlimitedOcrAdapter)
+    a.max_tokens = kw.get("max_tokens", 16384)
+    a.batch_enabled = kw.get("batch_enabled", True)
+    a.max_batch_pages = kw.get("max_batch_pages", 12)
+    a.model = "unlimited-ocr"
+    a.base_url = "http://test/v1"
+    a.api_key = "k"
+    a._encode_image = lambda path: "QUJD"
+    a._post = kw.get("post")
+    return a
+
+
+def _resp(content: str, finish: str = "stop", comp: int | None = None) -> dict:
+    return {"choices": [{"message": {"content": content},
+                         "finish_reason": finish}],
+            "usage": {"completion_tokens": comp if comp is not None
+                      else len(content)}}
+
+
+def test_split_multipage_basic():
+    text = ("<PAGE><|det|>title [0,0,10,10]<|/det|>A"
+            "<PAGE><|det|>text [0,0,10,10]<|/det|>B")
+    assert UnlimitedOcrAdapter._split_multipage(text, 2) == [
+        "<|det|>title [0,0,10,10]<|/det|>A",
+        "<|det|>text [0,0,10,10]<|/det|>B",
+    ]
+
+
+def test_split_multipage_keeps_blank_page_alignment():
+    # Page 1 blank: the model still emits its leading <PAGE> separator, so
+    # the first chunk is empty — alignment of later pages must not shift.
+    text = "<PAGE><PAGE><|det|>text [0,0,10,10]<|/det|>B"
+    chunks = UnlimitedOcrAdapter._split_multipage(text, 2)
+    assert chunks[0] == ""
+    assert "<|det|>" in chunks[1]
+
+
+def test_split_multipage_without_leading_separator_still_works():
+    text = ("<|det|>text [0,0,10,10]<|/det|>A"
+            "<PAGE><|det|>text [0,0,10,10]<|/det|>B")
+    chunks = UnlimitedOcrAdapter._split_multipage(text, 2)
+    assert "<|det|>" in chunks[0] and "<|det|>" in chunks[1]
+
+
+def test_split_multipage_trailing_separator_tolerated():
+    text = ("<PAGE><|det|>text [0,0,10,10]<|/det|>A"
+            "<PAGE><|det|>text [0,0,10,10]<|/det|>B<PAGE>")
+    chunks = UnlimitedOcrAdapter._split_multipage(text, 2)
+    assert len(chunks) == 2 and "<|det|>" in chunks[1]
+
+
+def test_split_multipage_empty_text_maps_to_blank_pages():
+    assert UnlimitedOcrAdapter._split_multipage("", 3) == ["", "", ""]
+
+
+def test_split_multipage_mismatch_raises():
+    text = "<PAGE><|det|>text [0,0,10,10]<|/det|>A"
+    with pytest.raises(RuntimeError, match="parse mismatch"):
+        UnlimitedOcrAdapter._split_multipage(text, 2)
+
+
+def test_recognize_pages_batch_single_request_per_page_normalization():
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        return _resp("<PAGE><|det|>title [10,10,100,50]<|/det|>Five"
+                     "<PAGE><|det|>text [20,20,200,100]<|/det|>Six")
+
+    a = _adapter(post=fake_post)
+    specs = [PageSpec("p1.png", 1000, 2000, 5),
+             PageSpec("p2.png", 500, 1000, 6)]
+    pages = a.recognize_pages(specs)
+    assert len(calls) == 1  # one request for both pages
+    content = calls[0]["messages"][0]["content"]
+    assert content[0]["text"] == "Multi page parsing."
+    assert len(content) == 3  # text + 2 image parts, in spec order
+    assert calls[0]["skip_special_tokens"] is False
+    assert [p.page_index for p in pages] == [5, 6]
+    assert pages[0].width == 1000 and pages[1].width == 500
+    # Each chunk normalizes against ITS OWN page image: same canvas bbox
+    # [20,20,200,100] -> [20,40,200,200] in 1000x2000 vs [10,20,100,100] in
+    # 500x1000.
+    assert pages[0].blocks[0].bbox == [10, 20, 100, 100]
+    assert pages[1].blocks[0].bbox == [10, 20, 100, 100]
+    assert pages[0].blocks[0].kind == "title"
+    assert pages[1].blocks[0].kind == "text"
+
+
+def test_recognize_pages_truncation_splits_batch_in_half():
+    responses = [
+        _resp("", finish="length"),                    # whole batch truncated
+        _resp("<|det|>text [0,0,10,10]<|/det|>Five"),  # single-page path
+        _resp("<|det|>text [0,0,10,10]<|/det|>Six"),   # single-page path
+    ]
+
+    def fake_post(payload):
+        return responses.pop(0)
+
+    a = _adapter(post=fake_post)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5),
+                               PageSpec("p2.png", 1000, 1000, 6)])
+    assert len(responses) == 0  # all three requests consumed
+    assert [p.page_index for p in pages] == [5, 6]
+    assert pages[0].blocks[0].text == "Five"
+    assert pages[1].blocks[0].text == "Six"
+
+
+def test_recognize_pages_incomplete_batch_retries_once_then_succeeds():
+    # Model stops after page 1 on the first attempt, completes on the retry.
+    responses = [
+        _resp("<PAGE><|det|>text [0,0,10,10]<|/det|>OnlyOne"),
+        _resp("<PAGE><|det|>text [0,0,10,10]<|/det|>Five"
+              "<PAGE><|det|>text [0,0,10,10]<|/det|>Six"),
+    ]
+
+    def fake_post(payload):
+        return responses.pop(0)
+
+    a = _adapter(post=fake_post)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5),
+                               PageSpec("p2.png", 1000, 1000, 6)])
+    assert len(responses) == 0
+    assert [p.blocks[0].text for p in pages] == ["Five", "Six"]
+
+
+def test_recognize_pages_incomplete_batch_splits_after_retry_fails():
+    # Two incomplete attempts (page 1 only), then the split bottoms out at
+    # single pages which complete via the per-page path.
+    responses = [
+        _resp("<PAGE><|det|>text [0,0,10,10]<|/det|>OnlyOne"),
+        _resp("<PAGE><|det|>text [0,0,10,10]<|/det|>OnlyOneAgain"),
+        _resp("<|det|>text [0,0,10,10]<|/det|>Five"),
+        _resp("<|det|>text [0,0,10,10]<|/det|>Six"),
+    ]
+
+    def fake_post(payload):
+        return responses.pop(0)
+
+    a = _adapter(post=fake_post)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5),
+                               PageSpec("p2.png", 1000, 1000, 6)])
+    assert len(responses) == 0  # 2 attempts + 2 single-page calls
+    assert [p.blocks[0].text for p in pages] == ["Five", "Six"]
+
+
+def test_recognize_pages_single_page_truncation_raises():
+    def fake_post(payload):
+        return _resp("", finish="length")
+
+    a = _adapter(post=fake_post)
+    with pytest.raises(RuntimeError, match="truncated"):
+        a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5)])
+
+
+def test_recognize_pages_disabled_falls_back_to_per_page():
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        return _resp("<|det|>text [0,0,10,10]<|/det|>single")
+
+    a = _adapter(post=fake_post, batch_enabled=False)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5),
+                               PageSpec("p2.png", 1000, 1000, 6)])
+    assert len(calls) == 2  # one request per page
+    assert [p.page_index for p in pages] == [5, 6]
+    for payload in calls:
+        content = payload["messages"][0]["content"]
+        assert content[0]["text"] == "document parsing."
+        assert len(content) == 2  # text + 1 image
+
+
+def test_recognize_pages_single_spec_uses_single_prompt():
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        return _resp("<|det|>text [0,0,10,10]<|/det|>solo")
+
+    a = _adapter(post=fake_post)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5)])
+    assert len(calls) == 1
+    assert calls[0]["messages"][0]["content"][0]["text"] == "document parsing."
+    assert pages[0].blocks[0].text == "solo"
+
+
+def test_recognize_pixels_suspicious_empty_retries_once():
+    """finish=stop + empty content is retried once (the hosted endpoint's
+    blank-page / vision-degeneration shape)."""
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return _resp("", finish="stop", comp=1)
+        return _resp("<|det|>text [0,0,10,10]<|/det|>recovered")
+
+    a = _adapter(post=fake_post)
+    page = a.recognize_pixels("p1.png", 1000, 1000, 5)
+    assert len(calls) == 2
+    assert page.blocks[0].text == "recovered"
+
+
+def test_recognize_pixels_persistent_empty_stays_blank_page():
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        return _resp("", finish="stop", comp=1)
+
+    a = _adapter(post=fake_post)
+    page = a.recognize_pixels("p1.png", 1000, 1000, 5)
+    assert len(calls) == 2  # retried once, then accepted as blank
+    assert page.blocks == []
+
+
+def test_recognize_pixels_image_only_result_is_retried():
+    """A lone whole-page image marker (the 'only one <image> block' symptom)
+    is treated as a degenerate read and retried."""
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        if len(calls) == 1:
+            return _resp("<|det|>image [0,0,100,100]<|/det|>")
+        return _resp("<|det|>text [0,0,10,10]<|/det|>real text")
+
+    a = _adapter(post=fake_post)
+    page = a.recognize_pixels("p1.png", 1000, 1000, 5)
+    assert len(calls) == 2
+    assert page.blocks[0].kind == "text"
+    assert page.blocks[0].text == "real text"
+
+
+def test_recognize_pixels_persistent_image_only_is_kept():
+    """A page that is genuinely a figure stays a single image block after
+    the one retry."""
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        return _resp("<|det|>image [0,0,100,100]<|/det|>")
+
+    a = _adapter(post=fake_post)
+    page = a.recognize_pixels("p1.png", 1000, 1000, 5)
+    assert len(calls) == 2
+    assert len(page.blocks) == 1 and page.blocks[0].kind == "image"
+
+
+def test_looks_degenerate():
+    from backend.models import OcrBlock
+    L = UnlimitedOcrAdapter._looks_degenerate
+    from backend.models import OcrPage as OP
+    assert L(OP(0, 100, 100, [])) is True
+    assert L(OP(0, 100, 100, [OcrBlock(kind="image", bbox=[0, 0, 10, 10])])) is True
+    assert L(OP(0, 100, 100, [OcrBlock(kind="image", bbox=[0, 0, 10, 10],
+                                       caption="Fig 1")])) is False
+    assert L(OP(0, 100, 100, [OcrBlock(kind="text", bbox=[0, 0, 10, 10],
+                                       text="hi")])) is False
+
+
+def test_recognize_pages_batch_degenerate_chunk_reocrs_single():
+    """A batch chunk that parses to a lone image marker is re-OCRed through
+    the single-page path (which retries degenerate results)."""
+    calls = []
+
+    def fake_post(payload):
+        calls.append(payload)
+        n = len(calls)
+        if n == 1:  # the batch: chunk 1 image-only, chunk 2 fine
+            return _resp("<PAGE><|det|>image [0,0,100,100]<|/det|>"
+                         "<PAGE><|det|>text [0,0,10,10]<|/det|>page two")
+        if n == 2:  # single-page re-OCR of page 1: still image-only
+            return _resp("<|det|>image [0,0,100,100]<|/det|>")
+        return _resp("<|det|>text [0,0,10,10]<|/det|>page one recovered")  # page 1 retry
+
+    a = _adapter(post=fake_post)
+    pages = a.recognize_pages([PageSpec("p1.png", 1000, 1000, 5),
+                               PageSpec("p2.png", 1000, 1000, 6)])
+    assert len(calls) == 3
+    assert pages[0].blocks[0].kind == "text"
+    assert pages[0].blocks[0].text == "page one recovered"
+    assert pages[1].blocks[0].text == "page two"
+
+
+def test_cache_fingerprint_includes_batch_knobs():
+    fp = _adapter().cache_fingerprint()
+    assert fp["batch_enabled"] is True
+    assert fp["batch_max_pages"] == 12
+    fp2 = _adapter(batch_enabled=False, max_batch_pages=0).cache_fingerprint()
+    assert fp2["batch_enabled"] is False and fp2["batch_max_pages"] == 0
+    assert fp != fp2

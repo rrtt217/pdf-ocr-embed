@@ -51,6 +51,8 @@ _FILE_KEYS = (
     "tessdata_dir", "tess_cmd",
     # generic_openai adapter knob
     "generic_prompt",
+    # unlimited adapter document-level (multi-page) parsing knobs
+    "unlimited_batch_enabled", "unlimited_max_pages_per_batch",
     # HTTP adapter retry / rate-limit knobs (see backend/sources/http_utils.py):
     # shared by unlimited_ocr & generic_openai; do NOT affect OCR output.
     "max_retries", "retry_base_delay", "retry_max_delay", "rate_limit_rps",
@@ -94,6 +96,8 @@ _ENV_ALIASES = {
     "OCR_TESSDATA_DIR": "tessdata_dir",
     "OCR_TESS_CMD": "tess_cmd",
     "OCR_GENERIC_PROMPT": "generic_prompt",
+    "OCR_UNLIMITED_BATCH_ENABLED": "unlimited_batch_enabled",
+    "OCR_UNLIMITED_MAX_PAGES_PER_BATCH": "unlimited_max_pages_per_batch",
     "OCR_MAX_RETRIES": "max_retries",
     "OCR_RETRY_BASE_DELAY": "retry_base_delay",
     "OCR_RETRY_MAX_DELAY": "retry_max_delay",

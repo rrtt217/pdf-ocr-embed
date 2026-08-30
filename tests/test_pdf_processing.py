@@ -7,8 +7,9 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 from backend.models import OcrBlock, OcrPage
-from backend.pdf_processing import (_recompress_image, embed_invisible_text,
-                                    optimize_images)
+from backend.pdf_processing import (_recompress_image, _visual_to_user,
+                                    embed_invisible_text, optimize_images,
+                                    render_overlay)
 
 
 def _gradient_pixmap(size=256, alpha=False):
@@ -151,3 +152,95 @@ def test_embed_writes_image_captions_into_text_layer():
             text = final[0].get_text()
         assert "hello searchable" in text
         assert "Fig. 1 示例" in text
+
+
+# ---------------------------------------------------------------------------
+# Page-rotation aware embedding: /Rotate 180 scanned books embedded text
+# upside-down before _visual_to_user was introduced.
+# ---------------------------------------------------------------------------
+
+def _rotated_pdf(tmp_path, rotation=180):
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.set_rotation(rotation)
+    out = tmp_path / f"rot{rotation}.pdf"
+    doc.save(str(out), garbage=4, deflate=True)
+    doc.close()
+    return out
+
+
+def test_visual_to_user_identity_for_rotation_0(tmp_path):
+    src = _rotated_pdf(tmp_path, rotation=0)
+    with fitz.open(str(src)) as doc:
+        p = fitz.Point(10, 20)
+        assert _visual_to_user(p, doc[0]) == p
+
+
+def test_visual_to_user_flips_180(tmp_path):
+    src = _rotated_pdf(tmp_path, rotation=180)
+    with fitz.open(str(src)) as doc:
+        page = doc[0]
+        mapped = _visual_to_user(fitz.Point(10, 20), page)
+        assert abs(mapped.x - (400 - 10)) < 1e-6
+        assert abs(mapped.y - (400 - 20)) < 1e-6
+
+
+def test_embed_respects_page_rotation_180(tmp_path):
+    """On a rotation=180 page, a top-left OCR block must display back at the
+    top-left: map the extracted word's user-space center through the page's
+    rotation matrix and it must land inside the block's visual bbox (with
+    font/leading slack).  Exact user-space coordinates are NOT asserted —
+    the glyph pre-rotation (morph) legitimately shifts them."""
+    src = _rotated_pdf(tmp_path, rotation=180)
+    page = OcrPage(page_index=0, width=400, height=400, blocks=[
+        OcrBlock(kind="text", bbox=[10, 10, 200, 30], text="rotated hello")])
+    out, _thumb, _stats = embed_invisible_text(str(src), [page], tmp_path)
+    with fitz.open(str(out)) as final:
+        words = final[0].get_text("words")
+        assert words, "embedded text missing on rotated page"
+        x0, y0, x1, y1, *_ = words[0]
+        ux, uy = (x0 + x1) / 2, (y0 + y1) / 2
+        vis = fitz.Point(ux, uy) * final[0].rotation_matrix  # user -> visual
+        # visual bbox of the block is [10,10,200,30]; text ink sits inside
+        # with some centering/baseline slack.
+        assert 10 - 30 <= vis.x <= 200 + 30
+        assert 0 <= vis.y <= 60
+        assert final[0].rotation == 180
+
+
+def _overlay_png(tmp_path, rotation, text="Rotated Text 123"):
+    """render_overlay output for one OCR block on a rotated (or not) page.
+
+    Every page is 400x400 pt and the OcrPage is 800x800 px, so overlay Zoom 2
+    produces an 800x800 render for every rotation — the ONLY variable is the
+    page's /Rotate and the rotation-aware embedding.
+    """
+    src = _rotated_pdf(tmp_path, rotation)
+    ocr = OcrPage(page_index=0, width=800, height=800, blocks=[
+        OcrBlock(kind="text", bbox=[40, 60, 760, 110], text=text)])
+    ov = render_overlay(str(src), [ocr], 0, out_dir=tmp_path, for_page=0)
+    from PIL import Image as _Im
+    return _Im.open(str(ov)).convert("L")
+
+
+def _pixel_diff(a, b):
+    from PIL import ImageChops
+    if a.size != b.size:
+        a = a.resize(b.size)
+    diff = ImageChops.difference(a.convert("L"), b.convert("L"))
+    h = diff.histogram()
+    return sum(h[64:]) / (a.size[0] * a.size[1])
+
+
+def test_overlay_pixels_match_rotation_0_across_rotations(tmp_path):
+    """The gold standard for the rotation fix: a block embedded on a
+    rotated page must render IDENTICALLY to the same block on a rotation=0
+    page.  rotation=180 (the real-world scanned-book case) must be pixel-
+    exact; 90/270 are exotic and differ only by glyph anti-aliasing at
+    sub-pixel level (same position, ~1% of pixels)."""
+    base = _overlay_png(tmp_path, 0)
+    d180 = _pixel_diff(base, _overlay_png(tmp_path, 180))
+    assert d180 < 0.001, f"rotation=180: {d180:.6f} pixel diff vs rotation=0"
+    for rot in (90, 270):
+        d = _pixel_diff(base, _overlay_png(tmp_path, rot))
+        assert d < 0.02, f"rotation={rot}: {d:.4f} pixel diff vs rotation=0 "

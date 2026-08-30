@@ -131,3 +131,43 @@ def test_snapshot_keys_exclude_runtime_objects():
     snap = ocr_service._snapshot(job)
     assert 'cancel_event' not in snap
     assert snap['id'] == 'x' and snap['status'] == 'done'
+
+
+def test_batched_pages_split_on_request_failure(monkeypatch, tmp_path):
+    """A failing multi-page request (e.g. a read timeout) is split in half
+    and retried; only single pages that still fail are marked failed."""
+    import threading
+    from collections import deque
+    from backend.models import OcrBlock, OcrPage as OP
+
+    _use_tmp_dirs(monkeypatch, tmp_path)
+
+    class _FakeAdapter:
+        max_batch_pages = 4
+        def __init__(self):
+            self.calls = 0
+        def recognize_pages(self, specs):
+            self.calls += 1
+            if len(specs) > 1:
+                raise RuntimeError("simulated batch timeout")
+            s = specs[0]
+            return [OP(page_index=s.page_index, width=s.width, height=s.height,
+                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
+                                        text=f"p{s.page_index}")])]
+
+    adapter = _FakeAdapter()
+    job = {"id": "split-j", "current": 0, "pages": [],
+           "status": "running", "adapter": "unlimited",
+           "img_dir": str(tmp_path / "work" / "split-j"),
+           "num_pages": 3, "error": None}
+    ocr_service._JOBS[job["id"]] = job
+    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
+    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
+             for i in range(3)]
+    ocr_service._ocr_pages_batched(
+        job, job["id"], adapter, specs, 3, threading.Event(), None)
+    assert adapter.calls >= 5  # 3+2 then three singles
+    assert all(job["pages"][i] is not None for i in range(3))
+    assert job["pages"][0]["blocks"][0]["text"] == "p0"
+    assert job["pages"][2]["blocks"][0]["text"] == "p2"
+    assert job["current"] == 3

@@ -59,3 +59,23 @@ def test_empty_string_falls_back_to_preset(monkeypatch):
     cfg = config.resolve()
     assert cfg["base_url"] == "https://api.llm.ustc.edu.cn/v1"
     assert cfg["model"] == "unlimited-ocr"
+
+
+def test_unlimited_batch_keys_resolve_from_file(monkeypatch, tmp_path):
+    cfg_file = tmp_path / "ocr_config.toml"
+    cfg_file.write_text(
+        'unlimited_batch_enabled = "false"\n'
+        'unlimited_max_pages_per_batch = "5"\n',
+        encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
+    cfg = config.resolve()
+    assert cfg["unlimited_batch_enabled"] == "false"
+    assert cfg["unlimited_max_pages_per_batch"] == "5"
+
+
+def test_unlimited_batch_env_aliases(monkeypatch):
+    monkeypatch.setenv("OCR_UNLIMITED_BATCH_ENABLED", "false")
+    monkeypatch.setenv("OCR_UNLIMITED_MAX_PAGES_PER_BATCH", "3")
+    cfg = config.resolve()
+    assert cfg["unlimited_batch_enabled"] == "false"
+    assert cfg["unlimited_max_pages_per_batch"] == "3"

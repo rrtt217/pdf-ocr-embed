@@ -715,10 +715,98 @@ def _recognize_page(job, adapter, spec, fingerprint=None):
 
 def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel,
                           fingerprint=None):
+    """OCR pages in document order (single-path or document-level batches).
+
+    When the adapter supports document-level parsing (``max_batch_pages > 0``)
+    the pages go through ``recognize_pages`` in chunks of that size — one
+    HTTP request per chunk instead of one per page.  Otherwise the classic
+    one-request-per-page loop is used unchanged.
+    """
+    if adapter.max_batch_pages > 0 and len(page_specs) > 1:
+        _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
+                           fingerprint)
+        return
     for spec in page_specs:
         if cancel.is_set():
             return
         _ocr_one_page_and_report(job, job_id, adapter, spec, num, fingerprint)
+
+
+def _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
+                       fingerprint=None):
+    """OCR pages in document-level batches (one multi-page request per chunk).
+
+    Chunks follow ``adapter.max_batch_pages`` so cancellation is checked
+    between requests.  A chunk whose request failed outright (e.g. a read
+    timeout on a long generation) is split in half and retried recursively —
+    a dense chunk may simply be too big for one HTTP call, and a smaller one
+    completes in time.  A single page that still fails is marked failed
+    (error_page event) and the remaining chunks still run — the retry flow
+    later fills the gaps.  Mirrors the parallel path's error semantics.
+    """
+    from backend.sources.base import PageSpec
+
+    errors: Dict[int, str] = {}
+
+    def run_group(start_idx: int, specs: List[dict]) -> None:
+        if cancel.is_set():
+            return
+        group_specs = [PageSpec(image_path=s["img_path"], width=s["w"],
+                                height=s["h"], page_index=s["page_index"])
+                       for s in specs]
+        first, last = group_specs[0].page_index, group_specs[-1].page_index
+        log.info("job %s: OCR pages %d..%d as one multi-page request",
+                 job_id, first + 1, last + 1)
+        try:
+            pages = adapter.recognize_pages(group_specs)
+        except Exception as exc:  # noqa: BLE001
+            if cancel.is_set():
+                return
+            message = redact_secrets(str(exc))
+            if len(group_specs) > 1:
+                # Try smaller halves before giving up on any page.
+                log.warning("job %s: batch pages %d..%d failed (%s); splitting",
+                            job_id, first + 1, last + 1, message)
+                mid = len(group_specs) // 2
+                run_group(0, specs[:mid])
+                run_group(0, specs[mid:])
+                return
+            log.warning("job %s: page %d failed: %s",
+                        job_id, first + 1, message)
+            for gs in group_specs:
+                errors[gs.page_index] = message
+                push_event(job_id, {"type": "error_page",
+                                    "page_index": gs.page_index,
+                                    "message": message})
+            return
+        for spec, page in zip(group_specs, pages):
+            if cancel.is_set():
+                return
+            # Same per-page cache semantics as _recognize_page: a re-upload
+            # of the same PDF must hit the cache without re-OCR.
+            if fingerprint is not None:
+                ocr_cache.put_page(
+                    _page_cache_key(job, fingerprint, spec.page_index),
+                    page_to_dict(page))
+            update_page(job_id, spec.page_index, page_to_dict(page))
+            _bump_progress(job, job_id, num)
+
+    chunk_size = max(1, int(adapter.max_batch_pages or 1))
+    for start in range(0, len(page_specs), chunk_size):
+        if cancel.is_set():
+            return
+        run_group(0, page_specs[start:start + chunk_size])
+
+    if errors and len(errors) == len(page_specs):
+        failed = ", ".join(f"#{i + 1}" for i in sorted(errors))
+        raise RuntimeError(
+            f"OCR failed on all {len(errors)} attempted page(s): {failed}. "
+            f"Example error: {next(iter(errors.values()))}")
+    if errors:
+        failed_pages = ", ".join(f"#{i + 1}" for i in sorted(errors))
+        push_event(job_id, {"type": "warning",
+                            "message": f"{len(errors)} page(s) failed: "
+                                       f"{failed_pages}. Retry to fill them."})
 
 
 def _ocr_one_page_and_report(job, job_id, adapter, spec, num,

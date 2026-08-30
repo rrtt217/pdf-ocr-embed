@@ -3,6 +3,21 @@
 Parses the `<|det|>type [x1,y1,x2,y2]<|/det|>content` marker format, maps the
 1000x1000 normalized canvas bboxes back to real pixel coordinates using the page
 image width/height, and returns a normalized OcrPage.
+
+Document-level parsing: the model's headline feature (constant-KV decoder,
+"Multi page parsing." prompt) is used through ``recognize_pages`` — several
+page images go into ONE request and the response's `<PAGE>`-separated chunks
+are split back into per-page OcrPages, each normalized against its own page
+image (the model re-normalizes every image to its own 1000x1000 canvas).
+A truncated response is split in half and re-requested recursively; an
+incomplete response (the hosted vLLM endpoint occasionally stops after the
+first page) is retried once, then split the same way.
+
+Known endpoint quirk (observed 2026-06 on api.llm.ustc.edu.cn/v1, vLLM 0.22.1):
+the model sometimes returns finish_reason=stop with exactly one completion
+token and empty content for pages that do contain text — the same shape a
+genuinely blank page produces.  ``recognize_pixels`` retries that shape once;
+a still-empty result is kept as a blank page.
 """
 from __future__ import annotations
 
@@ -14,14 +29,24 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from backend.config import resolve
+from backend.config import as_bool, resolve
 from backend.models import OcrBlock, OcrPage
-from backend.sources.base import OcrSource, normalize_bbox
+from backend.sources.base import OcrSource, PageSpec, normalize_bbox
 from backend.sources.http_utils import RateLimiter, post_json_with_retry
 
 log = logging.getLogger(__name__)
 
 _LATEX_CONV = None
+
+
+class _IncompleteBatch(RuntimeError):
+    """A multi-page response that did not cover every requested page.
+
+    The hosted vLLM endpoint occasionally stops after the first page
+    (finish_reason=stop with fewer <PAGE> chunks than input images).  This is
+    distinct from token-limit truncation: a same-size retry may succeed, so
+    ``_recognize_batch`` retries once before splitting the batch.
+    """
 
 
 def _get_latex_conv():
@@ -172,13 +197,26 @@ class UnlimitedOcrAdapter(OcrSource):
     # Bump this whenever the raw-output -> OcrPage mapping changes: otherwise
     # a pre-change cached OcrPage keeps serving stale block content that the
     # new parser would have handled differently.
-    PARSE_VERSION = 3
+    PARSE_VERSION = 4
 
     # The model natively knows how to format output with <|det|> markers.
     # Per HuggingFace docs the prompt is just "document parsing." for single
     # image, "Multi page parsing." for multi-image.  No system prompt needed.
     SINGLE_PROMPT = "document parsing."
     MULTI_PROMPT = "Multi page parsing."
+
+    # Default chunk size for document-level parsing when the config leaves
+    # unlimited_max_pages_per_batch at 0 (auto).  Output runs ~1.5-2.5k tokens
+    # per dense page (measured on the live endpoint), so ~12 pages fit a 32K
+    # request; truncation-splitting covers denser pages.
+    DEFAULT_BATCH_PAGES = 12
+
+    # HTTP read timeout scales with the token budget: the hosted endpoint
+    # decodes at ~10-15 tok/s, so a full max_tokens generation needs
+    # minutes, and a multi-page batch more still.  Per-token seconds assume a
+    # conservative ~12 tok/s upper bound on generation wall time.
+    READ_TIMEOUT_MIN = 900.0
+    READ_TIMEOUT_PER_TOKEN = 0.08
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None,
                  model: str | None = None, max_tokens: int | None = None):
@@ -189,6 +227,15 @@ class UnlimitedOcrAdapter(OcrSource):
         self.model = model or cfg.get("model") or "unlimited-ocr"
         # Hard backend invariant: max_tokens must stay < 32768.
         self.max_tokens = min(int(max_tokens or 16384), 32767)
+        # Document-level (multi-page) parsing.  Output-affecting, so both
+        # settings live in cache_fingerprint().
+        self.batch_enabled = as_bool(cfg.get("unlimited_batch_enabled", "true"))
+        raw_batch = cfg.get("unlimited_max_pages_per_batch")
+        if self.batch_enabled:
+            self.max_batch_pages = (max(0, int(raw_batch)) if raw_batch is not None
+                                    else self.DEFAULT_BATCH_PAGES)
+        else:
+            self.max_batch_pages = 0
         # HTTP retry / rate-limit knobs (shared HTTP-adapter settings, see
         # backend/sources/http_utils.py).  These do NOT affect OCR output, so
         # they are intentionally absent from cache_fingerprint().
@@ -209,7 +256,9 @@ class UnlimitedOcrAdapter(OcrSource):
 
         Retry / rate-limit knobs are deliberately NOT included: they change
         call behavior but never the OCR output, so they must not alter the
-        result-cache key.
+        result-cache key.  Batch knobs ARE included: document-level parsing
+        uses a different prompt and cross-page context, so its per-page
+        output legitimately differs from single-page runs.
         """
         import hashlib
         return {
@@ -218,6 +267,8 @@ class UnlimitedOcrAdapter(OcrSource):
             "model": self.model,
             "parser_version": self.PARSE_VERSION,
             "max_tokens": self.max_tokens,
+            "batch_enabled": self.batch_enabled,
+            "batch_max_pages": self.max_batch_pages,
             "api_key_sha": hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
             if self.api_key else "",
         }
@@ -235,8 +286,16 @@ class UnlimitedOcrAdapter(OcrSource):
         url = self._chat_url()
         log.debug("POST %s model=%s", url, payload.get("model"))
         t0 = time.time()
-        # All responses stream as a single line; pass a generous read timeout.
-        with httpx.Client(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        # Read timeout must cover a full generation up to max_tokens on the
+        # hosted endpoint (~10-15 tok/s), and multi-page batches grow the
+        # required wall time in proportion.  A batch of dense book pages can
+        # legitimately take 10+ minutes — timing out (then retrying into the
+        # same timeout) fails the page set outright.  Scale generously with
+        # the token budget; request failure degrades via the batch splitter.
+        read_timeout = max(self.READ_TIMEOUT_MIN,
+                           self.max_tokens * self.READ_TIMEOUT_PER_TOKEN)
+        with httpx.Client(timeout=httpx.Timeout(read_timeout,
+                                                connect=30.0)) as client:
             resp = post_json_with_retry(
                 client, url, json=payload, headers=headers,
                 max_retries=self.max_retries,
@@ -255,8 +314,55 @@ class UnlimitedOcrAdapter(OcrSource):
 
     def recognize_pixels(self, image_path: str, width: int, height: int,
                          page_index: int) -> OcrPage:
+        """Single-page OCR with one retry on degenerate results.
+
+        The hosted endpoint intermittently returns degenerate output for
+        pages that DO contain text: a 1-token empty response, or a lone
+        whole-page image marker (the page "seen" as a pure figure — this is
+        what shows up as a page with only one ``<image>`` block in the
+        editor).  Either shape is retried once; a still-degenerate result
+        keeps its natural semantics (blank page, or a genuine figure page
+        that truly is an image).
+        """
+        page: OcrPage = OcrPage(page_index=page_index, width=width,
+                                height=height, blocks=[])
+        for attempt in range(2):
+            raw = self._post(self._single_payload(image_path))
+            # A truncated response silently drops the tail of the page (the
+            # last <|det|> markers never arrive) — that must be a page
+            # *failure*, not a silently-partial success.
+            self._assert_not_truncated(raw, self.max_tokens, page_index)
+            text = self._extract_content(raw)
+            candidate = self.parse_response(text, width, height, page_index)
+            if not self._looks_degenerate(candidate) or attempt == 1:
+                page = candidate
+                break
+            log.warning("page %d: OCR result looks degenerate (no text, %d "
+                        "block(s)); retrying once", page_index,
+                        len(candidate.blocks))
+        if not page.blocks:
+            # Genuinely blank page (or a page the model kept judging blank).
+            # Valid empty result — validation flags it via empty_source, and
+            # a force re-run re-recognizes it.
+            log.warning("page %d: empty OCR result (blank page?)", page_index)
+        return page
+
+    @staticmethod
+    def _looks_degenerate(page: OcrPage) -> bool:
+        """True when a page has no searchable text at all.
+
+        Covers genuinely blank pages (no blocks) and pure-figure pages (a
+        lone image marker) — the intermittent shapes the hosted endpoint
+        returns for pages that actually contain text.  Any text or caption
+        block means the page was read and is not retried.
+        """
+        return not any(b.text.strip() or b.caption.strip()
+                       for b in page.blocks)
+
+    def _single_payload(self, image_path: str) -> Dict[str, Any]:
+        """Build the single-image payload ("document parsing.")."""
         b64 = self._encode_image(image_path)
-        payload: Dict[str, Any] = {
+        return {
             "model": self.model,
             "max_tokens": self.max_tokens,  # must stay < 32768
             "temperature": 0.0,
@@ -277,20 +383,137 @@ class UnlimitedOcrAdapter(OcrSource):
                 },
             ],
         }
-        raw = self._post(payload)
-        # A truncated response silently drops the tail of the page (the last
-        # <|det|> markers never arrive) — that must be a page *failure*, not a
-        # silently-partial success, so the retry flow re-runs it.
-        self._assert_not_truncated(raw, self.max_tokens, page_index)
-        text = self._extract_content(raw)
-        log.debug("page %d: OCR returned %d chars", page_index, len(text))
+
+    def recognize_pages(self, specs: List[PageSpec]) -> List[OcrPage]:
+        """Document-level parsing: all specs in ONE request, <PAGE>-split.
+
+        Falls back to per-page calls when batching is disabled or a single
+        page is requested (single-page requests keep using the well-tested
+        "document parsing." path).  Batches are atomic: a failure raises and
+        the caller marks every page of the group failed for the retry flow.
+        """
+        if not self.batch_enabled or self.max_batch_pages <= 0 or len(specs) <= 1:
+            return super().recognize_pages(specs)
+        results: Dict[int, OcrPage] = {}
+        self._recognize_batch(specs, results)
+        return [results[s.page_index] for s in specs]
+
+    def _recognize_batch(self, specs: List[PageSpec],
+                         results: Dict[int, OcrPage]) -> None:
+        """One "Multi page parsing." request for ``specs`` (atomic).
+
+        Failure recovery, in order of increasing cost:
+          1. Truncated response (finish_reason=length) -> split in half and
+             re-request each half recursively (truncation is deterministic,
+             so a retry of the same batch would truncate again).
+          2. Incomplete response (fewer <PAGE> chunks than pages — the model
+             occasionally stops after the first page on the hosted vLLM
+             endpoint) -> retry the batch once, then split recursively.
+          3. A single page that still truncates/incomplete raises, matching
+             the single-page path's semantics so the retry flow re-runs it.
+
+        Splits bottom out at single pages, which go through
+        ``recognize_pixels`` (the well-tested per-page path).
+        """
+        if len(specs) == 1:
+            spec = specs[0]
+            results[spec.page_index] = self.recognize_pixels(
+                spec.image_path, spec.width, spec.height, spec.page_index)
+            return
+
+        first, last = specs[0].page_index, specs[-1].page_index
+        for attempt in range(2):  # one retry for transient early-stops
+            raw = self._post(self._batch_payload(specs))
+            try:
+                self._assert_not_truncated(raw, self.max_tokens, first)
+                text = self._extract_content(raw)
+                chunks = self._split_multipage(text, len(specs))
+                break  # success
+            except _IncompleteBatch:
+                reason = "incomplete (model stopped early)"
+                if attempt == 0:
+                    log.warning("multi-page batch pages %d..%d %s; "
+                                "retrying once", first + 1, last + 1, reason)
+                    continue
+            except RuntimeError:
+                reason = "truncated"
+            log.warning("multi-page batch pages %d..%d %s; splitting into "
+                        "halves", first + 1, last + 1, reason)
+            mid = len(specs) // 2
+            self._recognize_batch(specs[:mid], results)
+            self._recognize_batch(specs[mid:], results)
+            return
+        # Success: one chunk per spec, in input order.
+        for spec, chunk in zip(specs, chunks):
+            page = self.parse_response(chunk, spec.width, spec.height,
+                                       spec.page_index)
+            if self._looks_degenerate(page):
+                # The model sometimes "sees" a page inside a batch as a pure
+                # figure (lone image marker).  Re-OCR that page through the
+                # single-page path, which has its own degenerate-retry, so the
+                # editor does not end up with a bogus image-only page.
+                log.warning("page %d: multi-page chunk looks degenerate "
+                            "(no text); re-OCR as single page",
+                            spec.page_index + 1)
+                page = self.recognize_pixels(spec.image_path, spec.width,
+                                             spec.height, spec.page_index)
+            results[spec.page_index] = page
+        log.debug("multi-page batch pages %d..%d: %d chunk(s) parsed",
+                  first + 1, last + 1, len(chunks))
+
+    def _batch_payload(self, specs: List[PageSpec]) -> Dict[str, Any]:
+        """Build the OpenAI-compatible multi-image payload (SGLang layout:
+        prompt text first, then one image_url part per page, in page order).
+
+        Image order maps 1:1 to the response's <PAGE> chunk order — verified
+        against the live endpoint.  No <image> placeholder is needed on this
+        endpoint (both layouts work; the plain one is cleaner).
+        """
+        content: List[Dict[str, Any]] = [
+            {"type": "text", "text": self.MULTI_PROMPT},
+        ]
+        for spec in specs:
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,"
+                           + self._encode_image(spec.image_path),
+                },
+            })
+        return {
+            "model": self.model,
+            "max_tokens": self.max_tokens,  # must stay < 32768
+            "temperature": 0.0,
+            "skip_special_tokens": False,
+            "messages": [{"role": "user", "content": content}],
+        }
+
+    @staticmethod
+    def _split_multipage(text: str, expected: int) -> List[str]:
+        """Split a "Multi page parsing." response into per-page chunks.
+
+        The model emits one ``<PAGE>``-prefixed chunk per input image, in
+        input order (verified against the live endpoint).  Splitting on the
+        ``<PAGE>`` special token and dropping the leading separator (a page
+        whose chunk is empty — a blank page — keeps its empty string so
+        alignment never shifts).  A chunk count that does not match the
+        requested page count is a hard failure: silently mis-assigning pages
+        would corrupt the text layer, so the retry flow re-runs the batch.
+        """
         if not text:
-            # Likely a blank page (finish_reason=stop + no content).  Kept as a
-            # valid empty result — validation flags it via empty_source, and a
-            # force re-run re-recognizes it.
-            log.warning("page %d: empty OCR response (blank page?), usage=%s",
-                        page_index, raw.get("usage"))
-        return self.parse_response(text, width, height, page_index)
+            return [""] * expected
+        parts = text.split("<PAGE>")
+        # Leading separator (always emitted) -> drop one empty prefix.
+        if parts and not parts[0].strip():
+            parts = parts[1:]
+        # Tolerate a trailing separator from future model versions.
+        if parts and not parts[-1].strip():
+            parts = parts[:-1]
+        if len(parts) != expected:
+            raise _IncompleteBatch(
+                f"multi-page parse mismatch: expected {expected} page "
+                f"chunk(s), got {len(parts)}. Re-run this batch.")
+        return parts
 
     @staticmethod
     def _extract_content(raw: dict) -> str:

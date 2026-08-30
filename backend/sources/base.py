@@ -7,15 +7,32 @@ bbox is expressed in original pixel space.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from backend.models import OcrPage
+
+
+@dataclass
+class PageSpec:
+    """One page's OCR input, as produced by the job's pre-render phase."""
+
+    image_path: str
+    width: int
+    height: int
+    page_index: int
 
 
 class OcrSource(ABC):
     """Base class for all OCR engine adapters."""
 
     name: str = "base"
+
+    # Engines whose output is independent per page default to one
+    # recognize_pixels call per page.  Engines with native document-level
+    # parsing (e.g. unlimited) set this to a positive page count so the job
+    # layer can chunk pages and call recognize_pages() per chunk.
+    max_batch_pages: int = 0
 
     @abstractmethod
     def recognize_pixels(
@@ -37,6 +54,29 @@ class OcrSource(ABC):
             OcrPage with blocks in original pixel coordinates.
         """
         raise NotImplementedError
+
+    def recognize_pages(self, specs: List[PageSpec]) -> List[OcrPage]:
+        """Run OCR on several pages, returning one OcrPage per spec in order.
+
+        The default implementation is the correct-but-slow fallback: one
+        recognize_pixels call per page.  Engines that natively parse whole
+        documents (unlimited's "Multi page parsing.") override this to send
+        all specs in a single request and split the response per page.
+
+        Args:
+            specs: Page inputs; the caller chunks by ``max_batch_pages``.
+
+        Returns:
+            One OcrPage per spec, in the same order.
+
+        Raises:
+            RuntimeError: When any page in the group failed; the caller marks
+                every page of the group failed and retries them later.
+        """
+        return [
+            self.recognize_pixels(s.image_path, s.width, s.height, s.page_index)
+            for s in specs
+        ]
 
     def close(self) -> None:
         """Release any adapter-held resources."""

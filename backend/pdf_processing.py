@@ -477,13 +477,21 @@ def _insert_block(page: fitz.Page, block: OcrBlock, rect: fitz.Rect,
     layout = _compute_block_layout(block, page, w_scale, h_scale,
                                    font_scale=block.font_scale)
     _page_font_name(page)  # ensure font resource is present if active
+    _user_m, morph = _visual_transform(page)
     for x, y_base, line, fontsize, fontname in layout["lines"]:
         if not line:
             continue
+        # Layout is computed in visual space (== OCR pixel space scaled);
+        # hand the point to insert_text in page user space, honouring the
+        # page's /Rotate (identity for rotation=0).  On rotated pages the
+        # morph pre-rotates the glyphs so they read upright once the page's
+        # /Rotate is applied on display.
+        pt = _visual_to_user(fitz.Point(x, y_base), page)
+        kwargs = {"morph": (pt, morph)} if morph is not None else {}
         page.insert_text(
-            fitz.Point(x, y_base), line,
+            pt, line,
             fontsize=fontsize, fontname=fontname,
-            render_mode=3, overlay=True,
+            render_mode=3, overlay=True, **kwargs,
         )
 
 
@@ -622,16 +630,19 @@ def render_overlay(pdf_bytes_path: str, pages: List[OcrPage],
         h_scale = rect.height / page_cfg.height if page_cfg.height else 1.0
 
         out_file = out_dir / f"overlay_{target:04d}.png"
+        _user_m, morph = _visual_transform(page)
         for block in _text_blocks_to_place(page_cfg.blocks):
             layout = _compute_block_layout(block, page, w_scale, h_scale,
                                            font_scale=block.font_scale)
             for x, y_base, line, fontsize, fontname in layout["lines"]:
                 if not line:
                     continue
+                pt = _visual_to_user(fitz.Point(x, y_base), page)
+                kwargs = {"morph": (pt, morph)} if morph is not None else {}
                 page.insert_text(
-                    fitz.Point(x, y_base), line,
+                    pt, line,
                     fontsize=fontsize, fontname=fontname,
-                    render_mode=0, overlay=True, color=(0.9, 0.1, 0.1),
+                    render_mode=0, overlay=True, color=(0.9, 0.1, 0.1), **kwargs,
                 )
         pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
         pix.save(str(out_file))
@@ -841,17 +852,71 @@ def _pixel_rect_to_pdf(bbox, page: fitz.Page, w_scale: float,
 
 def _pixel_point_to_pdf(pt, page: fitz.Page, w_scale: float,
                         h_scale: float) -> fitz.Point:
-    """Map a pixel-space point to PyMuPDF page coordinates.
+    """Map a pixel-space point to the page's *visual* point space.
 
-    PyMuPDF's coordinate system (used by insert_text, get_text, page.rect,
-    etc.) has its origin at the TOP-LEFT with y increasing downward — exactly
-    the same convention as image pixel space.  So we only need to scale, NOT
-    flip the y-axis.  (Flipping is only needed for raw PDF operators, which
-    we don't use directly.)
+    PyMuPDF's visual coordinate system (what the user sees once the page's
+    /Rotate is applied) has its origin at the TOP-LEFT with y increasing
+    downward — exactly the same convention as image pixel space.  So we only
+    need to scale, NOT flip the y-axis.  (Flipping is only needed for raw PDF
+    operators, which we don't use directly.)
+
+    The result is in the page's VISUAL space; callers that hand coordinates to
+    ``page.insert_text`` must additionally pass them through
+    ``_visual_to_user()`` unless ``page.rotation == 0``.
     """
     x = pt[0] * w_scale
     y = pt[1] * h_scale
     return fitz.Point(x, y)
+
+
+def _visual_transform(page: fitz.Page) -> "tuple[fitz.Matrix, fitz.Matrix | None]":
+    """Return (user_transform, morph_matrix) for a page's /Rotate.
+
+    ``insert_text`` draws into the page's *unrotated* user space and the
+    viewer then applies the page's /Rotate to ALL page content — so to make
+    text display upright and at the right place on a rotated page we must
+    pre-compensate in user space:
+
+      * position: a visual-space point v must be handed to insert_text as
+        ``v * ~rotation_matrix`` (for 180°: the (W-x, H-y) flip), because the
+        display rotation maps the user-space point back to v.
+      * orientation: glyphs must be pre-rotated by the *linear part* of
+        ``~rotation_matrix`` so the display rotation restores upright
+        reading (for 180°: mirror-glyph-in-place).  This is passed to
+        ``insert_text(..., morph=(point, matrix))``; identity for rotation=0.
+
+    Returns ``(identity, None)`` for rotation=0 pages.
+    """
+    rm = page.rotation_matrix
+    if not page.rotation:
+        # fitz.Matrix() with no args is the ZERO matrix — identity must be
+        # spelled out.
+        return fitz.Matrix(1, 0, 0, 1, 0, 0), None
+    inv = ~rm
+    # Pure linear part of the inverse page rotation (rotation about the
+    # insertion point, so the translation component is dropped).
+    morph = fitz.Matrix(inv.a, inv.b, inv.c, inv.d, 0, 0)
+    return inv, morph
+
+
+def _visual_to_user(pt: fitz.Point, page: fitz.Page) -> fitz.Point:
+    """Map a point from the page's visual space into the page's user space.
+
+    ``page.insert_text`` expects coordinates in the page's *unrotated* user
+    space, while the OCR bboxes live in the visual space of the rendered page
+    image (PyMuPDF's ``get_pixmap`` applies each page's /Rotate, so a
+    rotation=180 scanned page renders upright and OCR sees upright pixels).
+    For rotation=0 the two spaces coincide and this is a no-op.  For
+    rotation=180 (very common in scanned books) it is an (W - x, H - y) flip,
+    so the block lands back at its visual position once the page's /Rotate is
+    applied on display.
+
+    Note this only fixes POSITION — callers must ALSO pass the matrix from
+    ``_visual_transform`` as ``insert_text(..., morph=...)`` so the glyphs
+    themselves read upright (otherwise they remain 180°-rotated on display).
+    """
+    inv, _morph = _visual_transform(page)
+    return pt * inv
 
 
 def _recompress_image(data, mode, quality, downscale=None):
