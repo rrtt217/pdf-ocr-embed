@@ -146,5 +146,21 @@
 - 后端统一走 OcrSource 抽象，不能只写死 Unlimited-OCR。
 - 不引入 CUDA / NVIDIA 依赖（部署节点无 NVIDIA GPU）。
 
+## 路线图
+
+当前阶段：**修复现存小 Bug，打磨稳定性**。大量基础功能已落地
+（并行 OCR、批量上传、任务持久化、嵌后校验、CLI、缓存、重试限速等），
+先把它们打磨到稳定，再拓展功能。
+
+1. **第一个稳定版（当前焦点）**：修复已知小 Bug，补齐测试与文档，
+   打 tag 发布 v1.0.0。
+2. **稳定版之后的扩展方向**：让 OCR 的**中间结果**（归一化 `OcrPage` /
+   `OcrBlock`，含块 bbox、kind、置信度）不再只服务于「嵌入隐形文字层」，
+   而是成为可复用的产物，例如：
+   - **还原可编辑 PDF**：按块结构重建原生文字 PDF（真文本而非隐形层）。
+   - **导出 Markdown / LaTeX**：利用 `kind=heading/equation/table` 与阅读序，
+     生成结构化文档导出（table→markdown 表格、equation→LaTeX）。
+   - 其他下游用途（纯文本导出、检索索引等）自然受益于同一套中间结果。
+
 ## 交付
-在 /home/david/vibe-arena/pdf-ocr-embed 下写完整个项目 + README。
+项目已完成并持续维护于本仓库（`pdf-ocr-embed`）；文档与测试随功能同步更新。

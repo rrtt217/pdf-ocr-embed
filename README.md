@@ -292,8 +292,7 @@ pdf-ocr-embed/
 ├── config.example.toml
 ├── .gitignore
 ├── AGENTS.md     # 面向 AI 编码代理的项目指南（含如何编写 OCR adapter）
-├── DESIGN.md
-└── FEATURE_IDEAS.md  # 新功能脑暴清单（候选 roadmap，非排期承诺）
+└── DESIGN.md     # 设计文档 + 路线图（先稳定版，后功能扩展）
 ```
 
 ---

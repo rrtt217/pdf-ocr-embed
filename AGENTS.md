@@ -155,9 +155,10 @@ override the TOML/WebUI values — adapters must go through `resolve()`, never
   dataclasses for data; `logging` not `print`. Keep it dependency-light.
 - **Frontend has no build step** — edit `frontend/index.html`, `style.css`,
   `app.js` directly; no bundler to run.
-- **Testing**: there is no test suite yet. When adding logic (especially
-  coordinate mapping and parsing), prefer pure functions and add a test if one
-  exists to extend; otherwise keep parsing in isolated static methods.
+- **Testing**: a pytest suite lives in `tests/` (run `.venv/bin/python -m pytest`).
+  When adding logic (especially coordinate mapping and parsing), prefer pure
+  functions and extend the suite; otherwise keep parsing in isolated static
+  methods.
 - **Vibe-coding notice**: this project was generated largely by AI
   (DeepSeek V4 Flash). Re-verify correctness rather than assuming prior code is
   bug-free; prefer small, reviewable diffs.
