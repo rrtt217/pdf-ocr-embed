@@ -14,7 +14,9 @@ import pytest
 from backend.cli import parse_pages
 
 ROOT = Path(__file__).resolve().parents[1]
-VENV_PY = "/home/david/vibe-arena/pdf-ocr-embed/.venv/bin/python"
+# Interpreter running the tests (the venv python when run inside .venv) —
+# never hardcode a machine-specific absolute path here.
+VENV_PY = sys.executable
 
 
 # --- parse_pages -------------------------------------------------------------
