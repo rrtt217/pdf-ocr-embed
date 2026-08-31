@@ -31,7 +31,7 @@ import httpx
 
 from backend.config import as_bool, resolve
 from backend.models import OcrBlock, OcrPage
-from backend.sources.base import OcrSource, PageSpec, normalize_bbox
+from backend.sources.base import OcrSource, PageSpec, UnavailableError, normalize_bbox
 from backend.sources.http_utils import RateLimiter, post_json_with_retry
 
 log = logging.getLogger(__name__)
@@ -119,13 +119,15 @@ def _tidy_ocr_text(text: str) -> str:
     return result.strip()
 
 
-def _latex_to_plain(text: str) -> str:
+def _latex_to_plain(text: str, join_lines: bool = False) -> str:
     """Convert LaTeX math delimiters/commands to readable plain text.
 
     Uses pylatexenc for robust conversion when the text contains real LaTeX
     commands (e.g. ``\\frac``); otherwise the raw content is returned and put
     through the same safe tidy.  Math-spacing tightening is handled separately
-    in ``_clean_math_spacing``.
+    in ``_clean_math_spacing``.  ``join_lines`` collapses every newline (for
+    equation blocks, which are single-line); the default keeps line structure
+    and only collapses blank-line runs.
     """
     if not text or "\\" not in text:
         return _tidy_ocr_text(text)
@@ -137,9 +139,16 @@ def _latex_to_plain(text: str) -> str:
         # recognized content rather than dropping it.
         result = text
 
-    # Display math (\\[ ... \\]) introduces blank lines around itself.
-    lines = [ln.strip() for ln in result.splitlines() if ln.strip()]
-    result = " ".join(lines)
+    if join_lines:
+        # Display math (\\[ ... \\]) introduces blank lines around itself, and
+        # an equation is a single line: join non-blank lines.
+        lines = [ln.strip() for ln in result.splitlines() if ln.strip()]
+        result = " ".join(lines)
+    else:
+        # Keep the line structure: collapse blank-line runs only.  Joining
+        # every line would let a single backslash (LaTeX escapes like \\%,
+        # file paths, ...) flatten a whole paragraph's newlines.
+        result = re.sub(r"\n[ \t]*\n+[ \t]*", "\n", result).strip()
     return _tidy_ocr_text(result)
 
 
@@ -182,12 +191,12 @@ def _normalize_engine_text(kind: str, content: str) -> str:
     if kind == "table":
         return _tidy_ocr_text(_table_html_to_text(content))
     if kind == "equation":
-        return _clean_math_spacing(_latex_to_plain(content))
+        return _clean_math_spacing(_latex_to_plain(content, join_lines=True))
     return _latex_to_plain(content)
 
 
 _MARKER_RE = re.compile(
-    r"<\|det\|>(?P<kind>[a-z_]+)(?:\s*\[(?P<bbox>[0-9,\s]+)\])?<\|/det\|>(?P<content>.*?)(?=<\|det\|>|\Z)",
+    r"<\|det\|>(?P<kind>[a-z_]+)(?:\s*\[(?P<bbox>[-+0-9.,\s]+)\])?<\|/det\|>(?P<content>.*?)(?=<\|det\|>|\Z)",
     re.DOTALL,
 )
 
@@ -197,7 +206,7 @@ class UnlimitedOcrAdapter(OcrSource):
     # Bump this whenever the raw-output -> OcrPage mapping changes: otherwise
     # a pre-change cached OcrPage keeps serving stale block content that the
     # new parser would have handled differently.
-    PARSE_VERSION = 4
+    PARSE_VERSION = 5
 
     # The model natively knows how to format output with <|det|> markers.
     # Per HuggingFace docs the prompt is just "document parsing." for single
@@ -232,8 +241,10 @@ class UnlimitedOcrAdapter(OcrSource):
         self.batch_enabled = as_bool(cfg.get("unlimited_batch_enabled", "true"))
         raw_batch = cfg.get("unlimited_max_pages_per_batch")
         if self.batch_enabled:
-            self.max_batch_pages = (max(0, int(raw_batch)) if raw_batch is not None
-                                    else self.DEFAULT_BATCH_PAGES)
+            # 0 (or absent) = auto default, as documented; batching is
+            # disabled via unlimited_batch_enabled = false instead.
+            pages = max(0, int(raw_batch)) if raw_batch is not None else 0
+            self.max_batch_pages = pages or self.DEFAULT_BATCH_PAGES
         else:
             self.max_batch_pages = 0
         # HTTP retry / rate-limit knobs (shared HTTP-adapter settings, see
@@ -275,7 +286,9 @@ class UnlimitedOcrAdapter(OcrSource):
 
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
-            raise RuntimeError(
+            # Pure setup problem -> UnavailableError (surfaces the friendly
+            # setup message instead of a stack trace, e.g. in the CLI).
+            raise UnavailableError(
                 "No api_key configured. Set `api_key` in backend/ocr_config.toml, "
                 "or fill in the WebUI settings page."
             )
@@ -506,8 +519,13 @@ class UnlimitedOcrAdapter(OcrSource):
         # Leading separator (always emitted) -> drop one empty prefix.
         if parts and not parts[0].strip():
             parts = parts[1:]
-        # Tolerate a trailing separator from future model versions.
-        if parts and not parts[-1].strip():
+        # Tolerate a trailing separator from future model versions — but only
+        # when dropping it is actually needed.  A genuinely blank last page
+        # also produces a trailing empty chunk, and dropping that would misparse
+        # it as an artifact (spurious count mismatch -> wasted re-request and
+        # recursive splitting).  An artifact leaves expected+1 parts; a blank
+        # last page leaves exactly expected.
+        if len(parts) > expected and not parts[-1].strip():
             parts = parts[:-1]
         if len(parts) != expected:
             raise _IncompleteBatch(

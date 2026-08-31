@@ -699,14 +699,6 @@ def _derive_fontsize(lines: list, box_w: float, box_h: float,
     if k <= 0:
         return max(box_h / ink_fraction, 1.0)
 
-    # --- Single logical line ---
-    text = lines[0]
-    # Measure text width at 1pt to get the proportionality constant k
-    # (get_text_length is linear in fontsize for most fonts).
-    k = _text_width(text, 1.0, fontname)
-    if k <= 0:
-        return max(box_h / ink_fraction, 1.0)
-
     fs_h = box_h / ink_fraction            # font size that makes one line's
                                            # ink fill the bbox height
     w_at_h = _text_width(text, fs_h, fontname)

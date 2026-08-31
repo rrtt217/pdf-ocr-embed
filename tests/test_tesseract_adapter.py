@@ -66,3 +66,37 @@ def test_classify():
     assert c("This is a normal body sentence about OCR.", 12,
              [{"height": 12}]) == "text"
     assert c("Title", 50, [{"height": 60}]) == "heading"
+
+
+# ---------------------------------------------------------------------------
+# CLI arg building (tessdata_dir as a flag, not an env mutation)
+# ---------------------------------------------------------------------------
+
+def test_build_config_args_tessdata_dir_flag():
+    a = TesseractAdapter(tessdata_dir="/tmp/custom data", psm=6, oem=1)
+    args = a._build_config_args()
+    assert "--tessdata-dir '/tmp/custom data'" in args  # shlex-quoted
+    assert "--psm 6" in args and "--oem 1" in args
+
+
+def test_build_config_args_user_config_overrides_structured_knobs():
+    a = TesseractAdapter(config="--psm 11", tessdata_dir="/x", psm=3, oem=3)
+    args = a._build_config_args()
+    # An advanced `config` string overrides the structured knobs.
+    assert "--psm 11" in args and "--psm 3" not in args
+    assert "--oem 3" in args
+    assert "--tessdata-dir /x" in args
+
+
+def test_tessdata_dir_does_not_touch_process_env(monkeypatch):
+    # Adapters never read or mutate os.environ (config comes via resolve()):
+    # a pre-existing TESSDATA_PREFIX must keep its value, and a missing one
+    # must NOT be added as a side effect of construction.
+    import os
+    monkeypatch.delenv("TESSDATA_PREFIX", raising=False)
+    TesseractAdapter(tessdata_dir="/tmp/td")
+    assert "TESSDATA_PREFIX" not in os.environ
+
+    monkeypatch.setenv("TESSDATA_PREFIX", "/existing")
+    TesseractAdapter(tessdata_dir="/tmp/td")
+    assert os.environ["TESSDATA_PREFIX"] == "/existing"

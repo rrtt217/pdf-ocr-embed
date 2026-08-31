@@ -285,8 +285,12 @@ async function loadJobs() {
       return j && j.has_embedded;
     }));
     // Drop streams for jobs that no longer exist server-side.
+    // Null-safe: a stale `null` entry (terminal close) must not throw here —
+    // a throw would abort the rest of loadJobs() (no render, no re-subscribe).
     Object.keys(state.es).forEach((id) => {
-      if (!jobById(id)) { state.es[id].close(); delete state.es[id]; }
+      const src = state.es[id];
+      if (src) src.close();
+      delete state.es[id];
     });
     renderJobs();
     updateZipButton();
@@ -439,7 +443,7 @@ function applyJobEvent(jobId, msg) {
   const terminal = job.status === "done" || job.status === "stopped" || job.status === "error";
   if (terminal && state.es[jobId]) {
     state.es[jobId].close();
-    state.es[jobId] = null;
+    delete state.es[jobId];  // never leave a stale null entry in the map
   }
   renderJobs();
 

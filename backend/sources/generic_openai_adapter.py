@@ -27,6 +27,7 @@ import httpx
 
 from backend.config import resolve
 from backend.models import OcrBlock, OcrPage
+from backend.sources.base import UnavailableError
 from backend.sources.base import OcrSource, normalize_bbox
 from backend.sources.http_utils import RateLimiter, post_json_with_retry
 
@@ -133,7 +134,9 @@ class GenericOpenAiAdapter(OcrSource):
 
     def _post(self, payload: dict) -> dict:
         if not self.api_key:
-            raise RuntimeError(
+            # Pure setup problem -> UnavailableError (surfaces the friendly
+            # setup message instead of a stack trace, e.g. in the CLI).
+            raise UnavailableError(
                 "No api_key configured. Set `api_key` in backend/ocr_config.toml, "
                 "or fill in the WebUI settings page."
             )
@@ -182,6 +185,7 @@ class GenericOpenAiAdapter(OcrSource):
             ],
         }
         raw = self._post(payload)
+        self._assert_not_truncated(raw, page_index)
         text = self._extract_content(raw)
         log.debug("page %d: model returned %d chars", page_index, len(text))
         if not text:
@@ -196,6 +200,39 @@ class GenericOpenAiAdapter(OcrSource):
             return raw["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
             return ""
+
+    @staticmethod
+    def _extract_finish_reason(raw: dict) -> Optional[str]:
+        try:
+            return raw["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return None
+
+    def _assert_not_truncated(self, raw: dict, page_index: int) -> None:
+        """Raise when the response hit the max_tokens ceiling.
+
+        Mirrors the unlimited adapter: ``finish_reason == "length"`` is the
+        canonical signal; some providers only report usage, so
+        ``completion_tokens >= max_tokens`` is checked as a fallback.  Without
+        this a response truncated mid-JSON parses as an empty page which the
+        job layer would cache — permanently serving a blank page.
+        """
+        reason = self._extract_finish_reason(raw)
+        truncated = reason == "length"
+        if not truncated:
+            try:
+                usage = raw.get("usage") or {}
+                completion = usage.get("completion_tokens")
+                truncated = (completion is not None
+                             and completion >= self.max_tokens)
+            except (AttributeError, TypeError):
+                truncated = False
+        if truncated:
+            raise RuntimeError(
+                f"page {page_index}: OCR output truncated "
+                f"(finish_reason={reason or 'usage>=max_tokens'}, "
+                f"max_tokens={self.max_tokens}). Re-run this page, or raise "
+                f"max_tokens (must stay < 32768).")
 
     def _parse_json_blocks(self, data: Optional[dict], width: int, height: int,
                            page_index: int) -> OcrPage:

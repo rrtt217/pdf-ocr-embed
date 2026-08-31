@@ -406,6 +406,10 @@ async def stream(job_id: str):
         # First flush any already-buffered events.
         for ev in ocr_service.drain_events(job_id):
             yield _sse(ev)
+        # Persists across loop iterations: without this, a terminal event read
+        # as "running" in one iteration (drained) is re-sent by the fallback
+        # branch in the next one — the client gets "done" twice.
+        terminal_delivered = False
         while True:
             cur = ocr_service.get_job(job_id)
             if cur is None:
@@ -418,7 +422,6 @@ async def stream(job_id: str):
             # EventSource.onerror ("Connection to server lost") even though the
             # task actually completed successfully.
             events = ocr_service.drain_events(job_id)
-            terminal_delivered = False
             for ev in events:
                 yield _sse(ev)
                 if ev.get("type") == "status" and ev.get("status") in ("done", "stopped"):
@@ -470,6 +473,19 @@ def get_pages(job_id: str) -> dict:
 
 @app.post("/api/pages/{job_id}/{page_index}")
 def update_page(job_id: str, page_index: int, payload: dict) -> dict:
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    # Bound the index: out-of-range would silently pad the pages list
+    # (memory growth + persisted garbage) or corrupt pages[-1]; the frontend
+    # only ever addresses real pages (0-based page_index from /api/pages).
+    max_index = max(int(job.get("num_pages") or 0),
+                    len(ocr_service.get_pages(job_id)))
+    if not 0 <= page_index < max_index:
+        raise HTTPException(
+            status_code=400,
+            detail=f"page_index out of range: {page_index} (job has "
+                   f"{max_index} page(s))")
     pages = ocr_service.update_page(job_id, page_index, payload)
     return {"ok": True, "page_count": len(pages)}
 
@@ -582,6 +598,8 @@ def fontinfo(job_id: str, page_index: int, payload: PreviewModel):
 
 @app.post("/api/embed/{job_id}")
 def embed(job_id: str, payload: EmbedModel):
+    if ocr_service.get_job(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
     # Allow either the body pages or the server-side stored pages.
     pages = payload.pages
     if pages is None:

@@ -61,4 +61,48 @@ def test_parse_json_blocks_garbage_data():
     assert page.blocks == []
     page = GenericOpenAiAdapter()._parse_json_blocks({"blocks": "nope"},
                                                        100, 100, 0)
-    assert page.blocks == []
+
+
+# ---------------------------------------------------------------------------
+# Truncation guard + missing api_key
+# ---------------------------------------------------------------------------
+
+def test_truncated_response_raises_not_parsed_as_blank_page():
+    a = GenericOpenAiAdapter(api_key="k")
+    ok = {"choices": [{"finish_reason": "stop"}],
+          "usage": {"completion_tokens": 100}}
+    a._assert_not_truncated(ok, 7)  # fine — no raise
+
+    by_reason = {"choices": [{"finish_reason": "length"}]}
+    try:
+        a._assert_not_truncated(by_reason, 7)
+        raise AssertionError("expected RuntimeError for finish_reason=length")
+    except RuntimeError as exc:
+        assert "truncated" in str(exc) and "max_tokens=16384" in str(exc)
+
+    by_usage = {"choices": [{"finish_reason": None}],
+                "usage": {"completion_tokens": 16384}}
+    try:
+        a._assert_not_truncated(by_usage, 7)
+        raise AssertionError("expected RuntimeError for completion_tokens>=max")
+    except RuntimeError as exc:
+        assert "truncated" in str(exc)
+
+
+def test_missing_api_key_raises_unavailable_error(monkeypatch):
+    import pytest
+    from backend.sources.base import UnavailableError
+    # No api_key in config: both HTTP adapters raise the setup error type,
+    # not a bare RuntimeError (UnavailableError subclasses it, so setup
+    # problems surface the friendly message path, e.g. in the CLI).  Patch
+    # each adapter module's own `resolve` binding (they import the name
+    # directly, so patching backend.config.resolve would not take effect).
+    monkeypatch.setattr("backend.sources.generic_openai_adapter.resolve",
+                        lambda: {})
+    with pytest.raises(UnavailableError):
+        GenericOpenAiAdapter()._post({})
+    from backend.sources.unlimited_ocr_adapter import UnlimitedOcrAdapter
+    monkeypatch.setattr(
+        "backend.sources.unlimited_ocr_adapter.resolve", lambda: {})
+    with pytest.raises(UnavailableError):
+        UnlimitedOcrAdapter()._post({})

@@ -394,6 +394,15 @@ def retry_job(job_id: str, adapter_name: str | None = None,
     if job is None:
         log.warning("retry: job %s not found", job_id)
         return False
+    if job["status"] in ("running", "retrying"):
+        # A retry must never start a second concurrent run_ocr on the same
+        # job: it would race the live worker over job["pages"], re-mark the
+        # job running (overwriting a just-pressed stop) and resurrect a run
+        # the user cancelled.  The frontend re-enables the button on reload,
+        # so the guard has to live server-side too.
+        log.warning("retry: job %s is %s; refusing concurrent retry",
+                    job_id, job["status"])
+        return False
     if not Path(job["pdf_path"]).exists():
         log.warning("retry: job %s source PDF missing", job_id)
         return False
@@ -472,6 +481,11 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
     _set(job, concurrency=concurrency)
     cancel = job["cancel_event"]
     cancel.clear()
+    # Early page-count fallback for the exception handler below: if the PDF
+    # fails to open before `num` is assigned, a cancel+failure race would
+    # otherwise raise UnboundLocalError from the handler and strand the job
+    # in "running" (SSE never terminates).
+    num = int(job.get("num_pages") or 0)
 
     # If extra_cfg carries per-request overrides, apply them to the adapter.
     # Allowed override keys differ per adapter; unknown ones are ignored.
@@ -661,13 +675,20 @@ def _make_adapter(name: str, adapter_kwargs: dict):
 
 
 def _page_cache_key(job, fingerprint, page_index: int) -> str:
-    """The single source of truth for a page cache key (content-addressed)."""
+    """The single source of truth for a page cache key (content-addressed).
+
+    Includes the OCR-input preprocessing flags: toggling preprocessing changes
+    the raster the engine sees (applied at render time, before OCR), and cache
+    hits are never re-rendered — without it, flipping `preprocess_*` in the
+    settings would keep serving stale cached OCR results.
+    """
     return ocr_cache.build_key({
-        "v": 1,
+        "v": 2,
         "pdf_sha": job.get("pdf_sha256", ""),
         "page": page_index,
         "zoom": pdf_processing.PIXEL_RENDER_ZOOM,
         "render": {"fmt": "png", "alpha": False},
+        "preprocess": pdf_processing.preprocess_options(),
         "adapter": fingerprint,
     })
 

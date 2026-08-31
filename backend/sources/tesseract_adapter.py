@@ -22,8 +22,7 @@ absolute path.
 from __future__ import annotations
 
 import logging
-import os
-from pathlib import Path
+import shlex
 from typing import Any, Dict, List, Optional
 
 from PIL import Image
@@ -84,8 +83,12 @@ class TesseractAdapter(OcrSource):
         self.min_line_fontsize = float(
             min_line_fontsize if min_line_fontsize is not None else 0.0)
 
-        if self.tessdata_dir:
-            os.environ.setdefault("TESSDATA_PREFIX", self.tessdata_dir)
+        # `tessdata_dir` reaches the tesseract binary as a --tessdata-dir
+        # flag (command line wins over an ambient TESSDATA_PREFIX env var).
+        # We deliberately do NOT touch os.environ here: adapters never read
+        # or mutate the process env (config comes via backend/config.py
+        # resolve() only), and a pre-existing TESSDATA_PREFIX in the user's
+        # shell silently no-op'ed this knob under the old setdefault().
         if self.tess_cmd:
             try:
                 import pytesseract
@@ -113,6 +116,21 @@ class TesseractAdapter(OcrSource):
             langs = ["eng"]
         return langs
 
+    def _build_config_args(self) -> str:
+        """Build the extra tesseract CLI args from the structured knobs.
+
+        Only adds flags the user-level config doesn't already set (so an
+        advanced `config` string can override any structured knob).
+        """
+        extra = self.config or ""
+        if self.tessdata_dir and "--tessdata-dir" not in extra:
+            extra = f"--tessdata-dir {shlex.quote(self.tessdata_dir)} " + extra
+        if "--psm" not in extra:
+            extra = f"--psm {self.psm} " + extra
+        if "--oem" not in extra:
+            extra = f"--oem {self.oem} " + extra
+        return extra.strip()
+
     def recognize_pixels(self, image_path: str, width: int, height: int,
                          page_index: int) -> OcrPage:
         pytesseract = self._require_pytesseract()
@@ -121,14 +139,7 @@ class TesseractAdapter(OcrSource):
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Cannot open page image {image_path}: {exc}") from exc
 
-        extra = self.config or ""
-        # Only add psm/oem flags when the user-level config doesn't already set
-        # them (so an advanced `config` string can override the structured knob).
-        if "--psm" not in extra:
-            extra = f"--psm {self.psm} " + extra
-        if "--oem" not in extra:
-            extra = f"--oem {self.oem} " + extra
-        extra = extra.strip()
+        extra = self._build_config_args()
 
         try:
             data = pytesseract.image_to_data(

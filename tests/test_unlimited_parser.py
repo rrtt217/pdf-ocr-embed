@@ -50,6 +50,23 @@ def test_standalone_caption_without_image():
     assert page.blocks[0].caption_bbox is None
 
 
+def test_marker_regex_accepts_float_and_negative_bbox():
+    # A float/negative bbox must survive _MARKER_RE (int-coerced downstream),
+    # not drop the whole marker including its content.  1000x1000 canvas ->
+    # identity scaling so the values stay readable.
+    page = UnlimitedOcrAdapter().parse_response(
+        "<|det|>text [10.5,20.2,30,40]<|/det|>hello", 1000, 1000, 0)
+    assert len(page.blocks) == 1
+    assert page.blocks[0].text == "hello"
+    assert page.blocks[0].bbox == [10, 20, 30, 40]
+
+    page2 = UnlimitedOcrAdapter().parse_response(
+        "<|det|>text [-5,20,30,40]<|/det|>world", 1000, 1000, 0)
+    assert len(page2.blocks) == 1
+    assert page2.blocks[0].text == "world"
+    assert page2.blocks[0].bbox == [0, 20, 30, 40]  # x1 clamped to canvas
+
+
 def test_invalid_bbox_entries_are_skipped():
     raw = """
 <|det|>text<|/det|>no bbox
@@ -103,6 +120,17 @@ def test_table_html_is_converted_to_plain_rows():
         f"<|det|>table [0,0,100,100]<|/det|>{raw}", 1000, 1000, 0)
     assert page.blocks[0].text == "x_i\t0\t1\nf(x_i)\t2 &\t3"
     assert "<table" not in page.blocks[0].text
+
+
+def test_latex_to_plain_keeps_newlines_without_display_math():
+    # A single backslash (LaTeX escape, path, ...) must not flatten a whole
+    # paragraph's line structure: only blank-line runs collapse.  Joining is
+    # reserved for equation blocks (join_lines=True).
+    t = "line one\nline two\n50\\% off\nline four"
+    assert _latex_to_plain(t) == "line one\nline two\n50% off\nline four"
+    assert _latex_to_plain(t, join_lines=True) == "line one line two 50% off line four"
+    # Blank-line runs still collapse (display-math padding).
+    assert _latex_to_plain("a\n\n\nb\\&c") == "a\nb&c"
 
 
 def test_single_digit_tokens_separated_by_spaces_are_never_merged_by_parser():
@@ -160,6 +188,35 @@ def test_parser_version_changes_cache_fingerprint():
     old = dict(fp, parser_version=fp["parser_version"] - 1)
     import backend.ocr_cache as ocr_cache
     assert ocr_cache.build_key(fp) != ocr_cache.build_key(old)
+
+
+def test_max_batch_pages_zero_means_auto_default(monkeypatch):
+    # 0 (or absent) = auto default, as documented in config.example.toml;
+    # batching is disabled via unlimited_batch_enabled = false instead.
+    # Patch the adapter module's own `resolve` binding (it imports the name
+    # directly, so patching backend.config.resolve would not take effect).
+    monkeypatch.setattr(
+        "backend.sources.unlimited_ocr_adapter.resolve",
+        lambda: {"unlimited_max_pages_per_batch": "0"})
+    assert UnlimitedOcrAdapter().max_batch_pages == \
+        UnlimitedOcrAdapter.DEFAULT_BATCH_PAGES
+
+    monkeypatch.setattr("backend.sources.unlimited_ocr_adapter.resolve",
+                        lambda: {})
+    assert UnlimitedOcrAdapter().max_batch_pages == \
+        UnlimitedOcrAdapter.DEFAULT_BATCH_PAGES
+
+    monkeypatch.setattr(
+        "backend.sources.unlimited_ocr_adapter.resolve",
+        lambda: {"unlimited_max_pages_per_batch": "5"})
+    assert UnlimitedOcrAdapter().max_batch_pages == 5
+
+    # Explicit disable still wins over the auto default.
+    monkeypatch.setattr(
+        "backend.sources.unlimited_ocr_adapter.resolve",
+        lambda: {"unlimited_batch_enabled": "false",
+                 "unlimited_max_pages_per_batch": "5"})
+    assert UnlimitedOcrAdapter().max_batch_pages == 0
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +278,19 @@ def test_split_multipage_trailing_separator_tolerated():
             "<PAGE><|det|>text [0,0,10,10]<|/det|>B<PAGE>")
     chunks = UnlimitedOcrAdapter._split_multipage(text, 2)
     assert len(chunks) == 2 and "<|det|>" in chunks[1]
+
+
+def test_split_multipage_blank_last_page_is_not_an_artifact():
+    # A blank LAST page also produces a trailing empty chunk (one <PAGE>
+    # prefix per input image).  Dropping it as an artifact raises a spurious
+    # mismatch and wastes a full re-request + recursive split — it must parse.
+    text = ("<PAGE><|det|>text [0,0,10,10]<|/det|>A"
+            "<PAGE><|det|>text [0,0,10,10]<|/det|>B"
+            "<PAGE>")
+    chunks = UnlimitedOcrAdapter._split_multipage(text, 3)
+    assert chunks[0].count("<|det|>") == 1
+    assert chunks[1].count("<|det|>") == 1
+    assert chunks[2] == ""  # blank last page keeps its empty string
 
 
 def test_split_multipage_empty_text_maps_to_blank_pages():

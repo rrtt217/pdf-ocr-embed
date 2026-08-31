@@ -105,13 +105,22 @@ def map_normalized_to_pixels(x: float, y: float, width: int, height: int) -> "tu
 
 
 def normalize_bbox(bbox, width: int, height: int) -> list:
-    """Convert a normalized (0..1000) bbox into raw pixel coordinates."""
+    """Convert a normalized (0..1000) bbox into raw pixel coordinates.
+
+    Values outside the canvas (e.g. a stray ``-3`` or ``1005`` from the
+    engine) are clamped to the page image bounds: an out-of-range coordinate
+    would corrupt the embedded text-layer position.  Clamping keeps the
+    "integers in raw pixel space" invariant even for malformed engine output.
+    """
     x1, y1, x2, y2 = (float(v) for v in bbox)
     px1, py1 = map_normalized_to_pixels(x1, y1, width, height)
     px2, py2 = map_normalized_to_pixels(x2, y2, width, height)
     x1p, x2p = sorted((px1, px2))
     y1p, y2p = sorted((py1, py2))
-    return [int(round(x1p)), int(round(y1p)), int(round(x2p)), int(round(y2p))]
+    return [int(round(min(max(x1p, 0.0), float(width)))),
+            int(round(min(max(y1p, 0.0), float(height)))),
+            int(round(min(max(x2p, 0.0), float(width)))),
+            int(round(min(max(y2p, 0.0), float(height))))]
 
 
 class UnavailableError(RuntimeError):

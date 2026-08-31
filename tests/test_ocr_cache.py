@@ -104,6 +104,33 @@ def test_setting_parsers():
     assert not cache._truthy('')
 
 
+def test_page_cache_key_includes_preprocess_options(monkeypatch):
+    # Toggling preprocessing changes the raster the engine sees, and cache
+    # hits skip the render entirely — the flags must be part of the key or
+    # flipped settings keep serving stale cached OCR results.
+    job = {'pdf_sha256': 'abc'}
+    fp = {'engine': 'fake'}
+
+    def opts(enabled, binarize):
+        return {'enabled': enabled, 'grayscale': enabled, 'denoise': enabled,
+                'contrast': enabled, 'binarize': binarize}
+
+    monkeypatch.setattr(ocr_service.pdf_processing, 'preprocess_options',
+                        lambda: opts(False, False))
+    k_off = ocr_service._page_cache_key(job, fp, 0)
+    monkeypatch.setattr(ocr_service.pdf_processing, 'preprocess_options',
+                        lambda: opts(True, False))
+    k_on = ocr_service._page_cache_key(job, fp, 0)
+    monkeypatch.setattr(ocr_service.pdf_processing, 'preprocess_options',
+                        lambda: opts(True, True))
+    k_binarize = ocr_service._page_cache_key(job, fp, 0)
+    assert k_off != k_on != k_binarize
+    # Deterministic within the same settings.
+    monkeypatch.setattr(ocr_service.pdf_processing, 'preprocess_options',
+                        lambda: opts(True, False))
+    assert ocr_service._page_cache_key(job, fp, 0) == k_on
+
+
 class CountingAdapter:
     # Dep-free fake engine: counts calls, returns distinguishable pages.
     name = 'fake'
