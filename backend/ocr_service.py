@@ -579,7 +579,12 @@ def run_ocr(job_id: str, adapter_name: str | None = None,
                         'message': 'Rendering done'})
             seed = already_done + len(cached_hits)
 
-            if concurrency <= 1 or len(page_specs) <= 1:
+            if getattr(base_adapter, "max_batch_pages", 0) > 0 and len(page_specs) > 1:
+                # Batch mode: up to ``concurrency`` multi-page requests run in
+                # parallel, each carrying max_batch_pages pages.
+                _ocr_pages_batched(job, job_id, base_adapter, page_specs, num,
+                                   cancel, fingerprint, concurrency)
+            elif concurrency <= 1 or len(page_specs) <= 1:
                 _ocr_pages_sequentially(job, job_id, base_adapter, page_specs,
                                         num, cancel, fingerprint)
             else:
@@ -715,17 +720,12 @@ def _recognize_page(job, adapter, spec, fingerprint=None):
 
 def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel,
                           fingerprint=None):
-    """OCR pages in document order (single-path or document-level batches).
+    """OCR pages in document order, one request per page (per-page adapters).
 
-    When the adapter supports document-level parsing (``max_batch_pages > 0``)
-    the pages go through ``recognize_pages`` in chunks of that size — one
-    HTTP request per chunk instead of one per page.  Otherwise the classic
-    one-request-per-page loop is used unchanged.
+    Adapters with document-level parsing go through ``_ocr_pages_batched``
+    instead (dispatched from ``run_ocr``), where multiple pages share one
+    request and batches may run in parallel.
     """
-    if adapter.max_batch_pages > 0 and len(page_specs) > 1:
-        _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
-                           fingerprint)
-        return
     for spec in page_specs:
         if cancel.is_set():
             return
@@ -733,22 +733,43 @@ def _ocr_pages_sequentially(job, job_id, adapter, page_specs, num, cancel,
 
 
 def _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
-                       fingerprint=None):
-    """OCR pages in document-level batches (one multi-page request per chunk).
+                       fingerprint=None, concurrency=1):
+    """OCR pages in document-level batches, up to ``concurrency`` at a time.
 
-    Chunks follow ``adapter.max_batch_pages`` so cancellation is checked
-    between requests.  A chunk whose request failed outright (e.g. a read
-    timeout on a long generation) is split in half and retried recursively —
-    a dense chunk may simply be too big for one HTTP call, and a smaller one
+    ``concurrency`` is the number of concurrent HTTP requests; each request
+    carries ``adapter.max_batch_pages`` pages, so in-flight pages ≈
+    concurrency × batch.  ``max_inflight_pages`` (config) caps that product
+    by clamping the batch size (parallelism is kept) — preventing an
+    accidental "concurrency 6 × batch 12 = 72 pages in flight".
+
+    A batch whose request fails outright (e.g. a read timeout on a long
+    generation) is split in half and retried recursively within its worker — a
+    dense chunk may simply be too big for one HTTP call, and a smaller one
     completes in time.  A single page that still fails is marked failed
-    (error_page event) and the remaining chunks still run — the retry flow
-    later fills the gaps.  Mirrors the parallel path's error semantics.
+    (error_page event) and the other batches still run; the retry flow later
+    fills the gaps.  Mirrors the parallel path's error semantics.
     """
+    import concurrent.futures as cf
     from backend.sources.base import PageSpec
+    from backend.config import resolve
+
+    chunk_size = max(1, int(adapter.max_batch_pages or 1))
+    workers = max(1, int(concurrency or 1))
+    try:
+        inflight_cap = int(resolve().get("max_inflight_pages") or 24)
+    except (TypeError, ValueError):
+        inflight_cap = 24
+    if chunk_size * workers > inflight_cap:
+        new_chunk = max(1, inflight_cap // workers)
+        log.warning("job %s: batch=%d workers=%d exceeds max_inflight_pages=%d; "
+                    "clamping batch size to %d",
+                    job_id, chunk_size, workers, inflight_cap, new_chunk)
+        chunk_size = new_chunk
 
     errors: Dict[int, str] = {}
+    errors_lock = threading.Lock()
 
-    def run_group(start_idx: int, specs: List[dict]) -> None:
+    def run_group(specs: List[dict]) -> None:
         if cancel.is_set():
             return
         group_specs = [PageSpec(image_path=s["img_path"], width=s["w"],
@@ -768,13 +789,15 @@ def _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
                 log.warning("job %s: batch pages %d..%d failed (%s); splitting",
                             job_id, first + 1, last + 1, message)
                 mid = len(group_specs) // 2
-                run_group(0, specs[:mid])
-                run_group(0, specs[mid:])
+                run_group(specs[:mid])
+                run_group(specs[mid:])
                 return
             log.warning("job %s: page %d failed: %s",
                         job_id, first + 1, message)
+            with errors_lock:
+                for gs in group_specs:
+                    errors[gs.page_index] = message
             for gs in group_specs:
-                errors[gs.page_index] = message
                 push_event(job_id, {"type": "error_page",
                                     "page_index": gs.page_index,
                                     "message": message})
@@ -791,21 +814,41 @@ def _ocr_pages_batched(job, job_id, adapter, page_specs, num, cancel,
             update_page(job_id, spec.page_index, page_to_dict(page))
             _bump_progress(job, job_id, num)
 
-    chunk_size = max(1, int(adapter.max_batch_pages or 1))
-    for start in range(0, len(page_specs), chunk_size):
-        if cancel.is_set():
-            return
-        run_group(0, page_specs[start:start + chunk_size])
+    groups = [page_specs[i:i + chunk_size]
+              for i in range(0, len(page_specs), chunk_size)]
+    if not groups:
+        return
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(groups)),
+                              thread_name_prefix="ocr-batch")
+    futures = {pool.submit(run_group, g) for g in groups}
+    try:
+        while futures:
+            if cancel.is_set():
+                for f in futures:
+                    f.cancel()
+                log.info("job %s: cancel during batched OCR, abandoning %d "
+                         "pending batch(es)", job_id, len(futures))
+                return
+            _, futures = cf.wait(futures, timeout=0.3,
+                                 return_when=cf.FIRST_COMPLETED)
+    finally:
+        pool.shutdown(wait=not cancel.is_set(), cancel_futures=True)
 
-    if errors and len(errors) == len(page_specs):
-        failed = ", ".join(f"#{i + 1}" for i in sorted(errors))
+    if cancel.is_set():
+        return
+
+    with errors_lock:
+        n_err = len(errors)
+        err_snapshot = dict(errors)
+    if n_err and n_err == len(page_specs):
+        failed = ", ".join(f"#{i + 1}" for i in sorted(err_snapshot))
         raise RuntimeError(
-            f"OCR failed on all {len(errors)} attempted page(s): {failed}. "
-            f"Example error: {next(iter(errors.values()))}")
-    if errors:
-        failed_pages = ", ".join(f"#{i + 1}" for i in sorted(errors))
+            f"OCR failed on all {n_err} attempted page(s): {failed}. "
+            f"Example error: {next(iter(err_snapshot.values()))}")
+    if n_err:
+        failed_pages = ", ".join(f"#{i + 1}" for i in sorted(err_snapshot))
         push_event(job_id, {"type": "warning",
-                            "message": f"{len(errors)} page(s) failed: "
+                            "message": f"{n_err} page(s) failed: "
                                        f"{failed_pages}. Retry to fill them."})
 
 

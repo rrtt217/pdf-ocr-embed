@@ -35,7 +35,10 @@
   反向映射**（位置经 `~rotation_matrix` 变换，字形经 `morph` 预旋转；`rotation=180`
   的扫描书页嵌入文字与 `rotation=0` 页面逐像素一致），保存为 `*_embedded.pdf`。
 - **进度流**：SSE 推送每页 OCR 进度。
-- **并行 OCR**：支持并指定并行数，多页并发调用 OCR 引擎（线程池），显著加快多页文档处理。
+- **并行 OCR**：支持并指定并行数（`concurrency`）。对 unlimited 引擎，并行数
+  作用于**多页批次**：`concurrency` 个「每批 `unlimited_max_pages_per_batch` 页」
+  的请求同时进行（在途页数 ≈ 并发 × 批大小，受 `max_inflight_pages` 护栏钳制）；
+  对 tesseract 等逐页引擎则退化为每页一个请求的并行。
 - **单页 WebUI**：左侧可编辑文本块，右侧页面预览 + bbox 高亮框，设置表单、嵌入按钮、进度条、
   并行数输入框。
 - **置信度审阅视图**：每个文本块带置信度徽标（85/60 分档绿/黄/红），低置信块红描边；
@@ -317,8 +320,10 @@ pdf-ocr-embed/
   （`X _ p`→`X_p`、`f (x)`→`f(x)`）；相邻单个数字之间不会自动合并；
   `image_caption` 图注连同其 bbox（`caption_bbox`）保留并嵌入到文字层。
 - **并行数（concurrency）**：上传时可指定，WebUI 上传区有输入框，或调用
-  `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。后端用线程池并发处理各页，
-  `concurrency=1` 即顺序执行。注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。
+  `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。对 unlimited 引擎，
+  `concurrency` 个多页批次请求同时进行（在途页数 ≈ 并发 × 批大小，受 `max_inflight_pages`
+  护栏钳制）；tesseract 等逐页引擎则用线程池并发处理各页，`concurrency=1` 即顺序执行。
+  注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。
 - **失败重试（智能）**：OCR 报错或中途停止后，WebUI 显示 **Retry remaining** 按钮。
   重试**只重跑失败/未完成的页**，已成功的页保留不重跑（修复了"跑了 99% 重试却从头开始"的问题）。
   也可调用 `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。

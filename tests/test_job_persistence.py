@@ -171,3 +171,84 @@ def test_batched_pages_split_on_request_failure(monkeypatch, tmp_path):
     assert job["pages"][0]["blocks"][0]["text"] == "p0"
     assert job["pages"][2]["blocks"][0]["text"] == "p2"
     assert job["current"] == 3
+
+
+def test_batched_pages_run_in_parallel(monkeypatch, tmp_path):
+    """concurrency>1 must run several multi-page batches at the same time."""
+    import threading
+    import time
+    from collections import deque
+    from backend.models import OcrBlock, OcrPage as OP
+
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    inflight: list = [0]
+    peak: list = [0]
+    lock = threading.Lock()
+
+    class _A:
+        max_batch_pages = 2
+        def recognize_pages(self, specs):
+            with lock:
+                inflight[0] += 1
+                peak[0] = max(peak[0], inflight[0])
+            try:
+                time.sleep(0.2)
+            finally:
+                with lock:
+                    inflight[0] -= 1
+            return [OP(page_index=s.page_index, width=s.width, height=s.height,
+                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
+                                        text=f"p{s.page_index}")])
+                    for s in specs]
+
+    adapter = _A()
+    job = {"id": "par-b", "current": 0, "pages": [],
+           "status": "running", "adapter": "unlimited",
+           "img_dir": str(tmp_path / "work" / "par-b"),
+           "num_pages": 4, "error": None}
+    ocr_service._JOBS[job["id"]] = job
+    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
+    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
+             for i in range(4)]
+    ocr_service._ocr_pages_batched(job, job["id"], adapter, specs, 4,
+                                   threading.Event(), None, concurrency=2)
+    assert peak[0] >= 2, f"expected overlapping batches, peak concurrency={peak[0]}"
+    assert all(job["pages"][i] is not None for i in range(4))
+
+
+def test_batched_inflight_cap_clamps_batch_size(monkeypatch, tmp_path):
+    """batch x concurrency beyond max_inflight_pages clamps the batch size
+    (parallelism kept) instead of letting a huge number of pages go in flight."""
+    import threading
+    from collections import deque
+    from backend.models import OcrBlock, OcrPage as OP
+
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    monkeypatch.setattr("backend.config.resolve",
+                        lambda: {"max_inflight_pages": "4"})
+    sizes: list = []
+
+    class _A:
+        max_batch_pages = 10
+        def recognize_pages(self, specs):
+            sizes.append(len(specs))
+            return [OP(page_index=s.page_index, width=s.width, height=s.height,
+                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
+                                        text="x")])
+                    for s in specs]
+
+    adapter = _A()
+    job = {"id": "cap-b", "current": 0, "pages": [],
+           "status": "running", "adapter": "unlimited",
+           "img_dir": str(tmp_path / "work" / "cap-b"),
+           "num_pages": 5, "error": None}
+    ocr_service._JOBS[job["id"]] = job
+    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
+    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
+             for i in range(5)]
+    ocr_service._ocr_pages_batched(job, job["id"], adapter, specs, 5,
+                                   threading.Event(), None, concurrency=2)
+    # batch=10 x workers=2 = 20 > 4 -> batch clamped to 4//2 = 2 pages:
+    # groups of [2, 2, 1]
+    assert sorted(sizes) == [1, 2, 2]
+    assert all(job["pages"][i] is not None for i in range(5))

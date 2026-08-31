@@ -45,8 +45,11 @@ nothing is hardcoded in the code.
   the text is embedded invisibly with `render_mode=3`; pixel→PDF coordinates are
   flipped correctly (y axis) and scaled by the page rect, saved as `*_embedded.pdf`.
 - **Progress streaming** — SSE pushes per-page OCR progress.
-- **Parallel OCR** — configurable concurrency: pages are OCR'd concurrently in a
-  thread pool, significantly speeding up multi-page documents.
+- **Parallel OCR** — configurable concurrency (`concurrency`). For the unlimited
+  engine, concurrency applies to **multi-page batches**: `concurrency` requests
+  ("`unlimited_max_pages_per_batch` pages each") run at the same time (pages in
+  flight ≈ concurrency × batch size, clamped by the `max_inflight_pages` guard);
+  per-page engines like tesseract degrade to one request per page in parallel.
 - **Single-page WebUI** — editable text blocks on the left, page preview + bbox
   overlay on the right, settings form, embed button, progress bars, concurrency input.
 - **Confidence review** — every block shows a confidence badge (green/amber/red at
@@ -362,9 +365,12 @@ pdf-ocr-embed/
   api_key/base_url/model config as unlimited; `generic_prompt` overrides the default
   bbox-JSON prompt.
 - **Concurrency**: set it on upload, via the WebUI input or the `concurrency` form
-  field of `POST /api/ocr/upload` (1–32). Pages are processed concurrently in a
-  thread pool (`concurrency=1` = sequential). Higher concurrency means more load on
-  the OCR engine/API — match it to your quota.
+  field of `POST /api/ocr/upload` (1–32). For the unlimited engine, `concurrency`
+  multi-page batch requests run at the same time (in-flight pages ≈ concurrency ×
+  batch size, clamped by `max_inflight_pages`); tesseract and other per-page
+  engines process pages concurrently in a thread pool (`concurrency=1` =
+  sequential). Higher concurrency means more load on the OCR engine/API — match
+  it to your quota.
 - **Smart retry**: after an OCR error or a mid-job stop, the WebUI shows a
   **Retry remaining** button. Retry only re-runs failed/incomplete pages; successful
   pages are kept (fixes the "99% done then restart from scratch" problem). You can
