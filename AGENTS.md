@@ -7,36 +7,49 @@
 ## What this project is
 
 `pdf-ocr-embed` turns a pure-image (scanned) PDF into one with a searchable /
-selectable / copyable **invisible text layer**. Pipeline per page:
+selectable / copyable **invisible text layer**. The OCR core is
+**[OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF)** (≥17.11); the
+`unlimited-ocr` engine ships as an **OCRmyPDF plugin**. Pipeline per job:
 
-1. PyMuPDF renders the page to a PNG image.
-2. An **OCR adapter** (`backend/sources/*`) recognizes text and returns a
-   normalized `OcrPage` with block bounding boxes in **original pixel space**.
-3. PyMuPDF embeds the text invisibly (`render_mode=3`) so PDF geometry matches
-   the pixel bboxes after a y-axis flip.
-4. A single-page WebUI (native JS, no build step) lets users edit the recognized
-   text, set OCR settings, watch SSE progress, and download the `*_embedded.pdf`.
+1. `POST /api/ocr/upload` → FastAPI stores the PDF, opens a job.
+2. **OCR phase** — `ocrmypdf.api._pdf_to_hocr(pdf, work/<job>/hocr, plugins=[...])`:
+   OCRmyPDF rasterizes pages, runs the plugin engine per page (`jobs`-way
+   concurrency), leaving per-page `000001_ocr_hocr.hocr` +
+   `000001_ocr_hocr.blocks.json` (the WebUI's editable representation).
+3. **Edit phase** — `POST /api/pages/{job}/{i}` writes edits back into the block
+   sidecar and regenerates that page's hOCR from it.
+4. **Finalize** — `ocrmypdf.api._hocr_to_ocr_pdf(work/<job>/hocr, embedded.pdf)`:
+   OCRmyPDF renders the (possibly edited) hOCR into an invisible text layer via
+   its fpdf2 renderer, grafts it onto the original pages, postprocesses.
+5. A single-page WebUI (native JS, no build step) drives all of it over
+   `/api/*` + SSE progress.
 
-Tech: Python 3 + FastAPI backend, vanilla-JS single-page frontend, PyMuPDF,
-httpx. No CUDA/NVIDIA. **All coordinates are integers in raw pixel space**
-(top-left origin), which is the single most important invariant to preserve.
+Tech: Python 3 + FastAPI backend, ocrmypdf (plugin: `backend/ocrmypad`),
+vanilla-JS frontend, PyMuPDF (page previews), httpx. No CUDA/NVIDIA.
+**All coordinates are integers in raw pixel space** (top-left origin), which is
+the single most important invariant to preserve.
 
 ## Hard invariants (do not break)
 
-- `OcrBlock.bbox` is `[x1, y1, x2, y2]` **integers in original pixel space** of
-  the page image. Adapters must convert any engine-specific coordinate system
-  (e.g. a 1000×1000 normalized canvas) back to raw pixels *before* returning.
-- Adapters return a normalized `backend.models.OcrPage`; the rest of the backend
-  must **never** depend on one engine's raw output format.
+- Block bboxes are `[x1, y1, x2, y2]` **integers in raw pixel space** of the page
+  image. The plugin converts the unlimited model's 1000×1000 normalized canvas
+  back to raw pixels *before* anything else sees it — via
+  `backend.errors.normalize_bbox` (the single source of truth for that mapping).
+- hOCR written by the plugin MUST carry `scan_res <dpi> <dpi>` (the fpdf2
+  renderer's px→pt transform derives from it) and every `ocr_line` MUST contain
+  at least one `ocrx_word` child (the hocrtransform parser drops empty lines).
+- Engine-agnostic boundary: the raw `<|det|>` marker stream never leaves
+  `backend/ocrmypad`; the rest of the backend reads the block sidecar JSON only.
 - API keys/providers come only from external config — never hardcode. Base
   config is TOML: `backend/config.py::resolve()` reads `backend/ocr_config.toml`
   (the WebUI also persists there). `OCR_*` environment variables are read by
   `resolve()` as **highest-priority overrides** (`_ENV_ALIASES` maps names), so
-  they can override file/WebUI values for the running process. Do not reintroduce
-  JSON / `.env` file config, and never read `os.environ` outside
-  `backend/config.py` — env-sourced values should reach the rest of the code
-  through `resolve()`.
+  they can override file/WebUI values for the running process. Do not
+  reintroduce JSON / `.env` file config, and never read `os.environ` outside
+  `backend/config.py`.
 - `max_tokens` must stay `< 32768`.
+- ocrmypdf runs must use `use_threads=True` (HTTP IO-bound; also keeps the
+  progress registry in this process — a forked child could not report into it).
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `.venv/`,
   `backend/ocr_config.toml`) are gitignored. Never commit keys or large sample PDFs.
 
@@ -46,128 +59,131 @@ httpx. No CUDA/NVIDIA. **All coordinates are integers in raw pixel space**
 backend/
   main.py                 # FastAPI app + all routes
   config.py               # external setting resolution (resolve())
-  models.py               # OcrPage / OcrBlock (normalized schema)
-  pdf_processing.py       # render page->PNG + invisible text embedding
-  ocr_service.py          # jobs, per-page progress, concurrency (thread pool)
-  sources/
-    base.py               # OcrSource ABC + coordinate helpers + UnavailableError
-    factory.py            # adapter registry + get_adapter(name)
-    unlimited_ocr_adapter.py     # reference implementation (marker format)
-    tesseract_adapter.py         # local OCR via pytesseract
-    generic_openai_adapter.py    # generic OpenAI-compatible vision model
-frontend/                 # index.html / style.css / app.js (no build)
+  ocrmypad/               # OCRmyPDF plugin package (the extension point)
+    unlimited_engine.py   # OcrEngine plugin + get_ocr_engine hook
+    engine_client.py      # OpenAI-compatible client (retry/timeout/truncation)
+    parser.py             # <|det|> markers -> blocks -> hOCR
+    text_norm.py          # math/table/LaTeX text normalization
+    progress.py           # per-page progress registry + cancel flags
+  errors.py               # UnavailableError + 1000-canvas -> pixel bbox mapping
+  http_retry.py           # HTTP retry/backoff/rate-limit (engine API calls)
+  ocr_service.py          # job flow on _pdf_to_hocr + _hocr_to_ocr_pdf
+  models.py               # editor page JSON (OcrPage/OcrBlock compatible)
+  pdf_processing.py       # page preview rendering (PyMuPDF)
+  validation.py           # post-embed coverage report
+  batch.py                # ZIP packaging (streamed)
+  cleanup.py              # temp-file cleanup
+  cli.py                  # headless CLI (python -m backend.cli)
+frontend/                 # index.html / style.css / app.js / i18n.js (no build)
 requirements.txt
 AGENTS.md  README.md  DESIGN.md  config.example.toml  .gitignore
 ```
 
-## How to write a new OCR adapter (the main extension point)
+## How to write a new OCR engine (the main extension point)
 
-An adapter packages one OCR engine behind the `OcrSource` interface so the rest
-of the backend is engine-agnostic. Follow the pattern exactly; the
-`unlimited_ocr_adapter.py` is the reference.
+An engine packages one OCR engine behind OCRmyPDF's `OcrEngine` interface so
+the rest of the backend is engine-agnostic. ocrmypdf already ships Tesseract
+and a null engine; add yours as a module in `backend/ocrmypad/`.
 
-### Result schema (what you must produce)
+### The contract
 
-Every block is a `backend.models.OcrBlock`:
+ocrmypdf calls the engine **per page** in its own worker threads
+(`use_threads`), with the page already rasterized to an image:
 
 ```python
-OcrBlock(
-    kind=...,      # "text" | "heading" | "equation" | "table" | "image"
-                   # | "image_caption" | "footnote"  (free string, lowercase)
-    bbox=[x1, y1, x2, y2],  # INTEGERS, raw pixel space, top-left origin
-    text=...,               # recognized text ("" for pure image blocks)
-    caption=...,            # for image blocks, else ""
-    conf=...,               # Optional[float] 0..1 (may be None)
-)
-```
+from ocrmypdf import hookimpl
+from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 
-Return one `OcrPage(page_index, width, height, blocks=[...])` per page.
+class MyEngine(OcrEngine):
+    @staticmethod
+    def version() -> str: ...
+    @staticmethod
+    def creator_tag(options) -> str: ...
+    def __str__(self) -> str: ...
+    @staticmethod
+    def languages(options) -> set[str]: ...   # accepted languages
+    @staticmethod
+    def get_orientation(input_file, options) -> OrientationConfidence: ...
+    @staticmethod
+    def generate_hocr(input_file, output_hocr, output_text, options) -> None:
+        """OCR the image at input_file; write hOCR + sidecar text."""
+    @staticmethod
+    def get_deskew(input_file, options) -> float: return 0.0  # optional
+    @staticmethod
+    def supports_generate_ocr() -> bool: return False          # optional
+
+@hookimpl
+def get_ocr_engine(options):
+    # Return your engine only when options.ocr_engine selects it;
+    # otherwise return None so ocrmypdf's built-ins handle it.
+    if options is not None and getattr(options, "ocr_engine", "auto") != "my_engine":
+        return None
+    return MyEngine()
+```
 
 ### Steps
 
-1. **Create `backend/sources/<engine>_adapter.py`** defining a subclass:
-
-   ```python
-   from backend.sources.base import OcrSource
-   from backend.models import OcrBlock, OcrPage
-
-   class MyAdapter(OcrSource):
-       name = "my_engine"  # lowercase; used by factory.get_adapter(name)
-
-       def __init__(self, ...):   # optional; resolve() for defaults
-           cfg = resolve()        # -> dict of external settings
-           ...
-
-       def recognize_pixels(self, image_path, width, height, page_index) -> OcrPage:
-           """Run OCR on the PNG at image_path; return normalized OcrPage."""
-           ...  # engine call + parse
-           return OcrPage(page_index=page_index, width=width, height=height,
-                          blocks=blocks)
-
-       def close(self):
-           """Release any held resources (client, subprocess). Optional."""
-   ```
-
-2. **Register it** in `backend/sources/factory.py` `_REGISTRY`:
-   ```python
-   from backend.sources.my_adapter import MyAdapter
-   _REGISTRY = { ... , MyAdapter.name: MyAdapter }
-   ```
-   `get_adapter("my_engine")` then resolves it, and it appears in
-   `/api/health`'s available-adapters list automatically.
-
-3. **Coordinate conversion — the critical part.** If your engine returns
-   coordinates in anything other than raw pixels, convert them:
-   - 1000×1000 normalized canvas → use `backend.sources.base.normalize_bbox(bbox, width, height)`
-     (per-axis linear scale; returns integer pixel bbox).
-   - If the engine already outputs raw pixels (like Tesseract's TSV), use them
-     directly — do **not** normalize.
-   - Clamp/round to integers; ensure `x1<=x2`, `y1<=y2`.
-
-4. **Handle missing deps / unavailable engine** by raising
-   `backend.sources.base.UnavailableError` with a clear setup message (e.g. "pip
-   install X" or "set `tess_cmd` in backend/ocr_config.toml") — the backend
-   surfaces this to the user gracefully. Raise `RuntimeError` for genuine OCR
-   failures, and log via `logging.getLogger(__name__)`.
-
-### Config convention
-
-Pull engine settings from `backend.config.resolve()` (a dict) and/or explicit
-constructor args, and mirror them into `backend/ocr_config.toml` keys. Follow
-the existing flat naming: `<engine>_<setting>` config key (e.g. `tess_lang`,
-`tess_cmd`, `generic_prompt`). The legacy `OCR_<ENGINE>_<SETTING>` environment
-variables are handled centrally by `resolve()` (see `_ENV_ALIASES`) and
-override the TOML/WebUI values — adapters must go through `resolve()`, never
-`os.environ`. Resolve defaults in `__init__`, not in `recognize_pixels`.
+1. **Create `backend/ocrmypad/<engine>_engine.py`** implementing the contract.
+   Read settings via `backend.config.resolve()` (never `os.environ`), resolve
+   defaults in the client constructor, not per call.
+2. **Emit hOCR** matching what `ocrmypdf.hocrtransform` parses:
+   `div.ocr_page` (title: `bbox 0 0 W H; ppageno N; scan_res DPI DPI`) →
+   `p.ocr_par` → `span.ocr_line` → `span.ocrx_word` (bbox in **raw pixels**,
+   top-left origin). Missing `scan_res` = wrong text scale; empty lines are
+   dropped by the parser.
+3. **Write a block sidecar JSON** next to the hOCR
+   (`output_hocr.with_name(output_hocr.stem + ".blocks.json")`) with
+   `{"page": {page_index, width, height, blocks: [...]}, "dpi": ...}` — this is
+   what the WebUI edits and what regenerates the hOCR after edits.
+4. **Report progress**: derive the job id from `options.output_folder`'s parent
+   (convention: `work/<job_id>/hocr`) and call
+   `backend.ocrmypad.progress.report_page(job_id, page_index)`; honor
+   `progress.is_cancelled(job_id)` per page for user-requested stops.
+5. **Register it** in `backend/ocrmypad/__init__.py` and (for the WebUI's
+   engine list) in `backend/main.py::health` + `frontend` engine selects.
+6. **Error semantics**: missing dependency / bad setup → raise
+   `backend.errors.UnavailableError` (surfaces a friendly message); genuine OCR
+   failures → raise `RuntimeError` (fails the run; the retry flow re-runs it).
 
 ### Editing checklist
 
-- [ ] `name` registered in `factory._REGISTRY`; class import added there.
-- [ ] Every returned bbox is integer raw-pixel `[x1,y1,x2,y2]`, `x1<=x2`,`y1<=y2`.
+- [ ] `get_ocr_engine` hook returns the engine only for its own `ocr_engine` name.
+- [ ] Every hOCR/`ocrx_word` bbox is integer raw-pixel `[x1,y1,x2,y2]`,
+      `x1<=x2`, `y1<=y2`; `scan_res` present.
+- [ ] Block sidecar JSON written next to the hOCR (WebUI edits it).
 - [ ] Missing optional dependency raises `UnavailableError`, not a traceback.
-- [ ] No hardcoded keys/URLs; settings come from `resolve()` / args (TOML config).
-- [ ] `close()` releases long-lived resources (httpx client, subprocess).
-- [ ] Works via `get_adapter("<name>")` and shows in `/api/health`.
+- [ ] No hardcoded keys/URLs; settings come from `resolve()`.
+- [ ] Works via `ocrmypdf.api._pdf_to_hocr(..., plugins=[backend/ocrmypad/__init__.py])`.
 
 ## Conventions & gotchas
 
 - **Python**: use `from __future__ import annotations` in new modules; type hints;
   dataclasses for data; `logging` not `print`. Keep it dependency-light.
 - **Frontend has no build step** — edit `frontend/index.html`, `style.css`,
-  `app.js` directly; no bundler to run.
+  `app.js` directly; no bundler to run. i18n keys live in `frontend/i18n.js`
+  (both `en` and `zh` dicts).
+- **ocrmypdf private APIs**: the editing flow uses
+  `ocrmypdf.api._pdf_to_hocr` / `ocrmypdf.api._hocr_to_ocr_pdf` (import from
+  `ocrmypdf.api`, NOT the top-level package — they are not re-exported).
+  These are marked experimental upstream; pin `ocrmypdf>=17.11` in
+  requirements.txt and re-verify after upgrades.
+- **Plugin selection**: ocrmypdf's plugin loader reads `plugins=[path]`; we pass
+  `backend/ocrmypad/__init__.py` (see `ocr_service.plugin_path()`).
 - **Testing**: a pytest suite lives in `tests/` (run `.venv/bin/python -m pytest`).
-  When adding logic (especially coordinate mapping and parsing), prefer pure
-  functions and extend the suite; otherwise keep parsing in isolated static
-  methods.
-- **Vibe-coding notice**: this project was generated largely by AI
-  (DeepSeek V4 Flash). Re-verify correctness rather than assuming prior code is
-  bug-free; prefer small, reviewable diffs.
+  When adding logic (especially coordinate mapping, hOCR generation and
+  parsing), prefer pure functions and extend the suite.
+- **Vibe-coding notice**: this project was generated largely by AI. Re-verify
+  correctness rather than assuming prior code is bug-free; prefer small,
+  reviewable diffs.
 
 ## Useful commands
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+# system deps (once): sudo apt-get install tesseract-ocr ghostscript
 uvicorn backend.main:app --host 0.0.0.0 --port 8000   # or: python -m backend.main
-# health + available adapters:
+# health + engines:
 curl http://localhost:8000/api/health
+# headless:
+python -m backend.cli input.pdf -o output/out.pdf --pages 1-3
 ```

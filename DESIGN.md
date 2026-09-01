@@ -1,166 +1,154 @@
-# PDF OCR Embed — 跨平台 GUI/WebUI：纯图片 PDF 嵌入文字
+# PDF OCR Embed — 跨平台 GUI/WebUI：纯图片 PDF 嵌入文字（OCRmyPDF 架构）
 
 ## 目标
 做一个跨平台的桌面 GUI / WebUI 程序：输入纯图片 PDF（扫描件），通过 OCR 识别的文字
 按坐标**嵌入**到 PDF 内层（真正的可选中/可搜索文字层），保留原图作为背景。
 
-> **Vibe coding 提示**：本文档与整个项目均由 **DeepSeek V4 Flash** 通过 Vibe coding
-> 生成，属设计思路记录而非权威规范，实现以其对应代码为准。审阅代码时勿盲信 AI 输出。
+> **架构决定（rebuild/ocrmypdf-backend 分支）**：后端推倒自研管线，改用
+> **OCRmyPDF**（https://github.com/ocrmypdf/OCRmyPDF）作为 OCR 核心——栅格化、
+> 引擎调度、并发、文本层渲染（fpdf2）、graft 回写、PDF/A 与优化全部交给它；
+> **unlimited-ocr 以 OCRmyPDF 插件（`OcrEngine`）实现**（`backend/ocrmypad`）。
+> 前端**沿用现有自研 WebUI**（不采用 OCRmyPDF 的 `misc/_webservice.py`，理由见下）。
 
-## 独立运行
-- API key 与 provider 配置通过**外部方式**提供，代码里绝不硬编码：
-  - 项目本地 TOML 配置文件 `backend/ocr_config.toml`（由根目录 `config.example.toml`
-    复制而来，已加入 .gitignore）。
-  - 或 WebUI 设置页里填写保存（保存写入同一个 TOML 文件）。
-- 旧版 `OCR_*` 环境变量继续支持，作为**最高优先级覆盖**：
-  `环境变量 > WebUI 会话内值 > TOML 文件`；JSON / `.env` 文件配置已移除。
-- 默认只给 USTC 的 OpenAI 兼容端点示例（`https://api.llm.ustc.edu.cn/v1`），
-  但必须支持任意 OpenAI 兼容端点（通过 base_url + api_key + model 配置即可切引擎）。
+## 为什么沿用自研前端（而非 misc/_webservice.py）
 
-## 技术栈建议
-- 后端：Python（FastAPI 提供 REST + 文件上传 + 进度事件）。
-- 前端：单页 WebUI（浏览器即用），可选后续用 Tauri 打包桌面。
+`misc/_webservice.py` 是一个 **Streamlit** 应用（并非简单 HTTP 服务）：表单式参数
+页 → 调 ocrmypdf CLI → 展示结果。它不满足本项目核心交互：
+
+1. **无逐页文本编辑**：本项目的核心是浏览器内逐块编辑识别文本（错字修正、块
+   移动/缩放/合并），`_webservice.py` 没有任何编辑界面。
+2. **无进度事件流**：它同步等待整份 PDF 处理完成；本项目需要 SSE 每页进度 +
+   任务卡片 + 并行多任务。
+3. **无编辑回写通道**：本项目用 `_pdf_to_hocr` + `_hocr_to_ocr_pdf` 官方 API 实现
+   「OCR → 编辑 → 合成」闭环，`_webservice.py` 只走单次 `ocr()`。
+4. **技术栈冲突**：引入 Streamlit 意味着第二个端口、第二套 UI 框架和状态模型；
+   现有前端是零构建原生 JS，由 FastAPI 直接托管。
+
+结论：**保留现有前端**（`frontend/` 原生 JS，`/api/*` 契约基本不变），仅把后端
+管线整体替换为 OCRmyPDF；`_webservice.py` 仅作为「无需编辑、快速 OCR」的参考
+实现保留在上游。
+
+## 技术栈
+- **OCR 核心**：OCRmyPDF ≥17.11（`pip install ocrmypdf`；系统依赖 tesseract、
+  ghostscript）。文本层渲染用其内置 **fpdf2** 渲染器（无需 qpdf）。
+- **后端**：FastAPI + `ocrmypdf.api`（进程内调用，不 shell out）。
+- **unlimited-ocr 引擎**：OpenAI 兼容视觉 API（USTC `unlimited-ocr` 模型），输出
+  `<|det|>` 标记流，由插件解析。
+- **前端**：沿用单页 WebUI（原生 JS，零构建）。
 - 不引入 CUDA / NVIDIA 依赖。
 
-## OCR 输出格式 — 通用抽象（核心设计）
+## OCRmyPDF 插件（backend/ocrmypad/）
 
-现有 Unlimited-OCR（百度/USTC API）输出带 `<|det|>` 标记，格式如下：
+OCRmyPDF 的 `OcrEngine` 插件接口（`ocrmypdf.pluginspec`）：
 
-```text
-<|det|>title [50,100,200,120]<|/det|>Document Title
-<|det|>text [50,150,300,170]<|/det|>Paragraph content here.
-<|det|>image [300,200,500,400]<|/det|>
-<|det|>image_caption [..]<|/det|>Figure 5. ...
+```python
+class OcrEngine(ABC):
+    @staticmethod
+    def generate_hocr(input_file, output_hocr, output_text, options): ...
+    # 新式 API（返回 OcrElement 树）：generate_ocr()（本项目用 hOCR 路径）
+    @staticmethod
+    def version() / creator_tag(options) / languages(options)
+    @staticmethod
+    def get_orientation(...) / get_deskew(...)
 ```
 
-要点（经验证）：
-1. bbox 是 [x1,y1,x2,y2] 整数。
-2. **bbox 不是原始像素坐标**！模型把每张图归一化到固定 1000×1000 画布，
-   每维独立缩放到 1000（非等比）。映射回原图：
-   `real_x = bbox_x * (img_width/1000)`，`real_y = bbox_y * (img_height/1000)`。
-3. marker 行格式：`<|det|>type [bbox]<|/det|>content`，可选 bbox 和 content。
-4. image 区域无 content，caption 在后续的 `image_caption` 块里。
-5. max_tokens 必须 < 32768，否则 API 400。
+`backend/ocrmypad/` 包结构：
 
-### 归一化的内部 Schema（通用，不只绑死 Unlimited-OCR）
+| 模块 | 职责 |
+| --- | --- |
+| `unlimited_engine.py` | `UnlimitedOcrEngine(OcrEngine)`：逐页调 API → 解析 → 写 hOCR + 块 sidecar + 文本 sidecar；`get_ocr_engine` hook（`ocr_engine='unlimited'` 时接管） |
+| `engine_client.py` | OpenAI 兼容客户端（`skip_special_tokens=False`、截断检测、退化重试、超时随 max_tokens 缩放） |
+| `parser.py` | `<|det|>` 标记 → `Block`（1000×1000 画布 → 原始像素坐标）→ hOCR 文档（`div.ocr_page`/`p.ocr_par`/`span.ocr_line`/`span.ocrx_word`，含 `scan_res`） |
+| `text_norm.py` | 数学/表格/LaTeX 文本规范化（自研管线平移，逻辑不变） |
+| `progress.py` | 每页进度注册表 + 取消标志（引擎在 ocrmypdf 工作线程内汇报，SSE 读取） |
 
-设计一个中间数据结构 `OcrPage`，解析任意 OCR 原始输出，统一成：
+关键事实（ocrmypdf 17.11 实测）：
+- `ocrmypdf.api._pdf_to_hocr(input_pdf, output_folder, plugins=[...], ...)`：跑到
+  每页 hOCR，工作文件夹布局 `{output_folder}/origin.pdf`、
+  `000001_ocr_hocr.hocr`、`000001_hocr.json`。本项目约定
+  `output_folder = work/<job_id>/hocr`，引擎据此汇报进度。
+- `ocrmypdf.api._hocr_to_ocr_pdf(work_folder, output_file, ...)`：把（可编辑后的）
+  hOCR 用 fpdf2 渲染成隐形文字层、graft 回原页、跑后处理（PDF/A、优化）。
+  这是官方提供的**编辑回写**通道。
+- 引擎 `languages()` 返回请求语言 ∪ `{"und"}`（引擎语言无关）。
+- 插件基础设施用读写锁：同插件集的并发任务可重叠；`use_threads=True` 必需
+  （HTTP IO-bound，且线程化运行让 progress 注册表留在本进程）。
 
-```json
-{
-  "page_index": 0,
-  "width": 1654,
-  "height": 2339,
-  "blocks": [
-    {"kind": "text", "bbox": [x1,y1,x2,y2], "text": "...", "conf": 0.98},
-    {"kind": "heading", "bbox": [...], "text": "..."},
-    {"kind": "equation", "bbox": [...], "text": "..."},
-    {"kind": "table", "bbox": [...], "text": "..."},
-    {"kind": "image", "bbox": [...], "caption": "Figure 5 ..."},
-    {"kind": "footnote", "bbox": [...], "text": "..."}
-  ]
-}
-```
+## 数据流（任务流水线）
 
-- **Adapter 模式**：每个 OCR 引擎一个 adapter，把原始输出解析成 `OcrPage`。
-  - `unlimited_ocr_adapter`：解析 `<|det|>` 标记（默认）。
-  - 预留接口：`tesseract_adapter` / `paddle_adapter` / `generic_openai_adapter`
-    （把任意 OpenAI 兼容多模态模型的输出按 bbox 规范解析）。
-  - **编写新 adapter 的完整步骤与检查清单见 `AGENTS.md`（面向 AI 代理的权威指南）。**
-- bbox 坐标统一转换为**原始像素空间**（adapter 内完成 1000 画布 → 像素换算，
-  换算所需原图宽高由调用方传入）。
+1. `POST /api/ocr/upload` → `create_job`（fitz 校验 + 页数）→ 后台线程跑 OCR 阶段。
+2. **OCR 阶段**：`_pdf_to_hocr`（`mode=force` 等 OcrOptions 来自 config + 请求覆盖）
+   → 插件引擎逐页 OCR → `work/<job>/hocr/000001_ocr_hocr.hocr` +
+   `000001_ocr_hocr.blocks.json`（WebUI 的可编辑表示）+ sidecar 文本。
+3. **编辑**：`POST /api/pages/{job}/{i}` → 编辑写回块 sidecar，并从块**重新生成**
+   该页 hOCR（finalize 渲染编辑后的文本）。
+4. **合成**：`POST /api/embed/{job}` → `_hocr_to_ocr_pdf` → `work/<job>/embedded.pdf`
+   → 嵌后校验报告（`backend/validation.py`，逻辑不变）。
+5. `GET /api/download/{job_id}.pdf` 下载；`GET /api/ocr/zip?jobs=...` 打包。
 
-## PDF 嵌入文字（Invisible Text / 可搜索层）
+## 硬不变量（不破坏）
 
-用 PyMuPDF (fitz)：
-- `page.insert_text(point, text, fontsize=..., render_mode=3)` render_mode=3 表示
-  仅渲染到文本提取层、不可见（搜索/复制可用，视觉不叠加）。
-- 每页插完保存为 `*_embedded.pdf`。
-- bbox 像素坐标 → PDF 页面坐标：PDF 原点左下、y 轴向上；像素原点左上。
-  `pdf_y = page_height_pdf - bbox_y`，用 page rect 与像素宽高比例缩放。
+- 块 bbox 是 `[x1, y1, x2, y2]` **整数、原始像素空间**（top-left origin）。
+  1000×1000 归一化画布 → 原始像素的换算集中在 `backend/errors.normalize_bbox`
+  （parser 与 sidecar 数据都经它），hOCR 的 `scan_res` 必须携带真实 DPI。
+- 引擎原始输出（标记流）不出 `backend/ocrmypad`；其余代码只看块 sidecar JSON。
+- API key/provider 仅来自外部配置（TOML `backend/ocr_config.toml` + WebUI 保存 +
+  `OCR_*` 环境变量最高优先级覆盖，全部经 `backend/config.resolve()`）。
+- `max_tokens` 必须 < 32768。
+- 运行时产物（`output/`、`work/`、`uploads/`、`.venv/`、`backend/ocr_config.toml`）
+  已 gitignore；绝不提交 key 或大样本 PDF。
 
-## 功能
-1. 上传 PDF（或拖拽多页）。
-2. 每页转图（PyMuPDF / pdftoppm），调 OCR。
-3. 展示识别结果（可编辑文本块，修正错字）。
-4. 一键嵌入文字 → 生成 `_embedded.pdf`。
-5. 进度条（SSE / WebSocket 每页进度事件）。
+## 配置键位（backend/ocr_config.toml）
 
-## API 设计（FastAPI）
-- `POST /api/settings` 保存/读取 provider 配置（key 打码显示；保存时写入 `backend/ocr_config.toml`）。
-- `POST /api/ocr/upload` 上传 PDF → 转图 → 逐页 OCR → 返回页级 JSON；
-  长任务用 SSE `/api/ocr/stream` 推进度。
-- `GET /api/pages/{i}/image` 拿页面预览图。
-- `POST /api/embed` 接收（可编辑后的）OcrPage 列表 → 生成嵌入 PDF。
-- `GET /api/download/{job_id}.pdf` 下载结果。
+- `provider` / `api_key` / `base_url` / `model`：unlimited 引擎的 API 凭据。
+- `ocr_engine`：`unlimited`（插件，默认）| `tesseract`（ocrmypdf 内置）| `none`。
+- `ocrmypdf_mode`（force|skip|redo|default）、`ocrmypdf_jobs`（0=auto）、
+  `ocrmypdf_optimize`（0..3）、`ocrmypdf_output_type`（pdf|pdfa）、
+  `ocrmypdf_language` / `ocrmypdf_deskew` / `ocrmypdf_clean` / `ocrmypdf_rotate_pages`。
+- HTTP 重试限速：`max_retries` / `retry_base_delay` / `retry_max_delay` / `rate_limit_rps`。
+- 清理与日志：`cleanup_max_age_hours` / `cleanup_interval_hours` / `log_level`。
+- 环境变量映射：`OCR_API_KEY`（`USTC_API_KEY` 别名）、`OCR_BASE_URL`、`OCR_MODEL`、
+  `OCR_ENGINE`、`OCRMYPDF_*`、`OCR_MAX_RETRIES` 等（见 `backend/config.py::_ENV_ALIASES`）。
+
+## API 一览（与旧版兼容面）
+
+| 端点 | 说明 |
+| --- | --- |
+| `GET /api/health` | 状态 + 引擎映射（unlimited/tesseract/none） |
+| `GET/POST /api/settings` | provider 配置（key 打码）+ 流水线旋钮 |
+| `POST /api/ocr/upload` | `files`（多文件）或 `file`；`ocr_engine`、`concurrency`（→ ocrmypdf jobs） |
+| `GET /api/ocr/stream/{job_id}` | SSE：status + 每页 `progress` 事件 |
+| `POST /api/ocr/retry/{job_id}` | `page_start/page_end/force` 页范围重跑 |
+| `POST /api/ocr/stop/{job_id}` | 请求停止（引擎逐页检查取消标志） |
+| `GET /api/pages/{job_id}` | 已完成页（块 sidecar JSON，含 `parse_version`） |
+| `POST /api/pages/{job_id}/{i}` | 编辑页 → 写 sidecar + 重生成 hOCR |
+| `GET /api/pages/{job_id}/{i}/image` | 页面预览 PNG（PyMuPDF 渲染） |
+| `POST /api/embed/{job_id}` | finalize（`optimize`、`output_type`）+ 校验报告 |
+| `GET /api/validation/{job_id}` | 按需重跑校验 |
+| `GET /api/download/{job_id}.pdf` | 下载结果 |
+| `GET /api/ocr/zip?jobs=...` | 批量打包下载 |
+
+已移除（随自研管线退役）：`/api/cache*`（结果缓存）、`/api/fonts`、
+`/api/preview/*`（调试叠加）、`/api/fontinfo/*`、预处理开关。
 
 ## 执行入口与可靠性
-- Web：`backend/main.py`（FastAPI）；无头 CLI：`backend/cli.py`
-  （`python -m backend.cli`），与 Web 共用 `ocr_service` / `pdf_processing` /
-  `config.resolve()` 同一套后端路径，无服务器也可批量处理。
-- HTTP adapter 的引擎调用走 `backend/sources/http_utils.py`：
-  429/5xx/瞬时网络错误按指数退避重试（尊重 `Retry-After`），并提供线程安全的
-  per-adapter 限速（`rate_limit_rps`）。
-- `POST /api/ocr/retry/{job_id}` 支持 `page_start` / `page_end` / `force`
-  （页范围 + 强制重跑已成功页，A/B 试跑用）；页选择逻辑集中在
-  `ocr_service.select_pages()`（纯函数，含单元测试）。
-- OCR 输入图像预处理（#2）：`pdf_processing.preprocess_image()` 在新渲染的
-  页面 PNG 上执行 PIL 清洗（灰度 / 中值去噪 / autcontrast / Otsu 二值化），
-  由 `preprocess_*` 配置开关控制。**尺寸不变**是硬约束——预处理前后宽高完全
-  一致，因此块 bbox 像素坐标语义永不改变；预处理只发生在 OCR 输入的渲染
-  路径（含按需预览补渲染），命中缓存的页面不渲染、不预处理。
-- 嵌后校验（#17）：`backend/validation.py` 用 PyMuPDF 抽取嵌入 PDF 的文字层，
-  与 OCR 源页逐页比对，输出页级覆盖率（token 重叠 × 字符连续度的几何平均）、
-  字数、置信度统计与汇总；比较数学全部为纯函数（可脱离 PDF 单测），
-  仅 `build_report()` 触碰 PyMuPDF 且全程只读、出错返回 `ok:false` 而非抛错。
-  `POST /api/embed` 响应携带 `report`，另有 `GET /api/validation/{job_id}`
-  按需重跑（对存储页校验——浏览器内未重新嵌入的编辑不反映在内，属预期限制）。
-- 块操作（#6）：纯前端。`frontend/app.js` 在 `state.sel` 上维护每会话的
-  `selection`（当前页选中块索引集合）、`undoStack`（结构编辑前的 blocks 快照）、
-  `drawMode` / `pendingDraw`（叠加层绘制新块）；`#overlay-canvas` 捕获
-  pointer 事件做移动/缩放/绘制，全部 bbox 变更经 `clampBbox` 夹取为页面内
-  **整数像素**坐标并保持 `x1<=x2`、`y1<=y2`。结构性编辑仍走「嵌入时发送整页」
-  的既有路径，无后端改动、无持久化（撤销仅会话内）。
 
-## 前端
-- 单页 WebApp（原生 JS / Vue 简洁优先）。
-- 左侧评论区：可编辑每块的文本；右侧实时预览 PDF 页 + 文本框高亮框。
-- 保存 / 嵌入按钮。
+- Web：`backend/main.py`；无头 CLI：`python -m backend.cli input.pdf -o out.pdf
+  --pages 1-3 --engine unlimited --sidecar-text`。
+- 引擎 API 调用走 `backend/http_retry.py`：429/5xx/瞬时网络错误指数退避重试
+  （尊重 `Retry-After`）+ 线程安全限速；日志绝不回显 key（`config.redact_secrets`）。
+- 任务持久化：`work/<job>/job.json`，重启恢复（中断的任务标 `stopped`，hOCR 工作
+  文件夹保留——已识别页可直接合成，无需重传）。
+- 后台清理：`backend/cleanup.py` 周期删除未引用的 `work/`、`output/`、`uploads/`
+  旧文件（live job 引用的路径豁免）。
 
-## 批量上传 + 队列 + 打包下载（#10）
-- 上传区支持一次拖入/选择多个 PDF；**每个文件独立成任务**（独立 id、卡片、SSE、
-  持久化），复用现有多任务并行能力，**不做单独的队列管理器**；服务端 `/api/jobs`
-  始终是任务列表唯一数据源，前端并发发出所有上传后直接回拉列表并各自订阅进度。
-- `POST /api/ocr/upload` 同时接受旧字段 `file`（单个，向后兼容）与新字段 `files`
-  （可多个，按对象身份去重）；多文件时返回 `{"jobs": [{job_id, filename, status}, ...]}`，
-  单文件时仍带顶层 `job_id` / `filename` / `status`（老前端不破坏）。
-- `GET /api/ocr/zip?jobs=id1,id2,...`：把所选任务的**嵌入式输出 PDF**
-  （`job["embedded_path"]`）按源文件名打包成一个 ZIP。打包逻辑集中在
-  `backend/batch.py`（纯函数、可单测）：`collect_embedded` 只保留确有嵌入结果的
-  任务，`build_zip` 用 `zipfile` + `copyfileobj` 把每个成员**分块从磁盘流式写入**
-  （ZIP 不整包进内存），重名成员自动加序号；全部无结果时返回 404。临时 ZIP 放
-  系统临时目录，以 `FileResponse` 流式返回，响应发送完成后由后台任务删除。
+## 测试
 
-## 质量要求
-- 代码可运行，README 写清依赖、配置方式（外部 key / provider）与启动命令。
-- 后端统一走 OcrSource 抽象，不能只写死 Unlimited-OCR。
-- 不引入 CUDA / NVIDIA 依赖（部署节点无 NVIDIA GPU）。
-
-## 路线图
-
-当前阶段：**修复现存小 Bug，打磨稳定性**。大量基础功能已落地
-（并行 OCR、批量上传、任务持久化、嵌后校验、CLI、缓存、重试限速等），
-先把它们打磨到稳定，再拓展功能。
-
-1. **第一个稳定版（当前焦点）**：修复已知小 Bug，补齐测试与文档，
-   打 tag 发布 v1.0.0。
-2. **稳定版之后的扩展方向**：让 OCR 的**中间结果**（归一化 `OcrPage` /
-   `OcrBlock`，含块 bbox、kind、置信度）不再只服务于「嵌入隐形文字层」，
-   而是成为可复用的产物，例如：
-   - **还原可编辑 PDF**：按块结构重建原生文字 PDF（真文本而非隐形层）。
-   - **导出 Markdown / LaTeX**：利用 `kind=heading/equation/table` 与阅读序，
-     生成结构化文档导出（table→markdown 表格、equation→LaTeX）。
-   - 其他下游用途（纯文本导出、检索索引等）自然受益于同一套中间结果。
+`.venv/bin/python -m pytest`（140 项）：标记解析/hOCR 生成、坐标换算、插件注册、
+页面选择、任务持久化、配置优先级、API 守卫、密钥脱敏、批量上传/ZIP、校验、CLI。
+端到端：`python -m backend.cli`（真实 API 冒烟已验证：OCR → 编辑 → 合成 →
+提取文本与编辑一致，覆盖率 1.0）。
 
 ## 交付
-项目已完成并持续维护于本仓库（`pdf-ocr-embed`）；文档与测试随功能同步更新。
+项目维护于本仓库 `pdf-ocr-embed`（分支 `rebuild/ocrmypdf-backend`）；文档与测试
+随功能同步更新。
