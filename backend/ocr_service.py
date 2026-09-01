@@ -120,6 +120,8 @@ def create_job(filename: str, contents: bytes) -> dict:
         raise ValueError(f"Cannot open uploaded PDF: {exc}") from exc
     import time
     job["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    # Epoch seconds: the WebUI sorts the job list by this numeric field.
+    job["created"] = time.time()
     with _jobs_lock:
         _JOBS[job["job_id"]] = job
     _push_event(job["job_id"], {"type": "status", "status": "queued",
@@ -175,6 +177,20 @@ def _persist(job: dict) -> None:
         log.exception("persist job %s failed", job.get("job_id"))
 
 
+def _persist_if_live(job_id: str) -> None:
+    """Persist a job's state only while it is still in the registry.
+
+    A clear during a running job must win over the worker thread: without
+    this guard, ``run_ocr``/``embed_job`` re-persist the stale in-memory dict
+    after ``clear_job`` popped it, recreating the work dir (the cleared task
+    reappears in the WebUI job list on next restore).
+    """
+    fresh = get_job(job_id)
+    if fresh is None:
+        return
+    _persist(fresh)
+
+
 def restore_jobs() -> int:
     """Restore jobs persisted in work/<job_id>/job.json (called at startup).
 
@@ -221,10 +237,18 @@ def clear_job(job_id: str) -> bool:
 
 
 def list_jobs() -> List[dict]:
-    """Every job (running or finished), newest first."""
-    jobs = sorted(all_jobs(), key=lambda j: j.get("created_at") or "",
+    """Every job (running or finished), newest first.
+
+    Each summary carries BOTH field-name sets: the pre-rebuild names the
+    WebUI reads (`id`, `current`, `total`, `created`) and the current internal
+    names (`job_id`, `pages_done`, `num_pages`, `created_at`).  Dropping the
+    old aliases breaks every job card in the browser (`/api/ocr/stream/undefined`
+    404s, clears fail) — the frontend is the compatibility contract here.
+    """
+    jobs = sorted(all_jobs(), key=lambda j: j.get("created") or 0,
                   reverse=True)
     return [{
+        # current names
         "job_id": j["job_id"],
         "filename": j["filename"],
         "status": j["status"],
@@ -233,6 +257,11 @@ def list_jobs() -> List[dict]:
         "has_embedded": bool(j.get("embedded_path")),
         "created_at": j.get("created_at", ""),
         "error": j.get("error", ""),
+        # pre-rebuild aliases the WebUI depends on
+        "id": j["job_id"],
+        "current": j.get("pages_done", 0),
+        "total": j.get("num_pages", 0),
+        "created": j.get("created") or 0,
     } for j in jobs]
 
 
@@ -283,6 +312,12 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     Calls ``ocrmypdf._pdf_to_hocr``: the plugin engine runs per page and leaves
     hOCR + block sidecars under the job's hOCR work folder.  Failures mark the
     job error'd; a user-requested stop marks it stopped with partial pages.
+
+    "Retry remaining" semantics: when ``overrides['_page_selection']`` is set
+    (computed by ``retry_job`` from the pages that don't have a result yet),
+    only those pages are run — ``pages`` is passed to ocrmypdf as a
+    comma-separated list.  A page selection that is empty means every selected
+    page already has a result: the job is marked done without re-running OCR.
     """
     import ocrmypdf.api
     from backend.ocrmypad import progress as progress_mod
@@ -294,11 +329,27 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     options = _ocrmypdf_options(**overrides)
     total = int(job.get("num_pages") or 0)
 
+    # Page selection (retry remaining): the selection wins over a raw pages
+    # range — it already accounts for the range AND the pages that are done.
+    selection = overrides.get("_page_selection")
+    if selection is not None:
+        if not selection:
+            # Nothing to run: every selected page already has a block sidecar.
+            progress_mod.reset(job_id, total)
+            _set(job_id, status="done", pages_done=len(_block_sidecars(job_id)),
+                 error="")
+            _push_event(job_id, {"type": "status", "status": "done",
+                                 "message": "All selected pages already done"})
+            _persist_if_live(job_id)
+            return
+        if len(selection) < total:
+            options["pages"] = ",".join(str(n) for n in sorted(selection))
+
     progress_mod.reset(job_id, total)
-    _set(job_id, status="running", pages_done=0, current=0, error="")
+    _set(job_id, status="running", current=0, error="")
     _push_event(job_id, {"type": "status", "status": "running",
                          "message": "OCR started (OCRmyPDF)"})
-    _persist(get_job(job_id) or job)
+    _persist_if_live(job_id)
 
     try:
         ocrmypdf.api._pdf_to_hocr(
@@ -312,24 +363,28 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     except UnavailableError as exc:
         _set(job_id, status="error", error=str(exc))
         _push_event(job_id, {"type": "error", "message": str(exc)})
-        _persist(get_job(job_id) or job)
+        _persist_if_live(job_id)
         return
     except Exception as exc:  # noqa: BLE001
         cancelled = progress_mod.snapshot(job_id).get("cancel")
         message = "OCR stopped by user" if cancelled else redact_secrets(str(exc))
         status = "stopped" if cancelled else "error"
         log.error("job %s: OCR phase failed: %s", job_id, message)
-        _set(job_id, status=status, error=message)
+        # pages_done reflects the pages that actually have results on disk
+        # (a partially completed run keeps its completed pages).
+        _set(job_id, status=status, error=message,
+             pages_done=len(_block_sidecars(job_id)))
         _push_event(job_id, {"type": "error" if status == "error" else "status",
                              "status": status, "message": message})
-        _persist(get_job(job_id) or job)
+        _persist_if_live(job_id)
         return
 
     progress_mod.reset(job_id, total)
-    _set(job_id, status="done", error="")
+    _set(job_id, status="done", pages_done=len(_block_sidecars(job_id)),
+         error="")
     _push_event(job_id, {"type": "status", "status": "done",
                          "message": "OCR complete"})
-    _persist(get_job(job_id) or job)
+    _persist_if_live(job_id)
 
 
 def stop_job(job_id: str) -> bool:
@@ -538,7 +593,7 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
         raise
 
     _set(job_id, embedded_path=str(output_path))
-    _persist(get_job(job_id) or job)
+    _persist_if_live(job_id)
     _push_event(job_id, {"type": "status", "status": "embedded",
                          "message": "PDF ready"})
     stats = {"optimize": optimize,

@@ -139,4 +139,11 @@ def test_retry_stopped_job_still_schedules(monkeypatch, tmp_path):
     pdf = Path(ocr_service._JOBS["guard-1"]["pdf_path"])
     pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf.write_bytes(b"%PDF-fake")
+    # Stub the worker thread: run_ocr would call the real ocrmypdf pipeline
+    # on the fake PDF; we only assert that scheduling happened.
+    started = []
+    monkeypatch.setattr(ocr_service.threading, "Thread",
+                        lambda **kw: started.append(kw) or
+                        type("T", (), {"start": lambda self: None})())
     assert ocr_service.retry_job("guard-1") is True
+    assert started

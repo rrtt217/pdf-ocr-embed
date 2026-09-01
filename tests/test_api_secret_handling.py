@@ -137,6 +137,9 @@ def test_ocr_error_message_is_redacted_before_frontend(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "ocr_config.toml")
     monkeypatch.setattr(config, "_saved", {})
     monkeypatch.setenv("OCR_API_KEY", ENV_SECRET)
+    # run_ocr persists job state — keep it out of the real work/ directory.
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
 
     job_id = "audit-secret-job"
     hocr_dir = tmp_path / "work" / job_id / "hocr"

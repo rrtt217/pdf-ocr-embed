@@ -144,3 +144,55 @@ def test_ensure_hocr_files_regenerates_missing_hocr(monkeypatch, tmp_path):
     ocr_service._ensure_hocr_files(job["job_id"])
     hocr = (hdir / "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
     assert "sidecar only" in hocr
+
+
+def test_list_jobs_carries_pre_rebuild_aliases(monkeypatch, tmp_path):
+    """The WebUI reads `id` / `current` / `total` / `created` from /api/jobs;
+    dropping those aliases breaks every job card (stream/clear 404 on
+    `undefined`).  Both field-name sets must be present."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    try:
+        listed = {j["job_id"]: j for j in ocr_service.list_jobs()}
+        entry = listed[job["job_id"]]
+        for old, new in (("id", "job_id"), ("current", "pages_done"),
+                         ("total", "num_pages")):
+            assert entry[old] == entry[new]
+        assert isinstance(entry["created"], (int, float)) and entry["created"] > 0
+        assert entry["status"] == "queued"
+        assert entry["has_embedded"] is False
+    finally:
+        ocr_service.clear_job(job["job_id"])
+
+
+def test_run_ocr_page_selection_only_runs_remaining(monkeypatch, tmp_path):
+    """Retry remaining: run_ocr passes the not-done pages to ocrmypdf as a
+    comma-separated `pages` list; an empty selection marks the job done
+    without re-running OCR."""
+    import json as _json
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=3)
+    _write_sidecar(job, 1, "page one")
+    _write_sidecar(job, 2, "page two")
+
+    captured = {}
+
+    def fake_pipeline(pdf, folder, **kwargs):
+        captured["pages"] = kwargs.get("pages")
+
+    import ocrmypdf.api
+    monkeypatch.setattr(ocrmypdf.api, "_pdf_to_hocr", fake_pipeline)
+
+    # Selection [3]: page 3 is the only one without a result.
+    ocr_service.run_ocr(job["job_id"], {"_page_selection": [3]})
+    assert captured["pages"] == "3"
+    assert ocr_service.get_job(job["job_id"])["status"] == "done"
+    assert ocr_service.get_job(job["job_id"])["pages_done"] == 2
+
+    # Empty selection: everything done -> no OCR run, job marked done.
+    captured.clear()
+    ocr_service.run_ocr(job["job_id"], {"_page_selection": []})
+    assert "pages" not in captured
+    assert ocr_service.get_job(job["job_id"])["status"] == "done"
+    ocr_service.clear_job(job["job_id"])
