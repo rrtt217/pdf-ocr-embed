@@ -35,13 +35,10 @@ const PREFS = {
   tessLang: "pdfocr.ui.tessLang",
   concurrency: "pdfocr.ui.concurrency",
   zoom: "pdfocr.ui.zoom",
-  embedFont: "pdfocr.ui.embedFont",
   confFilter: "pdfocr.ui.confFilter",
   confThreshold: "pdfocr.ui.confThreshold",
-  imgMode: "pdfocr.ui.imgMode",
-  imgQuality: "pdfocr.ui.imgQuality",
-  imgDownscale: "pdfocr.ui.imgDownscale",
-  linearize: "pdfocr.ui.linearize",
+  optimize: "pdfocr.ui.optimize",
+  outputType: "pdfocr.ui.outputType",
 };
 
 function getPref(key, fallback) {
@@ -62,7 +59,6 @@ const state = {
   zoom: 100,
   es: {},       // jobId -> EventSource
   logTimer: null,
-  embedFont: "",   // selected system font name for the text layer
   confFilter: false,   // show only low-confidence blocks in the editor
   confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
 };
@@ -176,26 +172,25 @@ function updateAdapterUI() {
     langRow.classList.add("hidden");
     hint.textContent = adapter === "unlimited"
       ? t("upload.hint.unlimited")
-      : t("upload.hint.generic");
+      : t("upload.hint.tesseract");
   }
 }
 
-function currentAdapterCfg() {
-  const adapter = $("#adapter").value;
-  const cfg = { adapter };
-  if (adapter === "tesseract") {
+function currentEngineCfg() {
+  // The engine select is shared by upload / retry; the language field applies
+  // to Tesseract (the unlimited engine ignores it).
+  const cfg = { ocr_engine: $("#adapter").value };
+  if (cfg.ocr_engine === "tesseract") {
     const lang = $("#tess-lang").value.trim();
     if (lang) cfg.lang = lang;
   }
-  // API adapters use the provider keys from Settings; engine-specific models
-  // fall back to whatever is configured server-side.
   return cfg;
 }
 
 async function uploadOne(file, cfg, concurrency) {
   const fd = new FormData();
   fd.append("files", file);            // multi-file field (a single file works too)
-  fd.append("adapter", cfg.adapter);
+  fd.append("ocr_engine", cfg.ocr_engine);
   if (cfg.lang) fd.append("lang", cfg.lang);
   fd.append("concurrency", String(concurrency));
   return api("/api/ocr/upload", { method: "POST", body: fd });
@@ -217,7 +212,7 @@ async function handleFiles(fileList) {
     }
     return;
   }
-  const cfg = currentAdapterCfg();
+  const cfg = currentEngineCfg();
   const concurrency = Math.max(1, Math.min(32,
     parseInt($("#concurrency").value || "1", 10)));
 
@@ -483,8 +478,8 @@ async function retryJob(jobId) {
   job.busy = true;
   renderJobs();
   const fd = new FormData();
-  const cfg = currentAdapterCfg();
-  fd.append("adapter", cfg.adapter);
+  const cfg = currentEngineCfg();
+  fd.append("ocr_engine", cfg.ocr_engine);
   if (cfg.lang) fd.append("lang", cfg.lang);
   const c = Math.max(1, Math.min(32, parseInt($("#concurrency").value || "1", 10)));
   fd.append("concurrency", String(c));
@@ -572,8 +567,8 @@ async function reOcrPage() {
   job.busy = true;
   renderJobs();
   const fd = new FormData();
-  const cfg = currentAdapterCfg();
-  fd.append("adapter", cfg.adapter);
+  const cfg = currentEngineCfg();
+  fd.append("ocr_engine", cfg.ocr_engine);
   if (cfg.lang) fd.append("lang", cfg.lang);
   fd.append("page_start", String(pageNo));
   fd.append("page_end", String(pageNo));
@@ -779,7 +774,6 @@ function renderPage() {
 
   $("#zoom-label").textContent = state.zoom + "%";
   img.style.width = state.zoom + "%";
-  loadFontInfo();  // annotate each block with its derived / applied font size
 }
 
 function drawOverlay(page) {
@@ -1326,19 +1320,18 @@ async function embed() {
   if (!sel || !sel.pages.length) return;
   $("#btn-embed").disabled = true;
   $("#embed-status").textContent = t("embed.busy");
-  const imgMode = $("#img-mode") ? $("#img-mode").value : "none";
-  const imgQuality = $("#img-quality") ? parseInt($("#img-quality").value || "75", 10) : 75;
-  const imgDownscaleRaw = $("#img-downscale") ? $("#img-downscale").value : "";
-  const imgDownscale = imgDownscaleRaw ? parseInt(imgDownscaleRaw, 10) : null;
-  const linearize = !!( $("#opt-linearize") && $("#opt-linearize").checked);
+  // Output options: ocrmypdf's finalize stage applies optimization; the text
+  // layer is rendered from the stored (possibly edited) hOCR pages.
+  const optimize = $("#opt-optimize") ? $("#opt-optimize").value : "0";
+  const outputType = $("#opt-output-type") ? $("#opt-output-type").value : "pdf";
   try {
     const out = await api(`/api/embed/${sel.jobId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        job_id: sel.jobId, pages: sel.pages, embed_font: state.embedFont,
-        img_mode: imgMode, img_quality: imgQuality,
-        img_downscale: imgDownscale, linearize: linearize,
+        job_id: sel.jobId,
+        optimize: parseInt(optimize, 10) || 0,
+        output_type: outputType,
       }),
     });
     sel.embedded = true;
@@ -1349,11 +1342,9 @@ async function embed() {
     link.textContent = t("embed.download", { name: out.filename });
     let extra = "";
     const imgs = out.images;
-    if (imgs && imgs.replaced > 0) {
-      extra = " " + t("embed.optStats", { n: imgs.replaced, bytes: fmtBytes(imgs.saved_bytes) });
+    if (imgs && imgs.optimize > 0) {
+      extra = " " + t("embed.optStats", { n: imgs.optimize, bytes: imgs.output_type || "" });
     }
-    if (imgs && imgs.linearized === true) extra += " " + t("embed.linearized");
-    else if (linearize && imgs && imgs.linearized === false) extra += " " + t("embed.linearUnavailable");
     $("#embed-status").textContent = t("embed.done") + extra;
     const job = jobById(sel.jobId);
     if (job) { job.has_embedded = true; renderJobs(); }
@@ -1492,52 +1483,6 @@ async function validateJob() {
   }
 }
 
-/* ---------- interactive font-size debug ---------- */
-async function previewOverlay() {
-  const sel = state.sel;
-  if (!sel) return;
-  const page = sel.pages[sel.pageIndex];
-  if (!page) return;
-  $("#preview-img").classList.add("loading");
-  try {
-    // POST current pages (with font_scale) so the overlay reflects the sliders.
-    const resp = await fetch(`/api/preview/${sel.jobId}/${page.page_index}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pages: sel.pages, embed_font: state.embedFont }),
-    });
-    if (!resp.ok) throw new Error(await resp.text());
-    const blob = await resp.blob();
-    const url = URL.createObjectURL(blob);
-    const img = $("#preview-img");
-    img.onload = () => { img.classList.remove("loading"); };
-    img.src = url;
-    setStatus("preview", "running");
-  } catch (e) {
-    setStatus("error", "error");
-    $("#embed-status").textContent = t("embed.previewFailed", { msg: e.message });
-  }
-}
-
-async function loadFontInfo() {
-  const sel = state.sel;
-  if (!sel) return;
-  const page = sel.pages[sel.pageIndex];
-  if (!page) return;
-  try {
-    const data = await api(`/api/fontinfo/${sel.jobId}/${page.page_index}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pages: sel.pages, embed_font: state.embedFont }),
-    });
-    // Refresh derived-fs annotations in the editor blocks.
-    (data.blocks || []).forEach((fi) => {
-      const row = document.querySelector(`.block[data-bi="${fi.index}"] .fs-der`);
-      if (row) row.textContent = t("fontInfo.line", { derived: fi.derived_fs, fs: fi.fs, lines: fi.lines });
-    });
-  } catch (e) { /* ignore */ }
-}
-
 function downloadDataset() {
   const sel = state.sel;
   if (!sel || !sel.pages.length) return;
@@ -1557,16 +1502,15 @@ function downloadDataset() {
 }
 
 /* ---------- settings ---------- */
-const PREPROCESS_IDS = {
-  "preprocess_enabled": "set-preprocess-enabled",
-  "preprocess_grayscale": "set-preprocess-grayscale",
-  "preprocess_denoise": "set-preprocess-denoise",
-  "preprocess_contrast": "set-preprocess-contrast",
-  "preprocess_binarize": "set-preprocess-binarize",
+// OCRmyPDF pipeline knobs (persisted server-side; see backend/config.py).
+const PIPELINE_IDS = {
+  "ocr_engine": "set-ocr-engine",
+  "ocrmypdf_mode": "set-ocrmypdf-mode",
+  "ocrmypdf_language": "set-ocrmypdf-language",
 };
-const PREPROCESS_DEFAULTS = {
-  preprocess_enabled: false, preprocess_grayscale: true,
-  preprocess_denoise: true, preprocess_contrast: true, preprocess_binarize: false,
+const PIPELINE_CHECKBOX_IDS = {
+  "ocrmypdf_deskew": "set-ocrmypdf-deskew",
+  "ocrmypdf_clean": "set-ocrmypdf-clean",
 };
 
 async function openSettings() {
@@ -1578,9 +1522,13 @@ async function openSettings() {
     $("#set-baseurl").value = s.base_url || "";
     $("#set-model").value = s.model || "";
     $("#set-apikey").value = s.has_api_key ? s.api_key_masked : "";
-    Object.keys(PREPROCESS_IDS).forEach((key) => {
-      const elm = $(PREPROCESS_IDS[key]);
-      if (elm) elm.checked = s[key] !== undefined ? !!s[key] : !!PREPROCESS_DEFAULTS[key];
+    Object.keys(PIPELINE_IDS).forEach((key) => {
+      const elm = $(PIPELINE_IDS[key]);
+      if (elm) elm.value = s[key] !== undefined && s[key] !== null ? String(s[key]) : "";
+    });
+    Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
+      const elm = $(PIPELINE_CHECKBOX_IDS[key]);
+      if (elm) elm.checked = !!s[key];
     });
   } catch (e) {
     $("#settings-status").textContent = t("settings.loadFailed", { msg: e.message });
@@ -1594,8 +1542,12 @@ async function saveSettings() {
     model: $("#set-model").value.trim(),
     api_key: $("#set-apikey").value.trim(),
   };
-  Object.keys(PREPROCESS_IDS).forEach((key) => {
-    const elm = $(PREPROCESS_IDS[key]);
+  Object.keys(PIPELINE_IDS).forEach((key) => {
+    const elm = $(PIPELINE_IDS[key]);
+    if (elm && elm.value) payload[key] = elm.value;
+  });
+  Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
+    const elm = $(PIPELINE_CHECKBOX_IDS[key]);
     if (elm) payload[key] = elm.checked;
   });
   try {
@@ -1636,7 +1588,6 @@ function areaSummary(name, a) {
 
 async function openCleanup() {
   $("#cleanup-modal").classList.remove("hidden");
-  refreshCacheInfo();  // OCR result-cache panel in the same modal
   const status = $("#cleanup-status");
   status.textContent = "";
   $("#cleanup-summary").innerHTML = "";
@@ -1662,48 +1613,6 @@ async function openCleanup() {
     }
   } catch (e) {
     status.textContent = t("cleanup.loadFailed", { msg: e.message });
-  }
-}
-
-/* ---------- OCR result cache ---------- */
-async function refreshCacheInfo() {
-  const sum = $("#cache-summary");
-  const status = $("#cache-status");
-  if (!sum) return;
-  try {
-    const data = await api("/api/cache");
-    sum.innerHTML = "";
-    sum.appendChild(el("div", "",
-      t("cache.entries", { n: data.entries, bytes: fmtBytes(data.bytes) })
-      + " · " + t("cache.hitsMisses", { hits: data.hits, misses: data.misses })));
-    sum.appendChild(el("div", "hint", data.enabled
-      ? t("cache.ttlHours", { h: Math.round(data.max_age_hours) })
-      : t("cache.disabled")));
-    if (status) status.textContent = "";
-  } catch (e) {
-    if (sum) {
-      sum.innerHTML = "";
-      sum.appendChild(el("div", "hint", t("cache.loadFailed", { msg: e.message })));
-    }
-  }
-}
-
-async function clearOcrCache() {
-  const btn = $("#btn-cache-clear");
-  const status = $("#cache-status");
-  if (!btn) return;
-  btn.disabled = true;
-  if (status) status.textContent = t("cache.clearing");
-  try {
-    const data = await api("/api/cache/clear", { method: "POST" });
-    const msg = t("cache.cleared", { n: data.removed, bytes: fmtBytes(data.freed_bytes) });
-    if (status) status.textContent = msg;
-    toast(msg, "success");
-    await refreshCacheInfo();
-  } catch (e) {
-    if (status) status.textContent = t("cache.failed", { msg: e.message });
-  } finally {
-    btn.disabled = false;
   }
 }
 
@@ -1774,24 +1683,6 @@ function stopLogPolling() {
 }
 
 /* ---------- wire up ---------- */
-async function loadFonts() {
-  const sel = $("#embed-font");
-  if (!sel) return;
-  try {
-    const data = await api("/api/fonts");
-    const fonts = (data.fonts || []);
-    sel.innerHTML = '<option value=""></option>';
-    sel.options[0].textContent = t("workspace.autoFont");
-    fonts.forEach((f) => {
-      const opt = document.createElement("option");
-      opt.value = f.name;
-      opt.textContent = f.name + (f.family ? " — " + f.family : "");
-      sel.appendChild(opt);
-    });
-    if (state.embedFont) sel.value = state.embedFont;
-  } catch (e) { /* fonts unavailable; keep Auto */ }
-}
-
 function prevPage() {
   const s = state.sel;
   if (s && s.pageIndex > 0) { s.pageIndex--; renderTabs(); renderPage(); }
@@ -1843,7 +1734,6 @@ async function init() {
     state.zoom = savedZoom;
     $("#zoom").value = String(savedZoom);
   }
-  state.embedFont = getPref(PREFS.embedFont, "");
 
   // --- confidence review preferences ---
   state.confFilter = getPref(PREFS.confFilter, "") === "1";
@@ -1856,24 +1746,17 @@ async function init() {
     if (thrBox) thrBox.value = String(Math.round(savedThr));
   }
 
-  // --- output optimization preferences ---
-  const savedImgMode = getPref(PREFS.imgMode, "none");
-  if (["none", "jpeg", "gray-jpeg"].includes(savedImgMode)) {
-    const imBox = $("#img-mode");
-    if (imBox) imBox.value = savedImgMode;
+  // --- output option preferences (optimize / output type) ---
+  const savedOpt = getPref(PREFS.optimize, "0");
+  if (["0", "1", "2", "3"].includes(savedOpt)) {
+    const optBox = $("#opt-optimize");
+    if (optBox) optBox.value = savedOpt;
   }
-  const savedQ = parseFloat(getPref(PREFS.imgQuality, "75"));
-  if (savedQ >= 20 && savedQ <= 100) {
-    const qBox = $("#img-quality");
-    if (qBox) qBox.value = String(Math.round(savedQ));
+  const savedOutType = getPref(PREFS.outputType, "pdf");
+  if (["pdf", "pdfa"].includes(savedOutType)) {
+    const otBox = $("#opt-output-type");
+    if (otBox) otBox.value = savedOutType;
   }
-  const savedDs = getPref(PREFS.imgDownscale, "");
-  if (["2", "4"].includes(savedDs)) {
-    const dsBox = $("#img-downscale");
-    if (dsBox) dsBox.value = savedDs;
-  }
-  const linBox = $("#opt-linearize");
-  if (linBox) linBox.checked = getPref(PREFS.linearize, "") === "1";
 
   // 有任务运行时关闭标签页 → 浏览器原生关闭确认提示（任意一个任务在跑都会提示）。
   window.addEventListener("beforeunload", (e) => {
@@ -1907,8 +1790,6 @@ async function init() {
     renderPage();
   };
   $("#btn-embed").onclick = embed;
-  $("#btn-preview").onclick = previewOverlay;
-  $("#btn-dataset").onclick = downloadDataset;
   // --- post-embed validation report (#17) ---
   const vBtn = $("#btn-validate");
   if (vBtn) vBtn.onclick = validateJob;
@@ -1928,7 +1809,6 @@ async function init() {
   }
   $("#btn-settings").onclick = openSettings;
   $("#btn-cleanup").onclick = openCleanup;
-  $("#btn-cache-clear").onclick = clearOcrCache;
 
   // --- confidence review controls ---
   $("#conf-filter").onchange = () => {
@@ -1945,12 +1825,10 @@ async function init() {
     renderPage();
   };
 
-  // --- output optimization controls (persist only; read at embed time) ---
-  $("#img-mode").onchange = () => setPref(PREFS.imgMode, $("#img-mode").value || "none");
-  $("#img-quality").onchange = () => setPref(PREFS.imgQuality, $("#img-quality").value || "75");
-  $("#img-downscale").onchange = () => setPref(PREFS.imgDownscale, $("#img-downscale").value);
-  $("#opt-linearize").onchange = () =>
-    setPref(PREFS.linearize, $("#opt-linearize").checked ? "1" : "0");
+  // --- output option controls (persist only; read at embed time) ---
+  $("#opt-optimize").onchange = () => setPref(PREFS.optimize, $("#opt-optimize").value || "0");
+  $("#opt-output-type").onchange = () =>
+    setPref(PREFS.outputType, $("#opt-output-type").value || "pdf");
   $("#btn-cleanup-preview").onclick = () => runCleanup(true);
   $("#btn-cleanup-run").onclick = () => runCleanup(false);
   $("#btn-cleanup-cancel").onclick = () => $("#cleanup-modal").classList.add("hidden");
@@ -1976,12 +1854,6 @@ async function init() {
   $("#adapter").addEventListener("change", () => setPref(PREFS.adapter, $("#adapter").value));
   $("#tess-lang").addEventListener("change", () => setPref(PREFS.tessLang, $("#tess-lang").value.trim()));
   $("#concurrency").addEventListener("change", () => setPref(PREFS.concurrency, $("#concurrency").value));
-  $("#embed-font").addEventListener("change", (e) => {
-    state.embedFont = e.target.value;
-    setPref(PREFS.embedFont, state.embedFont);
-    if (state.sel) state.sel.embedded = false;
-    setStatus("dirty", "running");
-  });
 
   // --- keyboard shortcuts: Ctrl/Cmd+Enter = embed; ←/→ = page navigation ---
   document.addEventListener("keydown", (e) => {
@@ -2004,7 +1876,6 @@ async function init() {
   updateAdapterUI();
   updatePageRangeHint();
   updateZipButton();
-  loadFonts();
 
   try { await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }
