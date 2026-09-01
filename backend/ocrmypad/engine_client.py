@@ -1,0 +1,253 @@
+"""Unlimited-OCR engine client (USTC / Baidu style OpenAI-compatible API).
+
+Ported from the pre-rebuild ``unlimited_ocr_adapter``.  Single-page requests
+(the per-page "document parsing." prompt) with:
+
+* ``skip_special_tokens=False`` — CRITICAL: the model outputs <|det|> markers
+  as special tokens; the default stripping would empty the content.
+* truncation detection (``finish_reason=length`` / usage >= max_tokens).
+* one retry on degenerate results (the hosted vLLM endpoint occasionally
+  returns a 1-token empty response for pages that DO contain text).
+
+HTTP retry / rate-limit knobs come from ``backend.config.resolve()`` — never
+hardcoded, never read from ``os.environ`` outside ``resolve()``.
+"""
+from __future__ import annotations
+
+import base64
+import logging
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import httpx
+
+from backend.config import resolve
+from backend.errors import UnavailableError
+from backend.http_retry import RateLimiter, post_json_with_retry
+
+log = logging.getLogger(__name__)
+
+
+class UnlimitedOcrClient:
+    """One OpenAI-compatible client for the unlimited-ocr model."""
+
+    # The model natively knows how to format output with <|det|> markers.
+    # Per HuggingFace docs the prompt is just "document parsing." for a single
+    # image.  No system prompt needed.
+    SINGLE_PROMPT = "document parsing."
+
+    # Output runs ~1.5-2.5k tokens per dense page (measured on the live
+    # endpoint), so the default budget leaves generous headroom.
+    DEFAULT_MAX_TOKENS = 16384
+
+    # HTTP read timeout scales with the token budget: the hosted endpoint
+    # decodes at ~10-15 tok/s, so a full max_tokens generation needs minutes.
+    READ_TIMEOUT_MIN = 900.0
+    READ_TIMEOUT_PER_TOKEN = 0.08
+
+    def __init__(self, base_url: str | None = None, api_key: str | None = None,
+                 model: str | None = None, max_tokens: int | None = None,
+                 config: Dict[str, str] | None = None):
+        cfg = dict(config) if config is not None else resolve()
+        self.base_url = (base_url or cfg.get("base_url") or
+                         "https://api.llm.ustc.edu.cn/v1").rstrip("/")
+        self.api_key = api_key or cfg.get("api_key") or ""
+        self.model = model or cfg.get("model") or "unlimited-ocr"
+        # Hard backend invariant: max_tokens must stay < 32768.
+        self.max_tokens = min(int(max_tokens or self.DEFAULT_MAX_TOKENS), 32767)
+        # HTTP retry / rate-limit knobs (shared HTTP settings).  These do NOT
+        # affect OCR output.
+        self.max_retries = int(cfg.get("max_retries") or 3)
+        self.retry_base_delay = float(cfg.get("retry_base_delay") or 1.0)
+        self.retry_max_delay = float(cfg.get("retry_max_delay") or 30.0)
+        self.rate_limit_rps = float(cfg.get("rate_limit_rps") or 0.0)
+        self._rate_limiter = (
+            RateLimiter.from_requests_per_second(self.rate_limit_rps)
+            if self.rate_limit_rps > 0 else None
+        )
+
+    def cache_fingerprint(self) -> dict:
+        """Output-affecting settings (endpoint, model, key identity)."""
+        import hashlib
+        return {
+            "engine": "unlimited",
+            "base_url": self.base_url,
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "api_key_sha": hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()
+            if self.api_key else "",
+        }
+
+    def _post(self, payload: dict) -> dict:
+        if not self.api_key:
+            # Pure setup problem -> UnavailableError (surfaces the friendly
+            # setup message instead of a stack trace, e.g. in the CLI).
+            raise UnavailableError(
+                "No api_key configured. Set `api_key` in backend/ocr_config.toml, "
+                "or fill in the WebUI settings page."
+            )
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.base_url}/chat/completions"
+        log.debug("POST %s model=%s", url, payload.get("model"))
+        t0 = time.time()
+        # Read timeout must cover a full generation up to max_tokens on the
+        # hosted endpoint (~10-15 tok/s).
+        read_timeout = max(self.READ_TIMEOUT_MIN,
+                           self.max_tokens * self.READ_TIMEOUT_PER_TOKEN)
+        with httpx.Client(timeout=httpx.Timeout(read_timeout,
+                                                connect=30.0)) as client:
+            resp = post_json_with_retry(
+                client, url, json=payload, headers=headers,
+                max_retries=self.max_retries,
+                base_delay=self.retry_base_delay,
+                max_delay=self.retry_max_delay,
+                rate_limiter=self._rate_limiter,
+            )
+            log.debug("response %d in %.1fs (%d bytes)", resp.status_code,
+                      time.time() - t0, len(resp.content))
+            resp.raise_for_status()
+            return resp.json()
+
+    def _encode_image(self, image_path: str | Path) -> str:
+        with open(image_path, "rb") as fh:
+            return base64.b64encode(fh.read()).decode("ascii")
+
+    def single_payload(self, image_path: str | Path) -> Dict[str, Any]:
+        """Build the single-image payload ("document parsing.")."""
+        b64 = self._encode_image(image_path)
+        return {
+            "model": self.model,
+            "max_tokens": self.max_tokens,  # must stay < 32768
+            "temperature": 0.0,
+            # CRITICAL: the model outputs <|det|>...<|/det|> markers as special
+            # tokens.  If skip_special_tokens is True (the default), they are
+            # stripped and the content becomes empty.  Must set False.
+            "skip_special_tokens": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": self.SINGLE_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64}"},
+                        },
+                    ],
+                },
+            ],
+        }
+
+    def recognize(self, image_path: str | Path) -> str:
+        """Single-page OCR: return the raw marker stream.
+
+        One retry on degenerate results (the hosted endpoint intermittently
+        returns degenerate output for pages that DO contain text: a 1-token
+        empty response, or a lone whole-page image marker).  Either shape is
+        retried once; a still-degenerate result keeps its natural semantics.
+        """
+        text = ""
+        for attempt in range(2):
+            raw = self._post(self.single_payload(image_path))
+            self._assert_not_truncated(raw, self.max_tokens)
+            candidate = self._extract_content(raw)
+            if candidate.strip() and not self._looks_degenerate_raw(candidate):
+                return candidate
+            if candidate.strip():
+                text = candidate
+            if attempt == 0:
+                log.warning("OCR result looks degenerate (no text blocks); "
+                            "retrying once")
+        return text
+
+    @staticmethod
+    def _looks_degenerate_raw(text: str) -> bool:
+        """True when a marker stream carries no usable text at all.
+
+        Covers a lone whole-page image marker (the page "seen" as a pure
+        figure).  Any text/table/equation/caption content means the page was
+        read and is not retried.
+        """
+        import re
+        for match in re.finditer(
+                r"<\|det\|>(?P<kind>[a-z_]+)[^<]*<\|/det\|>(?P<content>.*?)(?=<\|det\|>|\Z)",
+                text, re.DOTALL):
+            kind = (match.group("kind") or "").strip().lower()
+            content = (match.group("content") or "").strip()
+            if kind in ("image", "image_ref"):
+                continue
+            if content:
+                return False
+        return True
+
+    @staticmethod
+    def _extract_content(raw: dict) -> str:
+        try:
+            return raw["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    @staticmethod
+    def _extract_finish_reason(raw: dict) -> Optional[str]:
+        try:
+            return raw["choices"][0].get("finish_reason")
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return None
+
+    @staticmethod
+    def _assert_not_truncated(raw: dict, max_tokens: int) -> None:
+        """Raise when the response hit the max_tokens ceiling.
+
+        ``finish_reason == "length"`` is the canonical signal; some providers
+        only report usage, so ``completion_tokens >= max_tokens`` is checked
+        as a fallback.
+        """
+        reason = UnlimitedOcrClient._extract_finish_reason(raw)
+        truncated = reason == "length"
+        if not truncated:
+            try:
+                usage = raw.get("usage") or {}
+                completion = usage.get("completion_tokens")
+                truncated = completion is not None and completion >= max_tokens
+            except (AttributeError, TypeError):
+                truncated = False
+        if truncated:
+            raise RuntimeError(
+                f"OCR output truncated (finish_reason={reason or 'usage>=max_tokens'}, "
+                f"max_tokens={max_tokens}). Re-run this page, or raise "
+                f"max_tokens (must stay < 32768).")
+
+
+def image_size(image_path: str | Path) -> tuple[int, int]:
+    """Return (width, height) of a rasterized page image."""
+    from PIL import Image
+    with Image.open(image_path) as img:
+        return int(img.width), int(img.height)
+
+
+def image_dpi(image_path: str | Path, default: float = 300.0) -> float:
+    """Return the DPI saved in the rasterized page image (fallback default).
+
+    ocrmypdf writes square DPI into its page images; the hOCR ``scan_res``
+    MUST carry the true DPI or the renderer's px->pt transform places text at
+    the wrong scale.
+    """
+    from PIL import Image
+    try:
+        with Image.open(image_path) as img:
+            dpi_info = img.info.get("dpi")
+            if isinstance(dpi_info, tuple) and dpi_info[0]:
+                return float(dpi_info[0])
+            if dpi_info:
+                return float(dpi_info)
+    except Exception:  # noqa: BLE001
+        log.debug("dpi read failed for %s", image_path, exc_info=True)
+    return default
+
+
+def split_pages_param(specs: List) -> str:
+    """Format a list of 1-based page numbers as an ocrmypdf ``pages`` string."""
+    return ",".join(str(s) for s in specs)

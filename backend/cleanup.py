@@ -18,8 +18,8 @@ Settings (via ``backend.config.resolve()``, from ``backend/ocr_config.toml``):
   cleanup_interval_hours  default 6
 
 Deletion safety:
-  - Every path referenced by a live job (`img_dir`, `pdf_path`,
-    `embedded_path`, `thumb_path`) is excluded up front.
+  - Every path referenced by a live job (`pdf_path`, `hocr_dir`,
+    `previews_dir`, `embedded_path`) is excluded up front.
   - Symlinks are never followed or removed.
   - ``force`` only relaxes the *age* rule — referenced files are still kept.
 """
@@ -32,7 +32,6 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from backend import ocr_cache
 from backend.config import resolve
 
 log = logging.getLogger(__name__)
@@ -79,7 +78,7 @@ def referenced_paths() -> set:
     from backend import ocr_service
     refs = set()
     for job in ocr_service.all_jobs():
-        for key in ("img_dir", "pdf_path", "embedded_path", "thumb_path"):
+        for key in ("pdf_path", "hocr_dir", "previews_dir", "embedded_path"):
             p = job.get(key)
             if p:
                 refs.add(str(Path(p).resolve()))
@@ -259,18 +258,6 @@ def start_background_cleanup() -> threading.Thread:
     return _thread
 
 
-def _purge_ocr_cache() -> None:
-    """Expire old OCR-cache entries on the same background cadence."""
-    try:
-        result = ocr_cache.purge_expired()
-        if result["removed"]:
-            log.info("auto-cleanup: OCR cache purged %d entr%s (%.1f MB)",
-                     result["removed"], "y" if result["removed"] == 1 else "ies",
-                     result["freed_bytes"] / _MB)
-    except Exception:  # noqa: BLE001
-        log.exception("auto-cleanup: OCR cache purge failed")
-
-
 def stop_background_cleanup() -> None:
     """Signal the background loop to exit (used on server shutdown)."""
     _stop.set()
@@ -286,7 +273,6 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: initial pass failed")
-        _purge_ocr_cache()
     while not _stop.is_set():
         if _stop.wait(interval_hours() * 3600.0):
             break
@@ -297,4 +283,3 @@ def _cleanup_loop() -> None:
                          result["deleted_count"], result["freed_bytes"] / _MB)
         except Exception:  # noqa: BLE001
             log.exception("auto-cleanup: pass failed")
-        _purge_ocr_cache()
