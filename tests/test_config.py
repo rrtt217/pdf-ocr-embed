@@ -61,21 +61,25 @@ def test_empty_string_falls_back_to_preset(monkeypatch):
     assert cfg["model"] == "unlimited-ocr"
 
 
-def test_unlimited_batch_keys_resolve_from_file(monkeypatch, tmp_path):
+def test_engine_keys_resolve_from_file(monkeypatch, tmp_path):
     cfg_file = tmp_path / "ocr_config.toml"
     cfg_file.write_text(
-        'unlimited_batch_enabled = "false"\n'
-        'unlimited_max_pages_per_batch = "5"\n',
+        'ocr_engine = "tesseract"\n'
+        'ocrmypdf_mode = "skip"\n'
+        'ocrmypdf_jobs = "4"\n',
         encoding="utf-8")
     monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
     cfg = config.resolve()
-    assert cfg["unlimited_batch_enabled"] == "false"
-    assert cfg["unlimited_max_pages_per_batch"] == "5"
+    assert cfg["ocr_engine"] == "tesseract"
+    assert cfg["ocrmypdf_mode"] == "skip"
+    assert cfg["ocrmypdf_jobs"] == "4"
 
 
-def test_unlimited_batch_env_aliases(monkeypatch):
-    monkeypatch.setenv("OCR_UNLIMITED_BATCH_ENABLED", "false")
-    monkeypatch.setenv("OCR_UNLIMITED_MAX_PAGES_PER_BATCH", "3")
+def test_engine_env_aliases(monkeypatch):
+    monkeypatch.setenv("OCR_ENGINE", "tesseract")
+    monkeypatch.setenv("OCRMYPDF_MODE", "redo")
+    monkeypatch.setenv("OCRMYPDF_JOBS", "2")
     cfg = config.resolve()
-    assert cfg["unlimited_batch_enabled"] == "false"
-    assert cfg["unlimited_max_pages_per_batch"] == "3"
+    assert cfg["ocr_engine"] == "tesseract"
+    assert cfg["ocrmypdf_mode"] == "redo"
+    assert cfg["ocrmypdf_jobs"] == "2"

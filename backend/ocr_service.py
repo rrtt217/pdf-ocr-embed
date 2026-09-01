@@ -284,7 +284,7 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     hOCR + block sidecars under the job's hOCR work folder.  Failures mark the
     job error'd; a user-requested stop marks it stopped with partial pages.
     """
-    import ocrmypdf
+    import ocrmypdf.api
     from backend.ocrmypad import progress as progress_mod
 
     job = get_job(job_id)
@@ -301,7 +301,7 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     _persist(get_job(job_id) or job)
 
     try:
-        ocrmypdf._pdf_to_hocr(
+        ocrmypdf.api._pdf_to_hocr(
             Path(job["pdf_path"]),
             Path(job["hocr_dir"]),
             plugins=[plugin_path()],
@@ -490,7 +490,7 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     (metadata, optional PDF/A, optional optimization).  Returns the output
     path and a small stats dict.
     """
-    import ocrmypdf
+    import ocrmypdf.api
 
     job = get_job(job_id)
     if job is None:
@@ -524,7 +524,7 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     _push_event(job_id, {"type": "status", "status": "embedding",
                          "message": "Embedding text layer (OCRmyPDF)..."})
     try:
-        ocrmypdf._hocr_to_ocr_pdf(
+        ocrmypdf.api._hocr_to_ocr_pdf(
             Path(job["hocr_dir"]),
             output_path,
             **kwargs,

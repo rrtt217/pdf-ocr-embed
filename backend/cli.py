@@ -115,7 +115,7 @@ def main() -> int:
     output_path = (Path(args.output) if args.output else
                    out_dir / f"{input_path.stem}_embedded_{uuid.uuid4().hex[:8]}.pdf")
 
-    import ocrmypdf
+    import ocrmypdf.api
     overrides = {"ocr_engine": args.engine}
     if args.jobs:
         overrides["jobs"] = args.jobs
@@ -127,14 +127,14 @@ def main() -> int:
 
     try:
         # Phase 1: OCR -> per-page hOCR + block sidecars (plugin engine runs).
-        ocrmypdf._pdf_to_hocr(
+        ocrmypdf.api._pdf_to_hocr(
             input_path, hocr_dir,
             plugins=[ocr_service.plugin_path()],
             **ocr_service._ocrmypdf_options(**overrides),
             **({"pages": pages_arg} if pages_arg else {}),
         )
         # Phase 2: (possibly edited) hOCR -> final PDF with the text layer.
-        ocrmypdf._hocr_to_ocr_pdf(
+        ocrmypdf.api._hocr_to_ocr_pdf(
             hocr_dir, output_path,
             use_threads=True,
         )
