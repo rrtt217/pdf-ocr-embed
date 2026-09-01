@@ -11,7 +11,7 @@ import time
 import httpx
 import pytest
 
-from backend.sources.http_utils import (
+from backend.http_retry import (
     RateLimiter,
     _backoff_delay,
     post_json_with_retry,

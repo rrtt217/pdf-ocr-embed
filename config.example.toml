@@ -9,75 +9,46 @@
 #
 # Optional environment overrides: any `OCR_*` environment variable has the
 # HIGHEST priority and overrides this file and WebUI-saved values, e.g.
-#   OCR_API_KEY=sk-xxx OCR_MODEL=m2 python -m backend.main
+#   OCR_API_KEY=sk-xxx OCRMYPDF_MODE=force python -m backend.main
 # Full mapping (see README.md): OCR_API_KEY / USTC_API_KEY (alias) -> api_key,
 # OCR_BASE_URL -> base_url, OCR_MODEL -> model, OCR_PROVIDER -> provider,
-# OCR_TESS_LANG/PSM/OEM/CONFIG -> tess_*, OCR_TESSDATA_DIR -> tessdata_dir,
-# OCR_TESS_CMD -> tess_cmd, OCR_GENERIC_PROMPT -> generic_prompt,
-# OCR_MAX_RETRIES -> max_retries, OCR_RETRY_BASE_DELAY -> retry_base_delay,
-# OCR_UNLIMITED_BATCH_ENABLED -> unlimited_batch_enabled,
-# OCR_UNLIMITED_MAX_PAGES_PER_BATCH -> unlimited_max_pages_per_batch,
-# OCR_MAX_INFLIGHT_PAGES -> max_inflight_pages,
-# OCR_RETRY_MAX_DELAY -> retry_max_delay, OCR_RATE_LIMIT_RPS -> rate_limit_rps,
-# OCR_EMBED_FONT -> embed_font, OCR_CLEANUP_MAX_AGE_HOURS ->
+# OCR_ENGINE -> ocr_engine, OCR_MAX_RETRIES -> max_retries,
+# OCR_RETRY_BASE_DELAY -> retry_base_delay, OCR_RETRY_MAX_DELAY ->
+# retry_max_delay, OCR_RATE_LIMIT_RPS -> rate_limit_rps,
+# OCRMYPDF_MODE/JOBS/OPTIMIZE/OUTPUT_TYPE/LANGUAGE/DESKEW/CLEAN/
+# ROTATE_PAGES -> ocrmypdf_*, OCR_CLEANUP_MAX_AGE_HOURS ->
 # cleanup_max_age_hours, OCR_CLEANUP_INTERVAL_HOURS -> cleanup_interval_hours,
 # OCR_LOG_LEVEL -> log_level.
 
 # --- Primary (OpenAI-compatible) OCR engine -------------------------------
 provider = "ustc"                            # provider preset: "ustc" | "openai" | "custom"
-api_key = "your-key-here"                    # required for API-based OCR engines
+api_key = "your-key-here"                    # required for the unlimited engine
 base_url = "https://api.llm.ustc.edu.cn/v1"  # any OpenAI-compatible endpoint
 model = "unlimited-ocr"                      # model / deployment name
 
-# --- Tesseract adapter (local OCR, no API key) ----------------------------
-tess_lang = "chi_sim"                        # e.g. "eng", "chi_sim", "chi_sim+eng"
-# tess_psm = 3                               # page segmentation mode (0-13)
-# tess_oem = 3                               # engine mode (0-3)
-# tess_config = ""                           # extra tesseract CLI flags
-# tessdata_dir = "/usr/share/tesseract/tessdata"  # if tessdata moved from the default location
-# tess_cmd = "/usr/bin/tesseract"                 # if the tesseract binary is not on PATH
+# --- Engine selection -------------------------------------------------------
+# ocr_engine = "unlimited"                   # "unlimited" (plugin) | "tesseract" (ocrmypdf built-in) | "none"
 
-# --- Generic OpenAI adapter (any OpenAI-compatible vision model) ----------
-# generic_prompt = "..."                     # override the default bbox-JSON prompt
+# --- ocrmypdf pipeline knobs (see backend/ocr_service.py) -------------------
+# ocrmypdf_mode = "force"                    # force | skip | redo | default
+# ocrmypdf_jobs = 0                          # worker count (0 = auto / cpu count)
+# ocrmypdf_optimize = 0                      # 0..3, applied at finalize
+# ocrmypdf_output_type = "pdf"               # pdf | pdfa
+# ocrmypdf_language = ""                     # tesseract needs it; unlimited ignores it
+# ocrmypdf_deskew = false                    # deskew pages before OCR (boolean)
+# ocrmypdf_clean = false                     # clean pages before OCR (needs unpaper)
+# ocrmypdf_rotate_pages = false              # auto-rotate (needs an OSD-capable engine)
 
-# --- Unlimited adapter document-level (multi-page) parsing ----------------
-# Sends several page images in ONE request ("Multi page parsing."); responses
-# come back <PAGE>-separated.  Affects OCR output -> part of the cache key.
-# unlimited_batch_enabled = true            # master switch (false = per-page requests)
-# unlimited_max_pages_per_batch = 12        # pages per request (0 = auto default)
-# max_inflight_pages = 24                   # guard: batch x concurrency cap
-#                                           # (clamps batch size, keeps parallelism)
-
-# --- HTTP adapter retry + rate limiting (shared by unlimited & generic) ----
-# Applies to every API call; does NOT change OCR output (so it never affects
-# the result-cache key).  0 / absent disables that knobs' default.
-# max_retries = 3                           # retries after the first attempt (0 = no retry)
-# retry_base_delay = 1.0                    # initial backoff seconds (exponential, +jitter)
-# retry_max_delay = 30.0                    # upper bound on backoff delay
-# rate_limit_rps = 0                        # requests/second cap (0 = disabled)
-
-# --- Embedded-text font ----------------------------------------------------
-# embed_font = "Noto Sans SC"                # system font name or path for the text layer
+# --- HTTP retry + rate limiting (unlimited engine API calls) ----------------
+# Applies to every API call; does NOT change OCR output.
+# max_retries = 3                            # retries after the first attempt (0 = no retry)
+# retry_base_delay = 1.0                     # initial backoff seconds (exponential, +jitter)
+# retry_max_delay = 30.0                     # upper bound on backoff delay
+# rate_limit_rps = 0                         # requests/second cap (0 = disabled)
 
 # --- Temp-file cleanup (see backend/cleanup.py) ----------------------------
 cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days
 cleanup_interval_hours = 6                   # background cleanup re-run interval
-
-# --- OCR result cache (see backend/ocr_cache.py) ----------------------------
-ocr_cache_enabled = true                 # reuse results of identical page+engine work
-ocr_cache_max_age_hours = 720            # cache entry TTL (default 30 days)
-
-# --- OCR-input image preprocessing (feature #2) -------------------------------
-# Applied to the rendered page image BEFORE OCR (PIL only).  Never changes the
-# image dimensions, so block bboxes keep their pixel-space meaning.  The WebUI
-# Settings modal mirrors these same flags.
-# preprocess_enabled = false             # master switch (default off)
-# preprocess_grayscale = true            # convert to grayscale first
-# preprocess_denoise = true              # light median filter (scanner noise)
-# preprocess_contrast = true             # histogram stretch (autocontrast)
-# preprocess_binarize = false            # Otsu threshold -> black/white
-# Environment overrides: OCR_PREPROCESS_ENABLED, OCR_PREPROCESS_GRAYSCALE,
-# OCR_PREPROCESS_DENOISE, OCR_PREPROCESS_CONTRAST, OCR_PREPROCESS_BINARIZE.
 
 # --- Logging (see backend/logging_config.py) -------------------------------
 log_level = "INFO"                           # "DEBUG" | "INFO" | "WARNING" | "ERROR"
