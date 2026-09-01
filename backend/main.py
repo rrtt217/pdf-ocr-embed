@@ -1,4 +1,4 @@
-"""FastAPI REST server for PDF OCR Embed.
+"""FastAPI REST server for PDF OCR Embed (OCRmyPDF core).
 
 Endpoints:
   POST /api/settings            save or read provider config (masked)
@@ -8,9 +8,12 @@ Endpoints:
   GET  /api/pages/{job_id}/{i}/image   page preview image
   GET  /api/pages/{job_id}      get all page OCR data
   POST /api/pages/{job_id}/{i}  update an editable page (optional)
-  POST /api/embed/{job_id}      embed (possibly edited) pages -> *_embedded.pdf
+  POST /api/embed/{job_id}      finalize (possibly edited) pages -> *_embedded.pdf
   GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
+
+The OCR core is OCRmyPDF; the unlimited engine ships as the
+``backend.ocrmypad`` plugin.
 """
 from __future__ import annotations
 
@@ -33,9 +36,8 @@ from starlette.background import BackgroundTask
 
 from backend import batch
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_cache, ocr_service, validation
+from backend import config, ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
-from backend.sources.factory import available_adapters
 
 setup_logging()
 log = logging.getLogger(__name__)
@@ -73,28 +75,26 @@ class SettingsModel(BaseModel):
     base_url: Optional[str] = None
     model: Optional[str] = None
     api_key: Optional[str] = None
-    adapter: Optional[str] = None
-    # --- OCR-input image preprocessing toggles (feature #2) ---
-    preprocess_enabled: Optional[bool] = None
-    preprocess_grayscale: Optional[bool] = None
-    preprocess_denoise: Optional[bool] = None
-    preprocess_contrast: Optional[bool] = None
-    preprocess_binarize: Optional[bool] = None
+    # Engine selection + ocrmypdf pipeline knobs.
+    ocr_engine: Optional[str] = None
+    ocrmypdf_mode: Optional[str] = None
+    ocrmypdf_jobs: Optional[str] = None
+    ocrmypdf_optimize: Optional[str] = None
+    ocrmypdf_output_type: Optional[str] = None
+    ocrmypdf_deskew: Optional[bool] = None
+    ocrmypdf_clean: Optional[bool] = None
+    ocrmypdf_rotate_pages: Optional[bool] = None
 
 
 class EmbedModel(BaseModel):
     job_id: str
-    adapter: Optional[str] = None
+    ocr_engine: Optional[str] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     model: Optional[str] = None
-    pages: Optional[list] = None
-    embed_font: Optional[str] = None   # system font name / path for the text layer
-    # --- output optimization (see backend/pdf_processing.optimize_images) ---
-    img_mode: Optional[str] = None      # none | jpeg | gray-jpeg
-    img_quality: Optional[int] = None   # 1..100 JPEG quality
-    img_downscale: Optional[int] = None # 2 (half) | 4 (quarter) raster dims
-    linearize: bool = False             # web-first / linearized PDF
+    # Output options (applied by ocrmypdf's finalize stage).
+    optimize: Optional[int] = None     # 0..3
+    output_type: Optional[str] = None  # pdf | pdfa
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -107,7 +107,16 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "adapters": available_adapters()}
+    from backend.ocrmypad.unlimited_engine import UnlimitedOcrEngine
+    return {
+        "status": "ok",
+        "adapters": ["unlimited"],
+        "engines": {
+            "unlimited": str(UnlimitedOcrEngine()),
+            "tesseract": "ocrmypdf built-in Tesseract",
+            "none": "no OCR",
+        },
+    }
 
 
 @app.get("/api/logs")
@@ -152,18 +161,6 @@ def run_cleanup(payload: CleanupModel) -> dict:
 
 
 
-@app.get("/api/cache")
-def cache_status() -> dict:
-    """Status of the cross-job OCR result cache (entries, hits/misses, TTL)."""
-    return ocr_cache.status()
-
-
-@app.post("/api/cache/clear")
-def cache_clear() -> dict:
-    """Drop every OCR cache entry (never touches OCR results in job state)."""
-    return ocr_cache.clear()
-
-
 @app.get("/api/settings")
 def get_settings() -> dict:
     return config.get_effective_settings()
@@ -171,29 +168,23 @@ def get_settings() -> dict:
 
 @app.post("/api/settings")
 def save_settings(payload: SettingsModel) -> dict:
-    # Include any preprocessing toggles the WebUI sent (kept when saving the
-    # provider fields and when only the toggles changed without an API key).
-    preprocess = {}
-    for key in ("preprocess_enabled", "preprocess_grayscale",
-                "preprocess_denoise", "preprocess_contrast",
-                "preprocess_binarize"):
+    data = {}
+    if payload.api_key is not None:
+        data["api_key"] = payload.api_key
+    for key in ("provider", "base_url", "model", "ocr_engine",
+                "ocrmypdf_mode", "ocrmypdf_jobs", "ocrmypdf_optimize",
+                "ocrmypdf_output_type"):
         value = getattr(payload, key, None)
         if value is not None:
-            preprocess[key] = value
-    if payload.api_key is not None:
-        # Persist via config.save (handles masked-key preservation).
-        data = {
-            "provider": payload.provider or "",
-            "base_url": payload.base_url or "",
-            "model": payload.model or "",
-            "api_key": payload.api_key,
-            **preprocess,
-        }
+            data[key] = value
+    for key in ("ocrmypdf_deskew", "ocrmypdf_clean", "ocrmypdf_rotate_pages"):
+        value = getattr(payload, key, None)
+        if value is not None:
+            data[key] = value
+    if data:
+        # Persist via config.save (handles masked-key preservation, and only
+        # writes the fields actually present in the payload).
         return config.save(data)
-    if preprocess:
-        # Only the preprocessing toggles changed — persist just those keys;
-        # config.save preserves every other field (provider, api_key, ...).
-        return config.save(dict(preprocess))
     # Read-only display mode.
     return config.get_effective_settings()
 
@@ -202,29 +193,21 @@ def save_settings(payload: SettingsModel) -> dict:
 async def upload_pdf(
     file: Optional[UploadFile] = File(None),
     files: Optional[List[UploadFile]] = File(None),
-    adapter: Optional[str] = Form("unlimited"),
-    concurrency: Optional[int] = Form(1),
+    ocr_engine: Optional[str] = Form("unlimited"),
+    concurrency: Optional[int] = Form(None),
     base_url: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    # tesseract adapter knobs
-    lang: Optional[str] = Form(None),
-    psm: Optional[int] = Form(None),
-    oem: Optional[int] = Form(None),
-    # generic_openai adapter knob
-    prompt: Optional[str] = Form(None),
 ) -> dict:
-    """Upload one or more PDFs; each file becomes its own OCR job (#10).
+    """Upload one or more PDFs; each file becomes its own OCR job.
 
     Both a single ``file`` field (legacy clients) and a repeated ``files``
     field (batch upload) are accepted; the two are merged and deduplicated.
     Every file is read into memory, gets its own job (id, card, SSE stream,
-    persistence) and is OCR'd concurrently with the same per-request knobs —
+    persistence) and is OCR'd by OCRmyPDF with the shared plugin engine —
     there is no separate queue manager.
 
-    Response: ``{"jobs": [{job_id, filename, status}, ...], concurrency}``.
-    When exactly one file was uploaded a backward-compatible top-level
-    ``job_id`` / ``filename`` / ``status`` is also included.
+    ``concurrency`` (optional) maps to the OCRmyPDF worker count for this job.
     """
     uploads: List[UploadFile] = []
     seen: set = set()
@@ -236,13 +219,13 @@ async def upload_pdf(
     if not uploads:
         raise HTTPException(status_code=400, detail="No file uploaded")
 
-    concurrency = max(1, int(concurrency or 1))
     extra = {}
-    for k, v in (("base_url", base_url), ("api_key", api_key),
-                 ("model", model), ("lang", lang), ("psm", psm),
-                 ("oem", oem), ("prompt", prompt)):
+    for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
+                 ("api_key", api_key), ("model", model)):
         if v is not None and v != "":
             extra[k] = v
+    if concurrency is not None and int(concurrency) > 0:
+        extra["jobs"] = int(concurrency)
 
     loop = asyncio.get_running_loop()
     jobs = []
@@ -251,20 +234,18 @@ async def upload_pdf(
         if not contents:
             raise HTTPException(status_code=400, detail="Empty file")
         job = ocr_service.create_job(uf.filename or "upload.pdf", contents)
-        # Per-request overrides for this job only (not persisted).
-        ocr_service._set(job, adapter=adapter or "unlimited")
         loop.run_in_executor(
-            None, ocr_service.run_ocr, job["id"], adapter,
-            extra or None, concurrency)
-        log.info("upload job %s: %s, concurrency=%d",
-                 job["id"], job["filename"], concurrency)
+            None, ocr_service.run_ocr, job["id"], extra or None)
+        log.info("upload job %s: %s (engine=%s)", job["id"], job["filename"],
+                 extra.get("ocr_engine") or "unlimited")
         jobs.append({
             "job_id": job["id"],
             "filename": job["filename"],
             "status": "running",
         })
 
-    result: dict = {"jobs": jobs, "concurrency": concurrency}
+    result: dict = {"jobs": jobs,
+                    "concurrency": int(concurrency or 0) or None}
     if len(jobs) == 1:
         # Backward-compatible single-file shape for older frontend clients.
         result.update({
@@ -319,15 +300,11 @@ def zip_download(jobs: str):
 @app.post("/api/ocr/retry/{job_id}")
 async def retry_ocr(
     job_id: str,
-    adapter: Optional[str] = Form("unlimited"),
-    concurrency: Optional[int] = Form(1),
+    ocr_engine: Optional[str] = Form("unlimited"),
+    concurrency: Optional[int] = Form(None),
     base_url: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
-    lang: Optional[str] = Form(None),
-    psm: Optional[int] = Form(None),
-    oem: Optional[int] = Form(None),
-    prompt: Optional[str] = Form(None),
     page_start: Optional[int] = Form(None),
     page_end: Optional[int] = Form(None),
     force: Optional[bool] = Form(False),
@@ -335,38 +312,35 @@ async def retry_ocr(
     """Re-run OCR on an already-uploaded job without re-uploading the PDF.
 
     All fields are optional form fields so old clients keep working:
-      - adapter / concurrency / base_url / api_key / model / lang / psm /
-        oem / prompt — as before.
+      - ocr_engine / base_url / api_key / model / concurrency — as before.
       - page_start / page_end: a 1-based inclusive page range to run
         (both optional; e.g. page_start=1,page_end=20 runs pages 1..20).
       - force: boolean, default false — when true, already-successful pages in
         the selected range are re-run too (A/B testing after switching
-        prompt/engine).
+        engine/settings).
     """
     job = ocr_service.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    concurrency = max(1, int(concurrency or 1))
     extra = {}
-    for k, v in (("base_url", base_url), ("api_key", api_key),
-                 ("model", model), ("lang", lang), ("psm", psm),
-                 ("oem", oem), ("prompt", prompt)):
+    for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
+                 ("api_key", api_key), ("model", model)):
         if v is not None and v != "":
             extra[k] = v
+    if concurrency is not None and int(concurrency) > 0:
+        extra["jobs"] = int(concurrency)
     page_range = None
     if page_start is not None or page_end is not None:
         page_range = (page_start if page_start is not None else 1,
                       page_end if page_end is not None else job.get("num_pages", 0))
     ok = ocr_service.retry_job(
-        job_id, adapter_name=adapter or "unlimited",
-        extra_cfg=extra or None, concurrency=concurrency,
+        job_id, overrides=extra or None,
         page_range=page_range, force=bool(force))
     if not ok:
         raise HTTPException(status_code=409, detail="Job cannot be retried (missing file)")
-    log.info("retry scheduled for job %s (concurrency=%d, range=%s, force=%s)",
-             job_id, concurrency, page_range, force)
-    return {"job_id": job_id, "filename": job["filename"], "status": "retrying",
-            "concurrency": concurrency}
+    log.info("retry scheduled for job %s (range=%s, force=%s)",
+             job_id, page_range, force)
+    return {"job_id": job_id, "filename": job["filename"], "status": "retrying"}
 
 
 @app.post("/api/ocr/stop/{job_id}")
@@ -410,6 +384,7 @@ async def stream(job_id: str):
         # as "running" in one iteration (drained) is re-sent by the fallback
         # branch in the next one — the client gets "done" twice.
         terminal_delivered = False
+        delivered_pages: set = set()
         while True:
             cur = ocr_service.get_job(job_id)
             if cur is None:
@@ -424,8 +399,26 @@ async def stream(job_id: str):
             events = ocr_service.drain_events(job_id)
             for ev in events:
                 yield _sse(ev)
-                if ev.get("type") == "status" and ev.get("status") in ("done", "stopped"):
+                if ev.get("type") == "status" and ev.get("status") in ("done", "stopped", "embedded"):
                     terminal_delivered = True
+
+            # Per-page progress: the plugin engine reports completed pages into
+            # the shared registry; stream each newly completed page.
+            from backend.ocrmypad import progress as progress_mod
+            snap = progress_mod.snapshot(job_id)
+            done = snap.get("done_indices") or []
+            total = cur.get("num_pages") or snap.get("total") or 0
+            for page_no in done:
+                if page_no in delivered_pages:
+                    continue
+                delivered_pages.add(page_no)
+                yield _sse({
+                    "type": "progress",
+                    "current": page_no,
+                    "total": total,
+                    "pages_done": snap.get("pages_done", 0),
+                    "page_index": page_no - 1,
+                })
 
             if status in ("done", "embedded"):
                 # Guarantee the "done" status reaches the client even if the
@@ -435,7 +428,7 @@ async def stream(job_id: str):
                         "type": "status",
                         "status": "done",
                         "message": "OCR complete",
-                        "result": [p for p in cur["pages"] if p is not None],
+                        "result": ocr_service.get_pages(job_id),
                     })
                 break
             if status == "stopped":
@@ -443,7 +436,7 @@ async def stream(job_id: str):
                     yield _sse({
                         "type": "status", "status": "stopped",
                         "message": cur.get("error") or "OCR stopped",
-                        "result": [p for p in cur["pages"] if p is not None],
+                        "result": ocr_service.get_pages(job_id),
                     })
                 break
             if status == "error":
@@ -486,8 +479,11 @@ def update_page(job_id: str, page_index: int, payload: dict) -> dict:
             status_code=400,
             detail=f"page_index out of range: {page_index} (job has "
                    f"{max_index} page(s))")
-    pages = ocr_service.update_page(job_id, page_index, payload)
-    return {"ok": True, "page_count": len(pages)}
+    try:
+        count = ocr_service.update_page(job_id, page_index, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "page_count": count}
 
 
 @app.get("/api/pages/{job_id}/{page_index}/image")
@@ -502,150 +498,48 @@ def page_image(job_id: str, page_index: int):
     return FileResponse(path, media_type="image/png")
 
 
-class PreviewModel(BaseModel):
-    pages: Optional[list] = None   # list of OcrPage dicts (with font_scale)
-    embed_font: Optional[str] = None
-
-
-def _resolve_embed_font(font_name: Optional[str]):
-    """Resolve a requested embed font name to a FontSpec (config as fallback)."""
-    from backend import fonts
-    if font_name:
-        return fonts.resolve_font(font_name)
-    cfg_font = config.resolve().get("embed_font")
-    if cfg_font:
-        return fonts.resolve_font(cfg_font)
-    return fonts.resolve_font(None)  # default (first registry font)
-
-
-@app.post("/api/preview/{job_id}/{page_index}")
-def preview_overlay(job_id: str, page_index: int, payload: PreviewModel):
-    """Render a page's scan with the placed text drawn VISIBLY (debug view).
-
-    The body carries the current (possibly edited) page dicts, so the overlay
-    reflects each block's interactive ``font_scale`` without syncing server job
-    state on every slider move.  Returns a PNG.
-    """
-    job = ocr_service.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    pages = payload.pages
-    if not pages:
-        pages = ocr_service.get_pages(job_id)
-    import backend.pdf_processing as pdf_processing
-    from backend.models import dict_to_page
-    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
-    if not ocr_pages:
-        raise HTTPException(status_code=400, detail="No page data to preview")
-    embed_font = _resolve_embed_font(payload.embed_font)
-    try:
-        out = pdf_processing.render_overlay(
-            job["pdf_path"], ocr_pages, page_index,
-            pdf_processing.ensure_output_dir(), for_page=page_index,
-            embed_font=embed_font,
-        )
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc))
-    return FileResponse(str(out), media_type="image/png")
-
-
-@app.post("/api/fontinfo/{job_id}/{page_index}")
-def fontinfo(job_id: str, page_index: int, payload: PreviewModel):
-    """Return each block's derived / applied font size for the debug UI.
-
-    Body carries current page dicts (with font_scale).  Returns per-block:
-    {index, kind, derived_fs, fs (after font_scale), bbox}.
-    """
-    job = ocr_service.get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-    pages = payload.pages or ocr_service.get_pages(job_id)
-    import backend.pdf_processing as pdf_processing
-    from backend.models import dict_to_page
-    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
-    cfg = next((p for p in ocr_pages if p.page_index == page_index), None)
-    if cfg is None:
-        return {"blocks": []}
-    embed_font = _resolve_embed_font(payload.embed_font)
-    pdf_processing.set_embed_font(embed_font)
-    try:
-        # Open the source doc to get page geometry for layout.
-        with pdf_processing.open_pdf(job["pdf_path"]) as doc:
-            target = max(0, min(page_index, doc.page_count - 1))
-            pg = doc[target]
-            rect = pg.rect
-            w_scale = rect.width / cfg.width if cfg.width else 1.0
-            h_scale = rect.height / cfg.height if cfg.height else 1.0
-            out = []
-            for bi, block in enumerate(cfg.blocks):
-                if block.kind in ("image", "image_ref") or not block.text.strip():
-                    continue
-                lay = pdf_processing._compute_block_layout(
-                    block, pg, w_scale, h_scale, font_scale=block.font_scale)
-                out.append({
-                    "index": bi,
-                    "kind": block.kind,
-                    "bbox": block.bbox,
-                    "derived_fs": round(lay["derived"], 2),
-                    "fs": round(lay["fontsize"], 2),
-                    "font_scale": block.font_scale,
-                    "lines": len(lay["lines"]),
-                })
-        return {"blocks": out}
-    finally:
-        pdf_processing.set_embed_font(None)
-
-
 @app.post("/api/embed/{job_id}")
 def embed(job_id: str, payload: EmbedModel):
     if ocr_service.get_job(job_id) is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Allow either the body pages or the server-side stored pages.
-    pages = payload.pages
-    if pages is None:
-        pages = ocr_service.get_pages(job_id)
-    embed_font = _resolve_embed_font(payload.embed_font)
-    # embed_job filters out None entries, so partial results work too.
+    # Finalize options (output optimization) from the payload; the text layer
+    # itself is rendered by OCRmyPDF from the stored (possibly edited) hOCR.
+    overrides = {}
+    if payload.optimize is not None:
+        overrides["optimize"] = payload.optimize
+    if payload.output_type:
+        overrides["output_type"] = payload.output_type
     try:
-        out_path, img_stats = ocr_service.embed_job(
-            job_id, pages, embed_font=embed_font,
-            img_mode=payload.img_mode, img_quality=payload.img_quality,
-            img_downscale=payload.img_downscale, linearize=payload.linearize)
+        out_path, stats = ocr_service.embed_job(job_id, overrides or None)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
-    # Post-embed validation (#17): compare the freshly baked output against the
-    # exact pages that were embedded (payload pages if provided, else stored).
-    # Never fails the embed — a broken report is surfaced as ok:false instead.
-    report = _build_embed_report(out_path, pages)
+    # Post-embed validation: compare the freshly baked output against the
+    # stored pages.  Never fails the embed — a broken report is surfaced as
+    # ok:false instead.
+    report = _build_embed_report(job_id, Path(out_path))
     return {
         "status": "embedded",
-        "filename": out_path.name,
+        "filename": Path(out_path).name,
         "url": f"/api/download/{job_id}.pdf",
-        "font": embed_font.name,
-        "images": img_stats,
+        "images": stats,
         "report": report,
     }
 
 
-def _build_embed_report(out_path: Path, pages: list) -> dict:
+def _build_embed_report(job_id: str, out_path: Path) -> dict:
     """Best-effort report for the POST /api/embed response (never raises)."""
     from backend.models import dict_to_page
-    ocr_pages = [dict_to_page(p) for p in pages if isinstance(p, dict)]
-    if not ocr_pages:
+    pages = [dict_to_page(p) for p in ocr_service.get_pages(job_id)
+             if isinstance(p, dict)]
+    if not pages:
         return {"ok": False, "error": "no embeddable pages to validate"}
     try:
-        return validation.build_report(str(out_path), ocr_pages)
+        return validation.build_report(str(out_path), pages)
     except Exception as exc:  # noqa: BLE001
         log.exception("validation after embed failed")
         return {"ok": False, "error": str(exc)}
-
-
-@app.get("/api/fonts")
-def fonts_available() -> dict:
-    from backend import fonts
-    return {"fonts": fonts.available_fonts()}
 
 
 @app.get("/api/download/{job_id}.pdf")
