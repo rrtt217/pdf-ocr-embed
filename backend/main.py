@@ -233,13 +233,17 @@ async def upload_pdf(
         contents = await uf.read()
         if not contents:
             raise HTTPException(status_code=400, detail="Empty file")
-        job = ocr_service.create_job(uf.filename or "upload.pdf", contents)
+        try:
+            job = ocr_service.create_job(uf.filename or "upload.pdf", contents)
+        except ValueError as exc:
+            # Unreadable / non-PDF bytes: a client error, not a 500.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         loop.run_in_executor(
-            None, ocr_service.run_ocr, job["id"], extra or None)
-        log.info("upload job %s: %s (engine=%s)", job["id"], job["filename"],
-                 extra.get("ocr_engine") or "unlimited")
+            None, ocr_service.run_ocr, job["job_id"], extra or None)
+        log.info("upload job %s: %s (engine=%s)", job["job_id"],
+                 job["filename"], extra.get("ocr_engine") or "unlimited")
         jobs.append({
-            "job_id": job["id"],
+            "job_id": job["job_id"],
             "filename": job["filename"],
             "status": "running",
         })

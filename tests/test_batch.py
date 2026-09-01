@@ -38,27 +38,23 @@ def _stub_lifespan(monkeypatch):
 def _use_tmp_dirs(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(pdf_processing, "OUTPUT_DIR", tmp_path / "output")
 
 
 def _make_job(job_id: str, filename: str, embedded_path=None,
               status: str = "embedded") -> dict:
     job = {
-        "id": job_id,
+        "job_id": job_id,
         "filename": filename,
         "pdf_path": f"/tmp/{job_id}.pdf",
-        "img_dir": f"/tmp/work/{job_id}",
-        "pages": [],
+        "hocr_dir": f"/tmp/work/{job_id}/hocr",
+        "previews_dir": f"/tmp/work/{job_id}/previews",
         "num_pages": 0,
+        "pages_done": 0,
         "current": 0,
         "status": status,
-        "adapter": "unlimited",
-        "concurrency": 1,
-        "error": None,
+        "error": "",
         "embedded_path": embedded_path,
-        "thumb_path": None,
-        "created": 0,
-        "cancel_event": threading.Event(),
+        "created_at": "",
     }
     with ocr_service._jobs_lock:
         ocr_service._JOBS[job_id] = job
@@ -174,15 +170,16 @@ def test_build_zip_skips_missing_member(tmp_path):
         assert zf.namelist() == ["ok.pdf"]
 
 
-def test_create_jobs_helper_creates_independent_jobs(monkeypatch, tmp_path):
+def test_create_job_helper_creates_independent_jobs(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    jobs = ocr_service.create_jobs([("a.pdf", b"%PDF-a"), ("b.pdf", b"%PDF-b")])
+    jobs = [ocr_service.create_job("a.pdf", _real_pdf("a")),
+            ocr_service.create_job("b.pdf", _real_pdf("b"))]
     assert len(jobs) == 2
     assert jobs[0]["filename"] == "a.pdf" and jobs[1]["filename"] == "b.pdf"
-    assert jobs[0]["id"] != jobs[1]["id"]
+    assert jobs[0]["job_id"] != jobs[1]["job_id"]
     for job in jobs:
-        assert ocr_service.get_job(job["id"]) is not None
-        _drop_job(job["id"])
+        assert ocr_service.get_job(job["job_id"]) is not None
+        _drop_job(job["job_id"])
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +190,15 @@ def _noop_run_ocr(*_args, **_kwargs):
     return None
 
 
+def _real_pdf(tag: str) -> bytes:
+    doc = fitz.open()
+    page = doc.new_page(width=100, height=100)
+    page.insert_text(fitz.Point(10, 50), tag)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
 def test_upload_accepts_multiple_files(monkeypatch, tmp_path):
     _stub_lifespan(monkeypatch)
     _use_tmp_dirs(monkeypatch, tmp_path)
@@ -200,8 +206,8 @@ def test_upload_accepts_multiple_files(monkeypatch, tmp_path):
     try:
         with TestClient(app) as client:
             r = client.post("/api/ocr/upload", files=[
-                ("files", ("a.pdf", b"%PDF-A", "application/pdf")),
-                ("files", ("b.pdf", b"%PDF-B", "application/pdf")),
+                ("files", ("a.pdf", _real_pdf("A"), "application/pdf")),
+                ("files", ("b.pdf", _real_pdf("B"), "application/pdf")),
             ])
         assert r.status_code == 200, r.text
         data = r.json()
@@ -213,7 +219,7 @@ def test_upload_accepts_multiple_files(monkeypatch, tmp_path):
         for j in data["jobs"]:
             job = ocr_service.get_job(j["job_id"])
             assert job is not None and job["filename"] == j["filename"]
-            assert job["status"] == "uploaded"  # run_ocr stubbed -> still uploaded
+            assert job["status"] == "queued"  # run_ocr stubbed -> still queued
     finally:
         for jid in list(ocr_service._JOBS):
             _drop_job(jid)
@@ -227,7 +233,7 @@ def test_upload_single_file_backward_compat(monkeypatch, tmp_path):
     try:
         with TestClient(app) as client:
             r = client.post("/api/ocr/upload",
-                            files=[("file", ("legacy.pdf", b"%PDF-legacy",
+                            files=[("file", ("legacy.pdf", _real_pdf("L"),
                                              "application/pdf"))])
         assert r.status_code == 200, r.text
         data = r.json()
@@ -249,6 +255,10 @@ def test_upload_rejects_empty_batch_and_empty_file(monkeypatch, tmp_path):
             assert client.post("/api/ocr/upload").status_code == 400
             assert client.post("/api/ocr/upload", files=[
                 ("files", ("empty.pdf", b"", "application/pdf")),
+            ]).status_code == 400
+            # Non-PDF bytes are rejected by upload validation.
+            assert client.post("/api/ocr/upload", files=[
+                ("files", ("fake.pdf", b"%PDF-not-really", "application/pdf")),
             ]).status_code == 400
     finally:
         for jid in list(ocr_service._JOBS):

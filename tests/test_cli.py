@@ -98,18 +98,16 @@ def test_cli_help_subprocess():
         text=True,
     )
     assert result.returncode == 0
-    assert "--adapter" in result.stdout
+    assert "--engine" in result.stdout
     assert "--pages" in result.stdout
 
 
-def test_cli_adapter_list_no_network():
+def test_cli_missing_input_exits_nonzero():
     result = subprocess.run(
-        [VENV_PY, "-m", "backend.cli", "does_not_exist.pdf", "--adapter", "list"],
+        [VENV_PY, "-m", "backend.cli", "does_not_exist.pdf"],
         cwd=str(ROOT),
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0
-    names = result.stdout.strip().splitlines()
-    assert "unlimited" in names
-    assert "tesseract" in names
+    assert result.returncode != 0
+    assert "input not found" in result.stderr

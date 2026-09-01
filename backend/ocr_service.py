@@ -351,6 +351,8 @@ def retry_job(job_id: str, overrides: Optional[dict] = None,
     job = get_job(job_id)
     if job is None:
         return False
+    if job.get("status") in ("running", "stopping"):
+        return False
     if not job.get("pdf_path") or not Path(job["pdf_path"]).exists():
         return False
     overrides = dict(overrides or {})

@@ -75,7 +75,7 @@ def _pages_arg(pages_0based: List[int], num_pages: int) -> Optional[str]:
     return ",".join(str(i + 1) for i in pages_0based)
 
 
-def main() -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     setup_logging()
     parser = argparse.ArgumentParser(
         prog="python -m backend.cli",
@@ -92,7 +92,7 @@ def main() -> int:
                         help="worker count (default: config ocrmypdf_jobs, else auto)")
     parser.add_argument("--sidecar-text", action="store_true",
                         help="print the recognized text to stdout as JSON pages")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     input_path = Path(args.input)
     if not input_path.exists():
