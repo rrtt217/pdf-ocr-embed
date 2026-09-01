@@ -7,13 +7,13 @@ stream into blocks (``backend.ocrmypad.parser``), and writes:
 * an hOCR file (what ocrmypdf's fpdf2 renderer turns into the invisible text
   layer, and what ``ocrmypdf._hocr_to_ocr_pdf`` renders after user edits), and
 * a plain-text sidecar, and
-* a block sidecar JSON (``*_ocr_hocr.blocks.json``) that the WebUI edits and
-  that feeds progress reporting.
+* a block sidecar JSON (``*_ocr_hocr.blocks.json``) that the WebUI edits.
 
-Page attribution: the engine derives the job id from ``options.output_folder``
-(the hOCR pipeline's work folder sits directly under the job dir, a convention
-documented in ``backend.ocr_service``) and reports progress into
-``backend.ocrmypad.progress``.
+Decoupling: the engine communicates with the backend ONLY through the job's
+work folder on disk (hOCR, sidecars, the ``<job>/cancel`` flag file).  It
+derives the job dir from ``options.output_folder`` (the hOCR pipeline's work
+folder, a convention documented in ``backend.ocr_service``) and never imports
+job/progress state.
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from backend.ocrmypad import progress as progress_mod
 from backend.ocrmypad.engine_client import (
     UnlimitedOcrClient,
     image_dpi,
@@ -33,6 +32,7 @@ from backend.ocrmypad.parser import (
     hocr_page_sidecar_text,
     parse_response,
 )
+from backend.page_store import is_cancelled
 from ocrmypdf import hookimpl
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 
@@ -42,22 +42,35 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _job_id_from_options(options: "OcrOptions | None") -> str:
-    """Derive the job id from the hOCR pipeline's work folder.
+def _job_dir_from_options(options: "OcrOptions | None") -> Path:
+    """Derive the job dir from the hOCR pipeline's work folder.
 
     Convention (backend.ocr_service): ``_pdf_to_hocr`` is called with
     ``output_folder = work/<job_id>/hocr`` — the parent of that folder is the
-    job dir.  Unknown conventions return "" and progress reporting is skipped.
+    job dir (where the ``cancel`` flag lives).  Unknown conventions return
+    the work folder's own parent, which simply never has a cancel flag.
     """
     if options is None:
-        return ""
+        return Path()
     folder = getattr(options, "output_folder", None)
     if not folder:
-        return ""
+        return Path()
     try:
-        return Path(folder).resolve().parent.name
+        return Path(folder).resolve().parent
     except (OSError, ValueError, TypeError):
-        return ""
+        return Path()
+
+
+def _page_index_from_name(name: str) -> int:
+    """Parse the 0-based page index from an ocrmypdf page file name.
+
+    ocrmypdf names per-page work files ``000001_ocr_hocr.hocr`` etc.
+    Returns 0 when the prefix is unparseable.
+    """
+    try:
+        return max(0, int(name.split("_", 1)[0]) - 1)
+    except (ValueError, IndexError):
+        return 0
 
 
 class UnlimitedOcrEngine(OcrEngine):
@@ -120,13 +133,13 @@ class UnlimitedOcrEngine(OcrEngine):
         Runs inside ocrmypdf's worker threads.  Raises (fails the run) on
         genuine OCR failures; the caller's retry flow re-runs the job.
         """
-        job_id = _job_id_from_options(options)
-        if job_id and progress_mod.is_cancelled(job_id):
+        job_dir = _job_dir_from_options(options)
+        if job_dir != Path() and is_cancelled(job_dir):
             raise RuntimeError("OCR job cancelled by user")
 
         width, height = image_size(input_file)
         dpi = image_dpi(input_file)
-        page_index = progress_mod.page_number_from_hocr_name(output_hocr.name)
+        page_index = _page_index_from_name(output_hocr.name)
 
         cfg: dict[str, Any] = {}
         try:
@@ -159,8 +172,6 @@ class UnlimitedOcrEngine(OcrEngine):
         except OSError:
             log.warning("page %d: failed to write block sidecar", page_index)
 
-        if job_id:
-            progress_mod.report_page(job_id, page_index)
         log.info("page %d: %d block(s) recognized", page_index + 1,
                  len(page.blocks))
 

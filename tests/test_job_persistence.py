@@ -196,3 +196,84 @@ def test_run_ocr_page_selection_only_runs_remaining(monkeypatch, tmp_path):
     assert "pages" not in captured
     assert ocr_service.get_job(job["job_id"])["status"] == "done"
     ocr_service.clear_job(job["job_id"])
+
+
+def test_embedded_path_named_after_source(monkeypatch, tmp_path):
+    """The finalize output is `<source stem>_embedded.pdf` in the job dir —
+    never a hardcoded name (same-named uploads must not overwrite each
+    other), and hostile characters are sanitized away."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('My Report: v2?.pdf', _real_pdf())
+    path = ocr_service._embedded_path(job)
+    assert path.parent == ocr_service._job_dir(job['job_id'])
+    assert path.name == 'My Report_ v2__embedded.pdf'
+    # A previous result of the same job is disambiguated, not overwritten.
+    path.write_bytes(b'%PDF-old-result')
+    path2 = ocr_service._embedded_path(job)
+    assert path2.name == 'My Report_ v2__embedded_' + job['job_id'] + '.pdf'
+    ocr_service.clear_job(job['job_id'])
+
+
+def _write_hocr_only(job, page_no: int, text: str = "tesseract line"):
+    """Drop ONLY an hOCR file (as ocrmypdf's built-in Tesseract would — no
+    block sidecar), with page geometry but no scan_res."""
+    hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+            f"{page_no:06d}_ocr_hocr.hocr")
+    hocr.parent.mkdir(parents=True, exist_ok=True)
+    hocr.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n<body>\n'
+        f"<div class='ocr_page' title='bbox 0 0 1000 2000; ppageno {page_no - 1}'>\n"
+        " <p class='ocr_par' title='bbox 100 100 900 200'>\n"
+        f"  <span class='ocr_line' title='bbox 100 100 900 200'>"
+        f"<span class='ocrx_word' title='bbox 100 100 900 200'>{text}</span></span>\n"
+        " </p>\n"
+        "</div>\n</body>\n</html>\n",
+        encoding="utf-8")
+    return hocr
+
+
+def test_tesseract_hocr_only_page_is_editable_and_embeddable(monkeypatch, tmp_path):
+    """An engine that writes only hOCR (ocrmypdf's built-in Tesseract) must
+    still give the WebUI editable pages and a passing embed guard: the page
+    store derives the sidecar from the hOCR via ocrmypdf's own parser."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=1)
+    _write_hocr_only(job, 1, "recognized by tesseract")
+
+    # The hOCR-only page counts as a result and is editable.
+    assert ocr_service._embedded_path(job) is not None
+    pages = ocr_service.get_pages(job["job_id"])
+    assert len(pages) == 1
+    assert pages[0]["blocks"][0]["text"] == "recognized by tesseract"
+
+    # An edit works on the derived page and regenerates the hOCR.
+    ocr_service.update_page(job["job_id"], 0, {
+        "blocks": [{"kind": "text", "bbox": [100, 100, 900, 200],
+                    "text": "edited by user"}]})
+    hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+            "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
+    assert "edited by user" in hocr
+    sidecar = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+               "000001_ocr_hocr.blocks.json")
+    assert sidecar.exists()  # derived sidecar now persisted
+
+    # The embed guard passes for an hOCR-only job.
+    assert ocr_service.page_store.has_results(
+        ocr_service._job_dir(job["job_id"]) / "hocr") is True
+    ocr_service.clear_job(job["job_id"])
+
+
+def test_retry_remaining_counts_hocr_only_pages(monkeypatch, tmp_path):
+    """Pages that only have an hOCR file count as done for the retry-remaining
+    selection (engine-agnostic progress)."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=2)
+    _write_hocr_only(job, 1)
+    statuses = [bool(p) for p in ocr_service.get_page_dicts(job["job_id"])]
+    assert statuses == [True, False]
+    from backend.ocr_service import select_pages
+    assert select_pages(2, statuses) == [2]
+    ocr_service.clear_job(job["job_id"])

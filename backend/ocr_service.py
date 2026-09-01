@@ -30,7 +30,7 @@ from typing import Deque, Dict, List, Optional
 
 import fitz  # PyMuPDF
 
-from backend import pdf_processing
+from backend import page_store, pdf_processing
 from backend.config import as_bool, redact_secrets, resolve
 from backend.errors import UnavailableError
 
@@ -224,13 +224,15 @@ def restore_jobs() -> int:
 
 
 def clear_job(job_id: str) -> bool:
-    """Fully remove a job: in-memory state and its work dir."""
+    """Fully remove a job: in-memory state and its work dir.
+
+    The whole work dir (hOCR, sidecars, cancel flag) goes with it — the
+    engine's filesystem channel is the only state to clean.
+    """
     with _jobs_lock:
         job = _JOBS.pop(job_id, None)
     if job is None:
         return False
-    from backend.ocrmypad import progress as progress_mod
-    progress_mod.pop(job_id)
     shutil.rmtree(_job_dir(job_id), ignore_errors=True)
     UPLOAD_DIR.joinpath(f"{job_id}.pdf").unlink(missing_ok=True)
     return True
@@ -309,9 +311,10 @@ def _ocrmypdf_options(**overrides):
 def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     """Run the OCR phase for one job (worker-thread entry point).
 
-    Calls ``ocrmypdf._pdf_to_hocr``: the plugin engine runs per page and leaves
-    hOCR + block sidecars under the job's hOCR work folder.  Failures mark the
-    job error'd; a user-requested stop marks it stopped with partial pages.
+    Calls ``ocrmypdf._pdf_to_hocr``: the engine (unlimited plugin or ocrmypdf's
+    built-in Tesseract) runs per page and leaves hOCR files under the job's
+    hOCR work folder.  Failures mark the job error'd; a user-requested stop
+    marks it stopped with partial pages.
 
     "Retry remaining" semantics: when ``overrides['_page_selection']`` is set
     (computed by ``retry_job`` from the pages that don't have a result yet),
@@ -320,7 +323,6 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     page already has a result: the job is marked done without re-running OCR.
     """
     import ocrmypdf.api
-    from backend.ocrmypad import progress as progress_mod
 
     job = get_job(job_id)
     if job is None:
@@ -334,9 +336,9 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     selection = overrides.get("_page_selection")
     if selection is not None:
         if not selection:
-            # Nothing to run: every selected page already has a block sidecar.
-            progress_mod.reset(job_id, total)
-            _set(job_id, status="done", pages_done=len(_block_sidecars(job_id)),
+            # Nothing to run: every selected page already has a result.
+            _set(job_id, status="done",
+                 pages_done=len(page_store.page_numbers(Path(job["hocr_dir"]))),
                  error="")
             _push_event(job_id, {"type": "status", "status": "done",
                                  "message": "All selected pages already done"})
@@ -345,7 +347,6 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
         if len(selection) < total:
             options["pages"] = ",".join(str(n) for n in sorted(selection))
 
-    progress_mod.reset(job_id, total)
     _set(job_id, status="running", current=0, error="")
     _push_event(job_id, {"type": "status", "status": "running",
                          "message": "OCR started (OCRmyPDF)"})
@@ -366,21 +367,21 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
         _persist_if_live(job_id)
         return
     except Exception as exc:  # noqa: BLE001
-        cancelled = progress_mod.snapshot(job_id).get("cancel")
+        cancelled = page_store.is_cancelled(_job_dir(job_id))
         message = "OCR stopped by user" if cancelled else redact_secrets(str(exc))
         status = "stopped" if cancelled else "error"
         log.error("job %s: OCR phase failed: %s", job_id, message)
         # pages_done reflects the pages that actually have results on disk
         # (a partially completed run keeps its completed pages).
         _set(job_id, status=status, error=message,
-             pages_done=len(_block_sidecars(job_id)))
+             pages_done=len(page_store.page_numbers(Path(job["hocr_dir"]))))
         _push_event(job_id, {"type": "error" if status == "error" else "status",
                              "status": status, "message": message})
         _persist_if_live(job_id)
         return
 
-    progress_mod.reset(job_id, total)
-    _set(job_id, status="done", pages_done=len(_block_sidecars(job_id)),
+    _set(job_id, status="done",
+         pages_done=len(page_store.page_numbers(Path(job["hocr_dir"]))),
          error="")
     _push_event(job_id, {"type": "status", "status": "done",
                          "message": "OCR complete"})
@@ -388,12 +389,15 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
 
 
 def stop_job(job_id: str) -> bool:
-    """Ask a running job to stop after its current page."""
+    """Ask a running job to stop after its current page.
+
+    The cancel flag is a plain file in the job dir; the engine polls for it
+    per page (the only engine <-> service channel besides the work files).
+    """
     job = get_job(job_id)
     if job is None or job.get("status") != "running":
         return False
-    from backend.ocrmypad import progress as progress_mod
-    progress_mod.request_cancel(job_id)
+    page_store.request_cancel(_job_dir(job_id))
     _set(job_id, status="stopping")
     _push_event(job_id, {"type": "status", "status": "stopping",
                          "message": "Stopping after the current page..."})
@@ -432,53 +436,44 @@ def _page_status_list(job_id: str) -> list:
 
 # --- editable pages ----------------------------------------------------------
 
-def _block_sidecars(job_id: str) -> List[Path]:
-    """The job's block sidecar files (000001_ocr_hocr.blocks.json, sorted)."""
-    hdir = Path(get_job(job_id)["hocr_dir"]) if get_job(job_id) else None
-    if hdir is None or not hdir.exists():
-        return []
-    return sorted(hdir.glob("*_ocr_hocr.blocks.json"))
+def _embedded_path(job: dict) -> Path:
+    """The finalize output path for a job: `<stem>_embedded.pdf`.
 
-
-def _hocr_files(job_id: str) -> List[Path]:
-    """The job's hOCR files (000001_ocr_hocr.hocr, sorted)."""
-    job = get_job(job_id)
-    if job is None:
-        return []
-    hdir = Path(job["hocr_dir"])
-    if not hdir.exists():
-        return []
-    return sorted(hdir.glob("*_ocr_hocr.hocr"))
-
-
-def _sidecar_path(job_id: str, page_no: int) -> Optional[Path]:
-    """The sidecar for a 1-based page number, or None when absent."""
-    hdir = get_job(job_id) and Path(get_job(job_id)["hocr_dir"])
-    if not hdir:
-        return None
-    path = hdir / f"{page_no:06d}_ocr_hocr.blocks.json"
-    return path if path.exists() else None
-
-
-def _page_name(page_no: int) -> str:
-    return f"{page_no:06d}_ocr_hocr"
+    Named after the SOURCE file (never hardcoded): re-running the same book
+    keeps its previous result distinguishable, and the download filename
+    (`GET /api/download/{job_id}.pdf` serves this file) carries the real
+    document name.  When a previous result of the SAME job is still on disk
+    under that name (e.g. an earlier finalize of the same upload), the job id
+    disambiguates instead of silently overwriting it.
+    """
+    stem = (Path(job.get("filename") or "document.pdf").stem or "document")
+    # Filesystem-hostile characters never reach the name.
+    for ch in "/\\:*?\"<>|":
+        stem = stem.replace(ch, "_")
+    stem = stem.strip().rstrip(".") or "document"
+    out = _job_dir(job["job_id"]) / f"{stem}_embedded.pdf"
+    if out.exists():
+        out = _job_dir(job["job_id"]) / f"{stem}_embedded_{job['job_id']}.pdf"
+    return out
 
 
 def get_page_dicts(job_id: str) -> List[Optional[dict]]:
-    """Per-page dicts (None for pages without a result), 1-based indexed."""
+    """Per-page dicts (None for pages without a result), 1-based indexed.
+
+    Reads through the engine-agnostic page store: a page with only an hOCR
+    file (e.g. ocrmypdf's built-in Tesseract, which writes no block sidecar)
+    is derived from it and becomes editable exactly like an engine-native one.
+    """
     pages: List[Optional[dict]] = []
     job = get_job(job_id)
     total = int((job or {}).get("num_pages") or 0)
-    for page_no in range(1, max(total, len(_block_sidecars(job_id))) + 1):
-        path = _sidecar_path(job_id, page_no)
-        if path is None:
+    hdir = Path(job["hocr_dir"]) if job else None
+    done = sorted(page_store.page_numbers(hdir)) if hdir else []
+    for page_no in range(1, max(total, max(done, default=0)) + 1):
+        if hdir is None or page_no not in done:
             pages.append(None)
             continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            pages.append(data.get("page") or data)
-        except (OSError, ValueError):
-            pages.append(None)
+        pages.append(page_store.load_page(hdir, page_no))
     return pages
 
 
@@ -491,47 +486,55 @@ def update_page(job_id: str, page_index: int, payload: dict) -> int:
     """Store an edited page (0-based index) and regenerate its hOCR file.
 
     Edits go back into the block sidecar; the page's hOCR file is regenerated
-    from the sidecar blocks so ``embed_job`` renders the edited text.  Returns
+    from the edited blocks so ``embed_job`` renders the edited text.  Works
+    for EVERY engine: a page that only had an hOCR file gets its sidecar
+    created here first (via ``page_store.load_page``), then edited.  Returns
     the completed page count.
     """
     job = get_job(job_id)
     if job is None:
         raise ValueError("Job not found")
     page_no = int(page_index) + 1
-    path = _sidecar_path(job_id, page_no)
-    if path is None:
-        raise ValueError(f"Page {page_no} has no OCR result to edit")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Cannot read page {page_no}: {exc}") from exc
+    hdir = Path(job["hocr_dir"])
 
-    page = data.get("page") or data
     blocks = payload.get("blocks")
     if blocks is None:
         raise ValueError("payload must carry 'blocks'")
+
+    # Load through the interchange layer (derives from hOCR when the engine
+    # wrote no sidecar) so the page geometry / dpi survive the edit.
+    page = page_store.load_page(hdir, page_no)
+    if page is None:
+        raise ValueError(f"Page {page_no} has no OCR result to edit")
     # Keep the page geometry: edits only touch blocks.
     page["blocks"] = blocks
-    data["page"] = page
 
-    from backend.ocrmypad import parser as parser_mod
-    parsed_blocks = [parser_mod.Block.from_dict(b) for b in blocks]
-    for block in parsed_blocks:
-        if not block.lines and block.text.strip():
-            block.lines = parser_mod.split_block_lines(block.text)
-    dpi = float(data.get("dpi") or 300.0)
+    dpi = page_store.read_sidecar_dpi(hdir, page_no)
+    hocr_w = int(page.get("width") or 0)
+    hocr_h = int(page.get("height") or 0)
+    if not hocr_w or not hocr_h:
+        # A derived page without geometry: fall back to the source PDF page.
+        try:
+            with pdf_processing.open_pdf(job["pdf_path"]) as doc:
+                pg = doc[max(0, page_no - 1)]
+                zoom = 300.0 / 72.0
+                hocr_w = int(round(pg.rect.width * zoom))
+                hocr_h = int(round(pg.rect.height * zoom))
+            page["width"], page["height"] = hocr_w, hocr_h
+        except Exception:  # noqa: BLE001
+            log.debug("geometry fallback failed for page %s", page_no,
+                      exc_info=True)
 
-    hdir = Path(job["hocr_dir"])
-    sidecar_tmp = path.with_suffix(".json.tmp")
-    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    sidecar_tmp.unlink(missing_ok=True)
-    # Regenerate the hOCR from the edited blocks so finalize renders them.
-    hocr_path = hdir / f"{_page_name(page_no)}.hocr"
-    hocr_path.write_text(
-        parser_mod.blocks_to_hocr(int(page.get("width") or 0),
-                                  int(page.get("height") or 0),
-                                  parsed_blocks, dpi=dpi,
-                                  ppageno=page_no),
+    # Persist the edited sidecar, then regenerate the hOCR from the same
+    # blocks (finalize renders the hOCR, so it must carry the edit).
+    sidecar = page_store.sidecar_path(hdir, page_no)
+    sidecar.write_text(
+        json.dumps({"page": page, "dpi": dpi}, ensure_ascii=False),
+        encoding="utf-8")
+    hocr_file = page_store.hocr_path(hdir, page_no)
+    hocr_file.write_text(
+        page_store.blocks_to_hocr(hocr_w, hocr_h, blocks, dpi=dpi,
+                                  ppageno=page_index),
         encoding="utf-8")
     _persist(job)
     return len([p for p in get_page_dicts(job_id) if p is not None])
@@ -545,23 +548,25 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     OCRmyPDF renders every page's (possibly edited) hOCR into an invisible
     text layer, grafts it onto the original pages and postprocesses the result
     (metadata, optional PDF/A, optional optimization).  Returns the output
-    path and a small stats dict.
+    path and a small stats dict.  Works for EVERY engine: pages that only
+    have an hOCR file (no sidecar) are used as-is.
     """
     import ocrmypdf.api
 
     job = get_job(job_id)
     if job is None:
         raise ValueError("Job not found")
-    if not _block_sidecars(job_id):
+    if not page_store.has_results(Path(job["hocr_dir"])):
         raise ValueError("No OCR results to embed — run OCR first")
 
     # Ensure every recognized page has an hOCR file (edits regenerate theirs
-    # in update_page; a missing file means a sidecar without a matching hOCR).
+    # in update_page; a sidecar without a matching hOCR — e.g. written by an
+    # engine that emits no hOCR — is materialized from the sidecar blocks).
     _ensure_hocr_files(job_id)
 
     overrides = dict(overrides or {})
     cfg = resolve()
-    output_path = Path(job["hocr_dir"]).parent / "embedded.pdf"
+    output_path = _embedded_path(job)
     try:
         optimize = max(0, min(3, int(overrides.get("optimize")
                                     or cfg.get("ocrmypdf_optimize") or 0)))
@@ -598,35 +603,35 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
                          "message": "PDF ready"})
     stats = {"optimize": optimize,
              "output_type": kwargs["output_type"],
-             "pages": len(_block_sidecars(job_id))}
+             "pages": len(page_store.page_numbers(Path(job["hocr_dir"])))}
     return str(output_path), stats
 
 
 def _ensure_hocr_files(job_id: str) -> None:
-    """Regenerate any missing per-page hOCR from its block sidecar."""
+    """Materialize any missing per-page hOCR from its block sidecar.
+
+    Engines that write hOCR natively (Tesseract, the unlimited plugin) never
+    hit this; a sidecar without a matching hOCR (an engine that emits only
+    the normalized sidecar) gets its hOCR generated from the sidecar blocks
+    so finalize can render it.
+    """
     job = get_job(job_id)
     if job is None:
         return
-    from backend.ocrmypad import parser as parser_mod
     hdir = Path(job["hocr_dir"])
-    for sidecar in _block_sidecars(job_id):
-        page_no = sidecar.name.split("_", 1)[0]
-        hocr_path = hdir / f"{page_no}_ocr_hocr.hocr"
-        if hocr_path.exists():
+    for page_no in page_store.page_numbers(hdir):
+        if page_store.hocr_path(hdir, page_no).exists():
+            continue
+        page = page_store.load_page(hdir, page_no)
+        if page is None:
             continue
         try:
-            data = json.loads(sidecar.read_text(encoding="utf-8"))
-            page = data.get("page") or data
-            blocks = [parser_mod.Block.from_dict(b) for b in page.get("blocks", [])]
-            for block in blocks:
-                if not block.lines and block.text.strip():
-                    block.lines = parser_mod.split_block_lines(block.text)
-            hocr_path.write_text(
-                parser_mod.blocks_to_hocr(int(page.get("width") or 0),
+            dpi = page_store.read_sidecar_dpi(hdir, page_no)
+            page_store.hocr_path(hdir, page_no).write_text(
+                page_store.blocks_to_hocr(int(page.get("width") or 0),
                                           int(page.get("height") or 0),
-                                          blocks,
-                                          dpi=float(data.get("dpi") or 300.0),
-                                          ppageno=int(page_no) - 1),
+                                          page.get("blocks", []),
+                                          dpi=dpi, ppageno=page_no - 1),
                 encoding="utf-8")
         except (OSError, ValueError):
             log.exception("ensure_hocr_files: page %s failed", page_no)
