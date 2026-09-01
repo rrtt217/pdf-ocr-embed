@@ -20,6 +20,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 import fitz  # PyMuPDF
 from PIL import Image, ImageFilter, ImageOps  # OCR-input preprocessing (#2)
 
+from backend import fonts as fonts_mod
 from backend.models import OcrBlock, OcrPage
 
 # The system font selected for embedding (a backend.fonts.FontSpec).  Set before
@@ -342,6 +343,46 @@ def _text_blocks_to_place(blocks: List[OcrBlock]) -> Iterator[OcrBlock]:
         yield block
 
 
+def _subset_fonts_verified(doc: "fitz.Document") -> "fitz.Document":
+    """Subset embedded fonts, keeping the result only when it is safe.
+
+    Returns the (possibly subsetted) document.  Verification: the extracted
+    text layer must be byte-identical before/after and the file must actually
+    shrink; otherwise the pre-subset document is returned (full font embedded
+    — larger but correct).  Failures are logged with the remedy.
+    """
+    try:
+        pre_bytes = doc.tobytes()
+        pre_texts = [page.get_text() for page in doc]
+
+        fitz.TOOLS.reset_mupdf_warnings()
+        doc.subset_fonts()
+        post_bytes = doc.tobytes()
+
+        post_doc = fitz.open(stream=post_bytes, filetype="pdf")
+        post_texts = [page.get_text() for page in post_doc]
+        post_doc.close()
+        text_intact = post_texts == pre_texts
+        shrank = len(post_bytes) < len(pre_bytes) * 0.95
+        if text_intact and shrank:
+            log.info("font subset ok: %d KB -> %d KB",
+                     len(pre_bytes) // 1024, len(post_bytes) // 1024)
+            return doc
+
+        reason = ("text layer changed" if not text_intact
+                  else f"no size win ({len(pre_bytes) // 1024} -> "
+                       f"{len(post_bytes) // 1024} KB)")
+        log.warning("font subsetting reverted: %s — the output keeps the "
+                    "full font (%d MB) with an intact text layer. Remedy: "
+                    "upgrade PyMuPDF, or embed a standalone .ttf/otf font "
+                    "instead of a .ttc collection.", reason,
+                    len(pre_bytes) // (1024 * 1024))
+        return fitz.open(stream=pre_bytes, filetype="pdf")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("font subsetting skipped: %s", exc)
+        return doc
+
+
 def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
                          out_dir: Optional[Path] = None,
                          embed_font=None,
@@ -373,6 +414,19 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
     src_stem = Path(pdf_bytes_path).stem
     out_file = out_dir / f"{src_stem}_embedded_{job_id}.pdf"
     thumb_file = out_dir / f"{src_stem}_thumb_{job_id}.png"
+
+    # Pre-subset the embed font to exactly the glyphs the text uses (PyMuPDF's
+    # own subsetting is unreliable for CJK — see _subset_fonts_verified).  A
+    # 15MB CJK face becomes a tens-of-KB subset; every inserted glyph is
+    # present because the subset is built from the actual text.
+    if embed_font is not None and pages:
+        all_text = " ".join(
+            (b.text or "") + " " + (b.caption or "")
+            for p in pages for b in (p.blocks or []))
+        sub_spec = fonts_mod.build_subset_font(embed_font, all_text)
+        if sub_spec is not None:
+            set_embed_font(sub_spec)
+            embed_font = sub_spec
 
     # Operate on an in-memory copy so the original file is untouched.
     with open(pdf_bytes_path, "rb") as fh:
@@ -406,10 +460,14 @@ def embed_invisible_text(pdf_bytes_path: str, pages: List[OcrPage],
 
         # Subset embedded fonts to keep the output small (variable/full CJK
         # fonts are megabytes; the used subset is tens of KB).
-        try:
-            doc.subset_fonts()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("font subsetting skipped: %s", exc)
+        #
+        # PyMuPDF's subsetting is unreliable here: the MuPDF path throws
+        # "Index bounds" for many common CJK glyphs, and the fontTools
+        # fallback (subset_fonts(fallback=True)) can DROP glyphs — silently
+        # truncating the invisible text layer.  A correct text layer beats a
+        # small file, so the subset is verified and rolled back when it
+        # breaks the text or doesn't shrink the file.
+        doc = _subset_fonts_verified(doc)
 
         # Optional image recompression (size win on scanned input).
         img_stats = optimize_images(

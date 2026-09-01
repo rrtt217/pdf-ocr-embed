@@ -23,6 +23,10 @@ import fitz
 
 log = logging.getLogger(__name__)
 
+# Standalone-face cache for .ttc collections (gitignored runtime dir; the
+# cleaner never touches cache/).  Module attr so tests can point it elsewhere.
+FACE_CACHE_DIR = Path("cache") / "fonts"
+
 
 @dataclass
 class FontSpec:
@@ -97,6 +101,73 @@ def _first_existing(paths: List[str]) -> Optional[str]:
     return None
 
 
+def _pick_face_index(names: List[str], prefer: str) -> int:
+    """Pick the best-matching face index of a .ttc collection.
+
+    ``names`` are the faces' full names in collection order, ``prefer`` the
+    requested font name (e.g. "Noto Sans SC").  Tries the full name, then the
+    trailing words ("SC" before "Sans" before "Noto"), so the SC face wins
+    over the JP face that MuPDF would otherwise silently load (the first).
+    """
+    lowered = [n.lower() for n in names]
+    want = (prefer or "").strip().lower()
+    if want:
+        if want in lowered:
+            return lowered.index(want)
+        for word in reversed(want.split()):
+            for i, n in enumerate(lowered):
+                if word and word in n:
+                    return i
+    return 0
+
+
+def _ensure_single_face(path: str, prefer: str) -> str:
+    """Return an embeddable single-face font file for ``path``.
+
+    ``.ttc`` TrueType Collections embed every face and break PyMuPDF's
+    ``subset_fonts()`` ("format error: Index bounds"), which silently leaves
+    the whole multi-MB collection in the output PDF.  Extract the best-
+    matching face (see ``_pick_face_index``) to a cached standalone TTF under
+    ``FACE_CACHE_DIR`` and return that.  Non-.ttc files are returned as-is;
+    without fontTools (or on any extraction error) the original path is
+    returned with a logged hint — embedding still works, only subsetting
+    stays broken.
+    """
+    if not path.lower().endswith(".ttc"):
+        return path
+    try:
+        from fontTools.ttLib import TTCollection
+    except ImportError:
+        log.warning("font %s is a .ttc collection; subsetting needs the "
+                    "fontTools package (pip install fonttools) — the output "
+                    "will embed the full collection (much larger file)",
+                    path)
+        return path
+    try:
+        FACE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        out = FACE_CACHE_DIR / f"{Path(path).stem}-face.ttf"
+        if out.exists() and out.stat().st_size > 0:
+            return str(out)
+        ttc = TTCollection(path, lazy=True)
+        names = []
+        for f in ttc.fonts:
+            try:
+                names.append(f["name"].getDebugName(4) or "")
+            except Exception:  # noqa: BLE001
+                names.append("")
+        idx = _pick_face_index(names, prefer)
+        ttc.fonts[idx].save(str(out))
+        log.info("font %s: extracted face %d (%s) -> %s (%d MB)",
+                 Path(path).name, idx, names[idx] or "?", out,
+                 out.stat().st_size // (1024 * 1024))
+        return str(out)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cannot extract a single face from %s: %s — using the "
+                    "collection as-is (font subsetting will fail and bloat "
+                    "the output)", path, exc)
+        return path
+
+
 def _unique_fontname(i: int) -> str:
     return f"UFont{''.join(chr(ord('A') + (i // 26) % 26) + chr(ord('A') + i % 26))}"
 
@@ -121,6 +192,54 @@ def _measure_ink(font: "fitz.Font") -> "tuple[float, float]":
         return 0.88, 0.80
 
 
+def build_subset_font(spec: "FontSpec", text: str,
+                      tag: str = "embed") -> Optional["FontSpec"]:
+    """Pre-subset ``spec`` to exactly the glyphs used in ``text``.
+
+    PyMuPDF's own ``subset_fonts()`` is unreliable for CJK (MuPDF throws
+    "Index bounds" for many common glyphs; the fontTools fallback can drop
+    glyphs and truncate the text layer).  Subsetting the font BEFORE embedding
+    avoids both: the subset is built from the exact unicode set of the text,
+    so every inserted glyph is present and the output stays small.
+
+    Returns a FontSpec pointing at a cached subset file under
+    ``FACE_CACHE_DIR``, or None when fontTools is missing, the text is empty,
+    or subsetting fails (the caller keeps the original spec — embedding still
+    works, only the output is larger).
+    """
+    if not spec.path.lower().endswith((".ttf", ".otf")) or not text.strip():
+        return None
+    try:
+        from fontTools import subset
+    except ImportError:
+        return None
+    try:
+        unicodes = sorted({ord(c) for c in text} | {ord(" ")})
+        import hashlib
+        key = hashlib.sha1(",".join(map(str, unicodes)).encode()).hexdigest()[:12]
+        FACE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        out = FACE_CACHE_DIR / f"{Path(spec.path).stem}-{tag}-{key}.ttf"
+        if not (out.exists() and out.stat().st_size > 0):
+            opts = subset.Options()
+            opts.name_IDs = ["*"]       # keep the name table
+            opts.notdef_outline = True  # keep .notdef drawable
+            font = subset.load_font(spec.path, opts)
+            s = subset.Subsetter(opts)
+            s.populate(unicodes=unicodes)
+            s.subset(font)
+            subset.save_font(font, str(out), opts)
+            log.info("font subset for %s: %d glyphs -> %s (%d KB)",
+                     spec.name, len(unicodes), out, out.stat().st_size // 1024)
+        # Subsetting preserves metrics, so ink measurements carry over.
+        return FontSpec(name=spec.name, fontname=spec.fontname, path=str(out),
+                        family=spec.family, ink_fraction=spec.ink_fraction,
+                        ink_up=spec.ink_up)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("cannot pre-subset font %s: %s — embedding the full "
+                    "font instead", spec.name, exc)
+        return None
+
+
 def load_registry() -> Dict[str, FontSpec]:
     """Populate and cache the font registry."""
     global _REGISTRY, _registry_loaded
@@ -132,7 +251,10 @@ def load_registry() -> Dict[str, FontSpec]:
         if not path:
             continue
         try:
-            font = fitz.Font(fontfile=path)
+            # .ttc collections: embed/measure the matching face only (a raw
+            # TTC breaks subsetting and embeds the whole multi-MB collection).
+            embed_path = _ensure_single_face(path, name)
+            font = fitz.Font(fontfile=embed_path)
             ink, up = _measure_ink(font)
             asc = font.ascender or 1.0
             desc = font.descender or -0.2
@@ -140,14 +262,14 @@ def load_registry() -> Dict[str, FontSpec]:
             _REGISTRY[name] = FontSpec(
                 name=name,
                 fontname=_unique_fontname(idx),
-                path=path,
+                path=embed_path,
                 family=family,
                 ink_fraction=round(ink, 3),
                 ink_up=round(up, 3),
                 _font=font,
             )
             idx += 1
-            log.debug("register font %s -> %s (ink=%s up=%s)", name, path,
+            log.debug("register font %s -> %s (ink=%s up=%s)", name, embed_path,
                       round(ink, 3), round(up, 3))
         except Exception as exc:  # noqa: BLE001
             log.warning("skip font %s at %s: %s", name, path, exc)
@@ -178,12 +300,13 @@ def resolve_font(name_or_path: str | None) -> FontSpec:
     if key.startswith("/") or key.endswith((".ttf", ".otf", ".ttc")):
         if Path(key).exists():
             try:
-                font = fitz.Font(fontfile=key)
+                embed_path = _ensure_single_face(key, Path(key).stem)
+                font = fitz.Font(fontfile=embed_path)
                 ink, up = _measure_ink(font)
                 return FontSpec(
                     name=Path(key).stem,
                     fontname="UFontAA",
-                    path=key,
+                    path=embed_path,
                     family=(font.name or Path(key).stem),
                     ink_fraction=round(ink, 3),
                     ink_up=round(up, 3),
