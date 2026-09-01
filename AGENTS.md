@@ -13,14 +13,17 @@ selectable / copyable **invisible text layer**. The OCR core is
 
 1. `POST /api/ocr/upload` → FastAPI stores the PDF, opens a job.
 2. **OCR phase** — `ocrmypdf.api._pdf_to_hocr(pdf, work/<job>/hocr, plugins=[...])`:
-   OCRmyPDF rasterizes pages, runs the plugin engine per page (`jobs`-way
-   concurrency), leaving per-page `000001_ocr_hocr.hocr` +
-   `000001_ocr_hocr.blocks.json` (the WebUI's editable representation).
-3. **Edit phase** — `POST /api/pages/{job}/{i}` writes edits back into the block
-   sidecar and regenerates that page's hOCR from it.
-4. **Finalize** — `ocrmypdf.api._hocr_to_ocr_pdf(work/<job>/hocr, embedded.pdf)`:
-   OCRmyPDF renders the (possibly edited) hOCR into an invisible text layer via
-   its fpdf2 renderer, grafts it onto the original pages, postprocesses.
+   OCRmyPDF rasterizes pages, runs the selected engine per page (`jobs`-way
+   concurrency), leaving per-page `000001_ocr_hocr.hocr` (the interchange
+   format every engine implements). The unlimited plugin additionally writes a
+   block sidecar `000001_ocr_hocr.blocks.json`.
+3. **Edit phase** — `POST /api/pages/{job}/{i}` writes edits back into the
+   block sidecar (derived from the hOCR when the engine wrote none) and
+   regenerates that page's hOCR from it.
+4. **Finalize** — `ocrmypdf.api._hocr_to_ocr_pdf(work/<job>/hocr,
+   <source stem>_embedded.pdf)`: OCRmyPDF renders the (possibly edited) hOCR
+   into an invisible text layer via its fpdf2 renderer, grafts it onto the
+   original pages, postprocesses.
 5. A single-page WebUI (native JS, no build step) drives all of it over
    `/api/*` + SSE progress.
 
@@ -48,8 +51,8 @@ the single most important invariant to preserve.
   reintroduce JSON / `.env` file config, and never read `os.environ` outside
   `backend/config.py`.
 - `max_tokens` must stay `< 32768`.
-- ocrmypdf runs must use `use_threads=True` (HTTP IO-bound; also keeps the
-  progress registry in this process — a forked child could not report into it).
+- ocrmypdf runs must use `use_threads=True` (the engines are HTTP/IO-bound;
+  a forked child could not report progress through the work files).
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `.venv/`,
   `backend/ocr_config.toml`) are gitignored. Never commit keys or large sample PDFs.
 
@@ -59,12 +62,12 @@ the single most important invariant to preserve.
 backend/
   main.py                 # FastAPI app + all routes
   config.py               # external setting resolution (resolve())
-  ocrmypad/               # OCRmyPDF plugin package (the extension point)
+  page_store.py           # engine-agnostic page interchange (sidecar/hOCR/cancel)
+  ocrmypad/               # OCRmyPDF plugin package (unlimited engine)
     unlimited_engine.py   # OcrEngine plugin + get_ocr_engine hook
     engine_client.py      # OpenAI-compatible client (retry/timeout/truncation)
     parser.py             # <|det|> markers -> blocks -> hOCR
     text_norm.py          # math/table/LaTeX text normalization
-    progress.py           # per-page progress registry + cancel flags
   errors.py               # UnavailableError + 1000-canvas -> pixel bbox mapping
   http_retry.py           # HTTP retry/backoff/rate-limit (engine API calls)
   ocr_service.py          # job flow on _pdf_to_hocr + _hocr_to_ocr_pdf
@@ -78,6 +81,28 @@ frontend/                 # index.html / style.css / app.js / i18n.js (no build)
 requirements.txt
 AGENTS.md  README.md  DESIGN.md  config.example.toml  .gitignore
 ```
+
+## The engine-agnostic page interchange (backend/page_store.py)
+
+This is the ONLY channel the rest of the backend uses to talk about pages —
+no engine's raw output format ever leaks past it, and the backend never
+imports `backend.ocrmypad`:
+
+- **Block sidecar** (`work/<job>/hocr/000001_ocr_hocr.blocks.json`) — the
+  normalized page representation (blocks in raw pixel space) the WebUI edits.
+  Written natively by engines that produce it (the unlimited plugin) and
+  **derived from hOCR** for engines that do not (ocrmypdf's built-in
+  Tesseract, and any future engine) — via ocrmypdf's own hOCR parser.
+- **hOCR** (`000001_ocr_hocr.hocr`) — the interchange format every engine
+  implements (`generate_hocr` is the abstract contract). This is also what
+  ocrmypdf's finalize stage renders into the text layer.
+- **Cancel flag** (`work/<job>/cancel`) — a plain file the service creates to
+  ask the engine to stop; the engine polls for it per page. No shared
+  registry, no imports: the engine and the backend communicate ONLY through
+  the job's work folder on disk.
+- **Page inventory** (`page_store.page_numbers`) — the union of hOCR files
+  and sidecars: what "retry remaining", progress counts and the embed guard
+  use (for every engine).
 
 ## How to write a new OCR engine (the main extension point)
 
@@ -133,12 +158,16 @@ def get_ocr_engine(options):
    dropped by the parser.
 3. **Write a block sidecar JSON** next to the hOCR
    (`output_hocr.with_name(output_hocr.stem + ".blocks.json")`) with
-   `{"page": {page_index, width, height, blocks: [...]}, "dpi": ...}` — this is
-   what the WebUI edits and what regenerates the hOCR after edits.
-4. **Report progress**: derive the job id from `options.output_folder`'s parent
-   (convention: `work/<job_id>/hocr`) and call
-   `backend.ocrmypad.progress.report_page(job_id, page_index)`; honor
-   `progress.is_cancelled(job_id)` per page for user-requested stops.
+   `{"page": {page_index, width, height, blocks: [...]}, "dpi": ...}` — this
+   is what the WebUI edits and what regenerates the hOCR after edits.
+   OPTIONAL: an engine that writes only hOCR (like ocrmypdf's built-in
+   Tesseract) is fully supported — the page store derives the sidecar from
+   the hOCR via ocrmypdf's own parser.
+4. **Report progress by writing files**: the engine's output files ARE the
+   progress. Honor the cancel flag per page — check
+   `backend.page_store.is_cancelled(job_dir)` (the job dir is
+   `options.output_folder`'s parent) and raise to stop; no registry, no
+   backend imports.
 5. **Register it** in `backend/ocrmypad/__init__.py` and (for the WebUI's
    engine list) in `backend/main.py::health` + `frontend` engine selects.
 6. **Error semantics**: missing dependency / bad setup → raise

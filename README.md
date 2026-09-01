@@ -264,17 +264,17 @@ pdf-ocr-embed/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI 应用与全部路由
 │   ├── config.py               # 外部设置解析（TOML 配置文件 / WebUI / OCR_* 环境变量）
-│   ├── models.py               # 编辑器页 JSON 结构（OcrPage/OcrBlock 兼容）
-│   ├── pdf_processing.py       # 页面预览渲染（PyMuPDF）
-│   ├── ocr_service.py          # OCRmyPDF 编排（_pdf_to_hocr + _hocr_to_ocr_pdf）+ 任务/进度状态
+│   ├── page_store.py           # 引擎无关页面交换层（块 sidecar / hOCR / 取消标志）
 │   ├── ocrmypad/               # OCRmyPDF 插件包（unlimited-ocr 引擎）
 │   │   ├── unlimited_engine.py # OcrEngine 插件 + get_ocr_engine hook
 │   │   ├── engine_client.py    # OpenAI 兼容客户端（截断检测/重试/超时）
 │   │   ├── parser.py           # <|det|> 标记解析 + hOCR 生成
-│   │   ├── text_norm.py        # 数学/表格文本规范化
-│   │   └── progress.py         # 每页进度注册表 + 取消标志
+│   │   └── text_norm.py        # 数学/表格文本规范化
 │   ├── errors.py               # UnavailableError + 1000 画布 → 像素坐标换算
 │   ├── http_retry.py           # HTTP 重试/限速（引擎 API 调用）
+│   ├── ocr_service.py          # OCRmyPDF 编排（_pdf_to_hocr + _hocr_to_ocr_pdf）+ 任务状态
+│   ├── models.py               # 编辑器页 JSON 结构（OcrPage/OcrBlock 兼容）
+│   ├── pdf_processing.py       # 页面预览渲染（PyMuPDF）
 │   ├── validation.py           # 嵌后校验（覆盖率报告）
 │   ├── batch.py                # ZIP 打包（流式）
 │   ├── cleanup.py              # 临时文件清理
@@ -285,12 +285,12 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
-├── tests/                      # pytest 测试（140 项）
+├── tests/                      # pytest 测试（145 项）
 ├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
-├── AGENTS.md     # 面向 AI 编码代理的项目指南（含插件扩展点）
+├── AGENTS.md     # 面向 AI 编码代理的项目指南（含插件扩展点与页面交换层）
 └── DESIGN.md     # 设计文档（OCRmyPDF 架构 + 前端沿用理由）
 ```
 
