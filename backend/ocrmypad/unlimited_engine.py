@@ -27,6 +27,10 @@ from backend.ocrmypad.engine_client import (
     image_dpi,
     image_size,
 )
+from backend.ocrmypad.line_split import (
+    split_block_into_lines,
+    split_block_text_across_bands,
+)
 from backend.ocrmypad.parser import (
     blocks_to_hocr,
     hocr_page_sidecar_text,
@@ -40,6 +44,54 @@ if TYPE_CHECKING:
     from ocrmypdf._options import OcrOptions
 
 log = logging.getLogger(__name__)
+
+
+def _per_line_overrides(input_file: Path, page) -> dict:
+    """Recover accurate per-line placement for the invisible text layer.
+
+    The model reports paragraph-level bboxes; each renderable line is placed
+    on an equal vertical slice today (approximate).  This re-derives the true
+    printed line rows from the page image (``backend.ocrmypad.line_split``):
+
+    * blocks whose text already splits into >1 line get one bbox per line,
+      aligned to that line's ink;
+    * blocks reported as a single long line over a multi-line bbox get their
+      text distributed across the detected printed line bands.
+
+    Returns ``{block_index: [(line_text, [x1, y1, x2, y2]), ...]}`` for
+    ``blocks_to_hocr``.  Every path falls back to the block's own lines with
+    equal-slice bboxes when the image cannot support the split, so the render
+    is never worse than today.  Editor semantics are untouched: the block
+    sidecar still carries one bbox per block.
+    """
+    overrides: dict = {}
+    try:
+        from PIL import Image
+        with Image.open(input_file) as img:
+            gray = img.convert("L")
+            for bi, block in enumerate(page.blocks):
+                if block.kind == "image" or not block.lines:
+                    continue
+                pairs: list = []
+                n_lines = len(block.lines)
+                if n_lines > 1:
+                    boxes = split_block_into_lines(gray, block.bbox, n_lines)
+                    if len(boxes) == n_lines:
+                        pairs = list(zip(block.lines, boxes))
+                elif block.text.strip():
+                    split = split_block_text_across_bands(
+                        gray, block.bbox, block.text)
+                    if split:
+                        pairs = list(split)
+                if pairs:
+                    overrides[bi] = pairs
+    except Exception:  # noqa: BLE001  (never degrade the run for placement)
+        log.warning("per-line bbox recovery failed for %s; using equal slices",
+                    input_file, exc_info=True)
+    if overrides:
+        log.debug("page %s: recovered per-line placement for %d block(s)",
+                  input_file.name, len(overrides))
+    return overrides
 
 
 def _job_dir_from_options(options: "OcrOptions | None") -> Path:
@@ -152,8 +204,10 @@ class UnlimitedOcrEngine(OcrEngine):
         raw = client.recognize(input_file)
         page = parse_response(raw, width, height, page_index)
 
+        per_line = _per_line_overrides(input_file, page)
         hocr_text = blocks_to_hocr(width, height, page.blocks, dpi=dpi,
-                                   ppageno=page_index)
+                                   ppageno=page_index,
+                                   per_line_overrides=per_line)
         output_hocr.write_text(hocr_text, encoding="utf-8")
         output_text.write_text(
             hocr_page_sidecar_text(page.blocks), encoding="utf-8")
