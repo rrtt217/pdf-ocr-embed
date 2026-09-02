@@ -13,7 +13,8 @@
 > 安全性、边界条件与依赖版本，别盲目信任 AI 输出。
 >
 > **给 AI Agent 的快速入口**：`AGENTS.md` 是为 AI 编码代理编写的项目指南（架构、
-> 硬性约定，以及**如何编写新的 OCR adapter** 的完整步骤与检查清单）。改动前请先读它。
+> 硬性约定，以及**如何编写新的 OCR 引擎（OcrEngine 插件）**的完整步骤与检查清单）。
+> 改动前请先读它。
 
 ---
 
@@ -34,9 +35,9 @@
 - **前端沿用自研 WebUI**（零构建原生 JS）：左侧可编辑文本块，右侧页面预览 +
   bbox 高亮框、设置表单、嵌入按钮、SSE 进度条。不采用 OCRmyPDF 的
   `misc/_webservice.py`（Streamlit 表单应用，无逐页编辑/进度流，理由见 DESIGN.md）。
-- **进度流**：SSE 推送每页 OCR 进度（插件引擎在工作线程内汇报到共享注册表）。
+- **进度流**：SSE 推送每页 OCR 进度（按 work 目录的文件清单统计，引擎无关）。
 - **并行 OCR**：`concurrency` 映射为 OCRmyPDF 的 worker 数（`ocrmypdf_jobs`）；
-  `use_threads` 固定开启（HTTP IO-bound，且保持进度注册表在本进程）。
+  `use_threads` 固定开启（引擎为 HTTP/IO-bound，线程化运行也更适合文件式进度）。
 - **置信度审阅视图**：每个文本块带置信度徽标（85/60 分档绿/黄/红），低置信块红描边；
   「只看低置信度」过滤 + 可调阈值（默认 60%），页 tab 角标显示该页低置信块数。
 - **输出选项**：合成时可选**优化级别**（0–3，交给 ocrmypdf 的 optimize 阶段）与
@@ -249,7 +250,7 @@ python -m backend.cli book.pdf --engine unlimited --pages 1-5 --sidecar-text  # 
 | GET  | `/api/pages/{job_id}` | 取全部分页 OCR 数据（块 sidecar JSON） |
 | GET  | `/api/pages/{job_id}/{i}/image` | 页面预览 PNG |
 | POST | `/api/pages/{job_id}/{i}` | 更新单个可编辑页（写 sidecar + 重生成 hOCR） |
-| POST | `/api/embed/{job_id}` | 合成（可编辑后的）文字 → `embedded.pdf`（`optimize`、`output_type`） |
+| POST | `/api/embed/{job_id}` | 合成（可编辑后的）文字 → `<源名>_embedded.pdf`（`optimize`、`output_type`；带 `pages` 时产出仅含所选页的 `<源名>_partial.pdf`） |
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
 | GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
 | POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
@@ -285,7 +286,7 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
-├── tests/                      # pytest 测试（145 项）
+├── tests/                      # pytest 测试（146 项）
 ├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml
