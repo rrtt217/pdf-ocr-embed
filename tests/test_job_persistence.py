@@ -277,3 +277,35 @@ def test_retry_remaining_counts_hocr_only_pages(monkeypatch, tmp_path):
     from backend.ocr_service import select_pages
     assert select_pages(2, statuses) == [2]
     ocr_service.clear_job(job["job_id"])
+
+
+def test_run_ocr_selection_preserves_other_engines_hocr(monkeypatch, tmp_path):
+    """Retry remaining with pages=2,3 must re-OCR ONLY pages 2 and 3: pages
+    1/4/5 keep their existing (tesseract) hOCR files untouched."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=5)
+    # pages 1,4,5 already have tesseract hOCR (no sidecar)
+    _write_hocr_only(job, 1, "tess p1")
+    _write_hocr_only(job, 4, "tess p4")
+    _write_hocr_only(job, 5, "tess p5")
+
+    captured = {}
+
+    def fake_pipeline(pdf, folder, **kwargs):
+        captured["pages"] = kwargs.get("pages")
+        captured["engine"] = kwargs.get("ocr_engine")
+
+    import ocrmypdf.api
+    monkeypatch.setattr(ocrmypdf.api, "_pdf_to_hocr", fake_pipeline)
+
+    ocr_service.run_ocr(job["job_id"], {
+        "ocr_engine": "unlimited", "_force": False,
+        "_page_range": (2, 3), "_page_selection": [2, 3]})
+    assert captured["pages"] == "2,3"
+    assert captured["engine"] == "unlimited"
+    # The untouched pages keep their hOCR (not deleted by the run).
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    for n in (1, 4, 5):
+        assert (hdir / f"{n:06d}_ocr_hocr.hocr").exists()
+    ocr_service.clear_job(job["job_id"])

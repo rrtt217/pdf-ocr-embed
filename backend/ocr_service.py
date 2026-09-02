@@ -393,14 +393,29 @@ def stop_job(job_id: str) -> bool:
 
     The cancel flag is a plain file in the job dir; the engine polls for it
     per page (the only engine <-> service channel besides the work files).
+
+    Engine support: the unlimited plugin checks the flag between pages, so a
+    stop lands after the page in flight.  ocrmypdf's built-in Tesseract has
+    no cancel hook — its run completes and the job ends up `done` with every
+    page recognized; the SSE stream notes this in the terminal event so the
+    WebUI does not promise a stop the engine cannot deliver.
     """
     job = get_job(job_id)
     if job is None or job.get("status") != "running":
         return False
     page_store.request_cancel(_job_dir(job_id))
+    engine = "unlimited"
+    try:
+        engine = resolve().get("ocr_engine") or "unlimited"
+    except Exception:  # noqa: BLE001
+        pass
+    cancellable = engine == "unlimited"
     _set(job_id, status="stopping")
     _push_event(job_id, {"type": "status", "status": "stopping",
-                         "message": "Stopping after the current page..."})
+                         "message": "Stopping after the current page..."
+                         if cancellable else
+                         "Stop requested, but the tesseract engine cannot "
+                         "cancel mid-run — the run will complete."})
     return True
 
 
@@ -542,7 +557,8 @@ def update_page(job_id: str, page_index: int, payload: dict) -> int:
 
 # --- finalize (embed) --------------------------------------------------------
 
-def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]:
+def embed_job(job_id: str, overrides: Optional[dict] = None,
+              page_indices: Optional[list] = None) -> tuple[str, dict]:
     """Run ``ocrmypdf._hocr_to_ocr_pdf`` on the job's hOCR work folder.
 
     OCRmyPDF renders every page's (possibly edited) hOCR into an invisible
@@ -550,6 +566,13 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     (metadata, optional PDF/A, optional optimization).  Returns the output
     path and a small stats dict.  Works for EVERY engine: pages that only
     have an hOCR file (no sidecar) are used as-is.
+
+    ``page_indices`` (partial embed): 0-based indices of the pages to include.
+    The text layer is rendered ONLY for those pages (ocrmypdf ``pages``
+    option); the remaining body pages arrive textless from the origin PDF and
+    are dropped afterwards (pikepdf), so the partial document contains exactly
+    the selected pages.  A partial result is named `<stem>_partial.pdf` and
+    does NOT replace the job's full embedded output.
     """
     import ocrmypdf.api
 
@@ -559,6 +582,26 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     if not page_store.has_results(Path(job["hocr_dir"])):
         raise ValueError("No OCR results to embed — run OCR first")
 
+    partial = page_indices is not None
+    wanted: list = []
+    if partial:
+        # Elements may be bare ints OR whole page dicts (the pre-rebuild
+        # frontend sends the full page objects it got from /api/pages).
+        def _index_of(item) -> int:
+            if isinstance(item, dict):
+                return int(item.get("page_index", -1))
+            return int(item)
+        wanted = sorted({_index_of(i) + 1 for i in page_indices})
+        if not wanted or -1 in wanted:
+            raise ValueError("Partial embed selected no valid pages")
+        # A partial document only makes sense for pages that have results.
+        done = set(page_store.page_numbers(Path(job["hocr_dir"])))
+        missing = [n for n in wanted if n not in done]
+        if missing:
+            raise ValueError(
+                f"Page(s) {','.join(str(n) for n in missing)} have no OCR "
+                "result — run OCR first")
+
     # Ensure every recognized page has an hOCR file (edits regenerate theirs
     # in update_page; a sidecar without a matching hOCR — e.g. written by an
     # engine that emits no hOCR — is materialized from the sidecar blocks).
@@ -567,6 +610,11 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
     overrides = dict(overrides or {})
     cfg = resolve()
     output_path = _embedded_path(job)
+    if partial:
+        output_path = output_path.with_name(
+            output_path.stem.replace("_embedded", "") + "_partial.pdf")
+
+    embed_dir = Path(job["hocr_dir"])
     try:
         optimize = max(0, min(3, int(overrides.get("optimize")
                                     or cfg.get("ocrmypdf_optimize") or 0)))
@@ -587,23 +635,33 @@ def embed_job(job_id: str, overrides: Optional[dict] = None) -> tuple[str, dict]
                          "message": "Embedding text layer (OCRmyPDF)..."})
     try:
         ocrmypdf.api._hocr_to_ocr_pdf(
-            Path(job["hocr_dir"]),
+            embed_dir,
             output_path,
+            **({"pages": ",".join(str(n) for n in wanted)} if partial else {}),
             **kwargs,
         )
+        if partial:
+            # The pipeline keeps every origin-PDF body page (textless for
+            # pages outside `pages`); a partial document drops them.
+            _drop_pages_except(output_path, {n - 1 for n in wanted})
     except Exception as exc:  # noqa: BLE001
         message = redact_secrets(str(exc))
         log.error("job %s: finalize failed: %s", job_id, message)
         _push_event(job_id, {"type": "error", "message": message})
         raise
 
-    _set(job_id, embedded_path=str(output_path))
-    _persist_if_live(job_id)
+    if not partial:
+        # A partial result is NOT the job's embedded output: the download
+        # endpoint and /api/jobs keep pointing at the latest FULL embed.
+        _set(job_id, embedded_path=str(output_path))
+        _persist_if_live(job_id)
     _push_event(job_id, {"type": "status", "status": "embedded",
                          "message": "PDF ready"})
     stats = {"optimize": optimize,
              "output_type": kwargs["output_type"],
-             "pages": len(page_store.page_numbers(Path(job["hocr_dir"])))}
+             "pages": len(wanted) if partial
+             else len(page_store.page_numbers(Path(job["hocr_dir"]))),
+             "partial": partial}
     return str(output_path), stats
 
 
@@ -666,3 +724,19 @@ def ensure_page_image(job_id: str, page_index: int) -> Optional[Path]:
                   job_id, page_index, exc)
         return None
     return out
+
+
+def _drop_pages_except(pdf_path: Path, keep_0based: set) -> None:
+    """Delete every page except ``keep_0based`` from a PDF (in place).
+
+    Used by the partial embed: ocrmypdf's hOCR-to-PDF pipeline renders text
+    only for the pages in ``pages`` but keeps every origin-PDF body page, so
+    a partial document needs the un-selected (textless) pages removed.
+    """
+    import pikepdf
+
+    with pikepdf.open(pdf_path, allow_overwriting_input=True) as pdf:
+        for i in reversed(range(len(pdf.pages))):
+            if i not in keep_0based:
+                del pdf.pages[i]
+        pdf.save(pdf_path)

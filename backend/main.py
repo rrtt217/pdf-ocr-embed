@@ -95,6 +95,10 @@ class EmbedModel(BaseModel):
     # Output options (applied by ocrmypdf's finalize stage).
     optimize: Optional[int] = None     # 0..3
     output_type: Optional[str] = None  # pdf | pdfa
+    # Partial embed: the 0-based page indices to include (None = all done pages).
+    pages: Optional[list] = None
+    # Partial embed: the 0-based page indices to include (None = all done pages).
+    pages: Optional[list] = None
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -406,23 +410,24 @@ async def stream(job_id: str):
                 if ev.get("type") == "status" and ev.get("status") in ("done", "stopped", "embedded"):
                     terminal_delivered = True
 
-            # Per-page progress: the plugin engine reports completed pages into
-            # the shared registry; stream each newly completed page.
-            from backend.ocrmypad import progress as progress_mod
-            snap = progress_mod.snapshot(job_id)
-            done = snap.get("done_indices") or []
-            total = cur.get("num_pages") or snap.get("total") or 0
-            for page_no in done:
-                if page_no in delivered_pages:
-                    continue
-                delivered_pages.add(page_no)
-                yield _sse({
-                    "type": "progress",
-                    "current": page_no,
-                    "total": total,
-                    "pages_done": snap.get("pages_done", 0),
-                    "page_index": page_no - 1,
-                })
+            # Per-page progress: pages that already have a result on disk
+            # (hOCR/sidecar — engine-agnostic) stream as progress events.
+            from backend import page_store
+            hdir = cur.get("hocr_dir")
+            total = cur.get("num_pages") or 0
+            if hdir:
+                done = page_store.page_numbers(Path(hdir))
+                for page_no in done:
+                    if page_no in delivered_pages:
+                        continue
+                    delivered_pages.add(page_no)
+                    yield _sse({
+                        "type": "progress",
+                        "current": page_no,
+                        "total": total,
+                        "pages_done": len(done),
+                        "page_index": page_no - 1,
+                    })
 
             if status in ("done", "embedded"):
                 # Guarantee the "done" status reaches the client even if the
@@ -506,23 +511,26 @@ def page_image(job_id: str, page_index: int):
 def embed(job_id: str, payload: EmbedModel):
     if ocr_service.get_job(job_id) is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    # Finalize options (output optimization) from the payload; the text layer
-    # itself is rendered by OCRmyPDF from the stored (possibly edited) hOCR.
+    # Finalize options from the payload.  A partial embed (`pages`) renders
+    # only the selected pages' text layer: those pages' hOCR files are staged
+    # into a temporary work folder, so the job's full hOCR set is untouched
+    # for later full embeds.
     overrides = {}
     if payload.optimize is not None:
         overrides["optimize"] = payload.optimize
     if payload.output_type:
         overrides["output_type"] = payload.output_type
     try:
-        out_path, stats = ocr_service.embed_job(job_id, overrides or None)
+        out_path, stats = ocr_service.embed_job(
+            job_id, overrides or None, page_indices=payload.pages)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
     # Post-embed validation: compare the freshly baked output against the
-    # stored pages.  Never fails the embed — a broken report is surfaced as
-    # ok:false instead.
-    report = _build_embed_report(job_id, Path(out_path))
+    # pages that were embedded.  Never fails the embed — a broken report is
+    # surfaced as ok:false instead.
+    report = _build_embed_report(job_id, Path(out_path), payload.pages)
     return {
         "status": "embedded",
         "filename": Path(out_path).name,
@@ -532,11 +540,23 @@ def embed(job_id: str, payload: EmbedModel):
     }
 
 
-def _build_embed_report(job_id: str, out_path: Path) -> dict:
+def _build_embed_report(job_id: str, out_path: Path,
+                        page_indices: Optional[list] = None) -> dict:
     """Best-effort report for the POST /api/embed response (never raises)."""
     from backend.models import dict_to_page
-    pages = [dict_to_page(p) for p in ocr_service.get_pages(job_id)
-             if isinstance(p, dict)]
+    done = [p for p in ocr_service.get_pages(job_id) if isinstance(p, dict)]
+    if page_indices is not None:
+        # Elements may be bare ints OR whole page dicts (the pre-rebuild
+        # frontend sends full page objects).
+        wanted = set()
+        for item in page_indices:
+            idx = item.get("page_index") if isinstance(item, dict) else item
+            try:
+                wanted.add(int(idx))
+            except (TypeError, ValueError):
+                continue
+        done = [p for p in done if p.get("page_index") in wanted]
+    pages = [dict_to_page(p) for p in done]
     if not pages:
         return {"ok": False, "error": "no embeddable pages to validate"}
     try:
