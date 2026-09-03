@@ -207,7 +207,8 @@ def _line_bboxes(block: Block, n_lines: int) -> List[List[int]]:
 
 
 def blocks_to_hocr(width: int, height: int, blocks: List[Block],
-                   dpi: float = 300.0, ppageno: int = 0) -> str:
+                   dpi: float = 300.0, ppageno: int = 0,
+                   per_line_overrides: Optional[dict] = None) -> str:
     """Render one page's blocks as an hOCR document for ocrmypdf.
 
     Structure (what ``ocrmypdf.hocrtransform`` parses):
@@ -215,6 +216,13 @@ def blocks_to_hocr(width: int, height: int, blocks: List[Block],
         p.ocr_par (title: bbox)
           span.ocr_line (title: bbox)  -- one per renderable line
             span.ocrx_word (title: bbox)  -- one full-width word per line
+
+    ``per_line_overrides`` (optional): ``{block_index: [(line_text, bbox), ...]}``
+    overrides a block's derived render lines AND their bboxes with explicit
+    (text, integer-bbox) pairs — used to place each rendered line at its actual
+    printed location (see ``backend.ocrmypad.line_split``).  When absent or
+    empty, lines fall back to the block's own text split with equal-slice
+    bboxes — this function's long-standing behavior.
 
     Gotchas honored:
       * ``scan_res`` MUST be present: the renderer's px->pt transform derives
@@ -225,20 +233,32 @@ def blocks_to_hocr(width: int, height: int, blocks: List[Block],
     """
     dpi_i = max(1, int(round(dpi)))
     body: List[str] = []
-    for block in blocks:
-        render_lines = list(block.lines)
-        if not render_lines and block.text.strip():
-            render_lines = split_block_lines(block.text)
-        if not render_lines and block.caption.strip():
-            # A figure whose caption is its only text: place the caption.
-            render_lines = [block.caption.strip()]
-        if not render_lines:
+    for block_index, block in enumerate(blocks):
+        override = None
+        if per_line_overrides:
+            override = per_line_overrides.get(block_index)
+        if override:
+            render_pairs = [(str(t), [int(v) for v in bb])
+                            for t, bb in override
+                            if str(t).strip() and len(bb) == 4]
+        else:
+            render_lines = list(block.lines)
+            if not render_lines and block.text.strip():
+                render_lines = split_block_lines(block.text)
+            if not render_lines and block.caption.strip():
+                # A figure whose caption is its only text: place the caption.
+                render_lines = [block.caption.strip()]
+            render_pairs = [
+                (line, lb)
+                for line, lb in zip(render_lines,
+                                    _line_bboxes(block, len(render_lines)))
+            ]
+        if not render_pairs:
             continue
 
-        line_bboxes = _line_bboxes(block, len(render_lines))
         line_class = _hocr_line_class(block.kind)
         par_lines: List[str] = []
-        for line_text, lb in zip(render_lines, line_bboxes):
+        for line_text, lb in render_pairs:
             escaped = _hocr_escape(line_text)
             title = f"bbox {lb[0]} {lb[1]} {lb[2]} {lb[3]}"
             par_lines.append(
