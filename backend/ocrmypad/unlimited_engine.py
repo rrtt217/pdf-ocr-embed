@@ -9,6 +9,12 @@ stream into blocks (``backend.ocrmypad.parser``), and writes:
 * a plain-text sidecar, and
 * a block sidecar JSON (``*_ocr_hocr.blocks.json``) that the WebUI edits.
 
+Multi-page (batch) mode: when ``ocr_batch_size > 1`` is configured, pages
+arriving concurrently from ocrmypdf's worker threads are grouped into ONE
+"Multi page parsing." request (``backend.ocrmypad.batching``); the
+``<PAGE>``-delimited response sections are handed back per page.  Every
+failure path degrades to a per-page request, so batching never loses a page.
+
 Decoupling: the engine communicates with the backend ONLY through the job's
 work folder on disk (hOCR, sidecars, the ``<job>/cancel`` flag file).  It
 derives the job dir from ``options.output_folder`` (the hOCR pipeline's work
@@ -19,10 +25,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 from backend.ocrmypad import settings as ocrmypad_settings
+from backend.ocrmypad.batching import BatchCancelled, BatchTimeout, MultiPageBatcher
 from backend.ocrmypad.engine_client import (
     UnlimitedOcrClient,
     image_dpi,
@@ -37,7 +46,7 @@ from backend.ocrmypad.parser import (
     hocr_page_sidecar_text,
     parse_response,
 )
-from backend.page_store import is_cancelled
+from backend.page_store import hocr_path, is_cancelled
 from ocrmypdf import hookimpl
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 
@@ -126,6 +135,117 @@ def _page_index_from_name(name: str) -> int:
         return 0
 
 
+# --- multi-page (batch) helpers ----------------------------------------------
+
+def _batch_size() -> int:
+    """Configured pages per multi-image request (0 = batching disabled)."""
+    try:
+        return max(0, int(ocrmypad_settings.get("ocr_batch_size") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _batch_timeout() -> float:
+    """Window flush timeout in seconds (backstop for the last partial window)."""
+    try:
+        return max(0.05, float(ocrmypad_settings.get("ocr_batch_timeout_ms") or 3000) / 1000.0)
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def _batch_max_wait(batch_size: int, client: UnlimitedOcrClient) -> float:
+    """How long a follower may wait for its batch response.
+
+    The leader's HTTP read timeout scales with the batch's max_tokens; add
+    connect + retry headroom so a slow-but-legit batch is not abandoned early.
+    """
+    budget = min(client.max_tokens, client.batch_per_page_tokens * batch_size)
+    read_timeout = max(client.READ_TIMEOUT_MIN, budget * client.READ_TIMEOUT_PER_TOKEN)
+    return read_timeout + 300.0
+
+
+def _pending_page_indices(work_dir: Path) -> set:
+    """0-based page indices whose rasterized image exists but whose hOCR
+    result is not on disk yet (their worker thread has not finished).
+
+    Used by the batcher to tell whether more pages are still expected after
+    the current batch window.  A page with an hOCR file (even stale from a
+    previous run) is treated as done: in a forced re-run the worst case is
+    that the re-run pages simply form their own windows.
+    """
+    work_dir = Path(work_dir)
+    pending: set = set()
+    for candidate in work_dir.glob("*_rasterize*.png"):
+        idx = _page_index_from_name(candidate.name)
+        if not hocr_path(work_dir, idx + 1).exists():
+            pending.add(idx)
+    return pending
+
+
+#: Per-job batchers so two concurrent jobs' worker threads never share a window.
+_BATCHERS: dict = {}
+_batchers_lock = threading.Lock()
+
+
+def _batcher_for(job_dir: Path, batch_size: int, client: UnlimitedOcrClient) -> MultiPageBatcher:
+    """Return the batcher for this job, created on the first page of a run.
+
+    Anonymous runs (no job dir — no ocrmypdf conventions) get a per-thread
+    batcher so worker threads stay separate and never batch across pages.
+    """
+    if not job_dir or job_dir == Path():
+        key = f"anon-{threading.get_ident()}"
+        job_dir_arg = None
+    else:
+        key = str(job_dir)
+        job_dir_arg = job_dir
+    with _batchers_lock:
+        batcher = _BATCHERS.get(key)
+        if batcher is None or batcher.batch_size != batch_size:
+            batcher = MultiPageBatcher(
+                batch_size=batch_size,
+                timeout=_batch_timeout(),
+                sender=client.recognize_multi,
+                pending_pages=_pending_page_indices,
+                is_cancelled=_cancel_check(job_dir_arg),
+                max_wait=_batch_max_wait(batch_size, client),
+            )
+            _BATCHERS[key] = batcher
+        return batcher
+
+
+def _cancel_check(job_dir: Optional[Path]) -> Callable[[], bool]:
+    """An is_cancelled() check for the batcher (anonymous runs: never)."""
+    if job_dir is None:
+        return lambda: False
+    return lambda: is_cancelled(job_dir)
+
+
+def _batch_recognize(job_dir: Path, batch_size: int, client: UnlimitedOcrClient,
+                     page_index: int, input_file: Path) -> str:
+    """Route one page through the multi-page batcher, with single-page fallback.
+
+    Never worse than a plain per-page request: batch failures, wait timeouts
+    and empty/missing sections (a ``<PAGE>`` stream shorter than the image
+    count) all degrade to ``client.recognize`` for THIS page only.  A cancel
+    propagates so the run stops.
+    """
+    batcher = _batcher_for(job_dir, batch_size, client)
+    try:
+        raw = batcher.submit(page_index, input_file)
+    except BatchCancelled:
+        raise RuntimeError("OCR job cancelled by user")
+    except BatchTimeout:
+        log.debug("page %d: batch path unavailable; single-page fallback",
+                  page_index + 1, exc_info=True)
+        return client.recognize(input_file)
+    if raw.strip():
+        return raw
+    log.debug("page %d: batch returned an empty section; single-page fallback",
+              page_index + 1)
+    return client.recognize(input_file)
+
+
 class UnlimitedOcrEngine(OcrEngine):
     """OCRmyPDF engine backed by the unlimited-ocr vision model."""
 
@@ -200,7 +320,18 @@ class UnlimitedOcrEngine(OcrEngine):
         # to the client's built-in defaults.
         client = UnlimitedOcrClient(config=ocrmypad_settings.snapshot())
 
-        raw = client.recognize(input_file)
+        # Multi-page (batch) mode: group concurrent pages into one request.
+        # Skipped for serial runs (jobs=1) and when no ocrmypdf options are
+        # available.  _batch_recognize falls back to a per-page request on any
+        # batch failure, so this never makes a page worse than before.
+        batch_size = _batch_size()
+        if batch_size > 1 and options is not None \
+                and getattr(options, "jobs", 0) != 1:
+            raw = _batch_recognize(job_dir, batch_size, client,
+                                   page_index, input_file)
+        else:
+            raw = client.recognize(input_file)
+
         page = parse_response(raw, width, height, page_index)
 
         per_line = _per_line_overrides(input_file, page)

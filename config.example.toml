@@ -15,6 +15,8 @@
 # OCR_ENGINE -> ocr_engine, OCR_MAX_RETRIES -> max_retries,
 # OCR_RETRY_BASE_DELAY -> retry_base_delay, OCR_RETRY_MAX_DELAY ->
 # retry_max_delay, OCR_RATE_LIMIT_RPS -> rate_limit_rps,
+# OCR_BATCH_SIZE -> ocr_batch_size, OCR_BATCH_TIMEOUT_MS ->
+# ocr_batch_timeout_ms, OCR_BATCH_PER_PAGE_TOKENS -> ocr_batch_per_page_tokens,
 # OCRMYPDF_MODE/JOBS/OPTIMIZE/OUTPUT_TYPE/LANGUAGE/DESKEW/CLEAN/
 # ROTATE_PAGES -> ocrmypdf_*, OCR_CLEANUP_MAX_AGE_HOURS ->
 # cleanup_max_age_hours, OCR_CLEANUP_INTERVAL_HOURS -> cleanup_interval_hours,
@@ -45,6 +47,14 @@ model = "unlimited-ocr"                      # model / deployment name
 # retry_base_delay = 1.0                     # initial backoff seconds (exponential, +jitter)
 # retry_max_delay = 30.0                     # upper bound on backoff delay
 # rate_limit_rps = 0                         # requests/second cap (0 = disabled)
+
+# --- Multi-page (batch) parsing (unlimited engine, opt-in) -------------------
+# Group concurrent pages from ocrmypdf's worker threads into ONE multi-image
+# request ("Multi page parsing.").  Response sections are <PAGE>-delimited and
+# matched back per page; any batch failure falls back to per-page requests.
+# ocr_batch_size = 0                         # pages per request; 0 = disabled (default)
+# ocr_batch_timeout_ms = 3000                # window flush timeout (backstop, ms)
+# ocr_batch_per_page_tokens = 2048           # per-page output token budget in a batch
 
 # --- Temp-file cleanup (see backend/cleanup.py) ----------------------------
 cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days
