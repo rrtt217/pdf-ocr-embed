@@ -347,6 +347,14 @@ async def retry_ocr(
     job = ocr_service.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Precise refusals: a retry on a *running* job was previously reported as
+    # "missing file" even though the source PDF is on disk (the job's OCR
+    # thread simply had not finished).  Surface the real reason.
+    if job.get("status") in ("running", "stopping"):
+        raise HTTPException(
+            status_code=409,
+            detail="Job is still running — stop it or wait for it to finish "
+                   "before retrying")
     extra = {}
     for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
                  ("api_key", api_key), ("model", model),
@@ -363,7 +371,13 @@ async def retry_ocr(
         job_id, overrides=extra or None,
         page_range=page_range, force=bool(force))
     if not ok:
-        raise HTTPException(status_code=409, detail="Job cannot be retried (missing file)")
+        # retry_job refuses running/stopping (already caught above) and a
+        # missing source PDF; report that specific reason, not a generic one.
+        if not job.get("pdf_path") or not Path(job["pdf_path"]).exists():
+            raise HTTPException(
+                status_code=409,
+                detail="Job cannot be retried (missing source PDF file)")
+        raise HTTPException(status_code=409, detail="Job cannot be retried")
     log.info("retry scheduled for job %s (range=%s, force=%s)",
              job_id, page_range, force)
     return {"job_id": job_id, "filename": job["filename"], "status": "retrying"}

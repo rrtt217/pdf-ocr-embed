@@ -563,6 +563,13 @@ async function reOcrPage() {
   const jobId = sel.jobId;
   const job = jobById(jobId);
   if (!job || job.busy) return;
+  // The backend refuses retries while this job's OCR is still running (the
+  // page may already have a result, but the run has not finished).  Tell the
+  // user up front instead of surfacing a confusing 409 from the API.
+  if (RUNNING_STATUSES.has(job.status)) {
+    toast(t("job.runningNoReOcr"), "error");
+    return;
+  }
   const pageNo = page.page_index + 1;  // 1-based, user-facing
   job.busy = true;
   renderJobs();

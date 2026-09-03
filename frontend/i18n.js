@@ -91,6 +91,7 @@ const I18N_DICT = {
     "job.embeddedPdf": "⬇ Embedded PDF",
     "job.stopFailed": "Stop failed: {msg}",
     "job.retryFailed": "Retry failed: {msg}",
+    "job.runningNoReOcr": "This job is still running — stop it or wait for it to finish before re-running a page.",
     "job.partialFailed": "Partial failed: {msg}",
     "job.noPages": "No completed pages",
 
@@ -339,6 +340,7 @@ const I18N_DICT = {
     "job.embeddedPdf": "⬇ 嵌入后的 PDF",
     "job.stopFailed": "停止失败：{msg}",
     "job.retryFailed": "重试失败：{msg}",
+    "job.runningNoReOcr": "该任务仍在运行中，重跑页面前请先停止或等待其完成。",
     "job.partialFailed": "获取部分结果失败：{msg}",
     "job.noPages": "没有已完成的页面",
 

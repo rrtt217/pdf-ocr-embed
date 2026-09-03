@@ -147,3 +147,27 @@ def test_retry_stopped_job_still_schedules(monkeypatch, tmp_path):
                         type("T", (), {"start": lambda self: None})())
     assert ocr_service.retry_job("guard-1") is True
     assert started
+
+
+# --- POST /api/ocr/retry/{job_id}: precise 409 reasons -----------------------
+
+def test_retry_route_running_job_reports_running_not_missing_file(client,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+    """A running job was previously refused with the misleading "missing file"
+    message even though its source PDF is on disk."""
+    _mk_job(tmp_path, monkeypatch, status="running")
+    r = client.post("/api/ocr/retry/guard-1", data={})
+    assert r.status_code == 409
+    assert "still running" in r.json()["detail"]
+    assert "missing" not in r.json()["detail"]
+
+
+def test_retry_route_missing_pdf_still_reports_missing_file(client,
+                                                            monkeypatch,
+                                                            tmp_path):
+    _mk_job(tmp_path, monkeypatch, status="stopped")
+    # Source PDF does not exist -> the "missing file" refusal remains accurate.
+    r = client.post("/api/ocr/retry/guard-1", data={})
+    assert r.status_code == 409
+    assert "missing source PDF" in r.json()["detail"]
