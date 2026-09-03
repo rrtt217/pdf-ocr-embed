@@ -106,3 +106,28 @@ def test_load_page_never_parses_mid_write_hocr(tmp_path):
     half-written file — it is excluded from the inventory entirely."""
     _truncated_hocr(tmp_path, 9)
     assert page_store.load_page(tmp_path, 9, persist_missing_sidecar=False) is None
+
+
+def test_tesseract_line_confidence_is_0_to_1_fraction(tmp_path):
+    """ocrmypdf's HocrParser converts the hOCR ``x_wconf`` (0-100) to a
+    0.0-1.0 fraction; the derived block ``conf`` must stay on that scale —
+    dividing again would collapse every block to 0% or 1% in the WebUI."""
+    f = tmp_path / "000002_ocr_hocr.hocr"
+    f.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n<body>\n'
+        "<div class='ocr_page' title='bbox 0 0 1000 2000; ppageno 1'>\n"
+        " <p class='ocr_par' title='bbox 100 100 900 200'>\n"
+        "  <span class='ocr_line' title='bbox 100 100 900 200'>\n"
+        "   <span class='ocrx_word' title='bbox 100 100 300 200; x_wconf 58'>one</span>\n"
+        "   <span class='ocrx_word' title='bbox 300 100 500 200; x_wconf 54'>two</span>\n"
+        "   <span class='ocrx_word' title='bbox 600 100 900 200; x_wconf 33'>three</span>\n"
+        "  </span>\n"
+        " </p>\n"
+        "</div>\n</body>\n</html>\n",
+        encoding="utf-8")
+    page, _ = page_store.hocr_to_page(f, page_no=2)
+    assert page is not None
+    assert len(page["blocks"]) == 1
+    # (58 + 54 + 33) / 3 = 48.33… -> 0.48 on the 0..1 scale.
+    assert page["blocks"][0]["conf"] == 0.48

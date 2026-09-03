@@ -218,7 +218,10 @@ def hocr_to_page(hocr_file: Path, origin_pdf: Optional[Path] = None,
                 continue
             confs = [w.confidence for w in line.children
                      if w.confidence is not None]
-            conf = round(sum(confs) / len(confs) / 100.0, 2) if confs else None
+            # ocrmypdf's HocrParser already converts the hOCR ``x_wconf``
+            # (0-100) to a 0.0-1.0 fraction; the block conf must stay in that
+            # same scale (the WebUI multiplies by 100 for display).
+            conf = round(sum(confs) / len(confs), 2) if confs else None
             lb = line.bbox
             int_bbox = [max(0, int(round(lb.left))), max(0, int(round(lb.top))),
                         max(0, int(round(lb.right))), max(0, int(round(lb.bottom)))]
