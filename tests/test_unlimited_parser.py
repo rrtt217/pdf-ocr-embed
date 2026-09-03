@@ -253,8 +253,8 @@ def test_multi_payload_structure(tmp_path):
     assert "data:image/png;base64," in content[1]["image_url"]["url"]
 
 
-def test_multi_payload_max_tokens_never_exceeds_the_hard_cap():
-    p = [_make_png(__import__("pathlib").Path("."))]  # never used below
+def test_multi_payload_max_tokens_never_exceeds_the_hard_cap(tmp_path):
+    p = [_make_png(tmp_path, "cap.png")]
     client = UnlimitedOcrClient(base_url="http://x", api_key="k", max_tokens=32767,
                                 config={"ocr_batch_per_page_tokens": "100000"})
     payload = client.multi_payload(p)
