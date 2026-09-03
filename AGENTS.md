@@ -50,6 +50,11 @@ the single most important invariant to preserve.
   they can override file/WebUI values for the running process. Do not
   reintroduce JSON / `.env` file config, and never read `os.environ` outside
   `backend/config.py`.
+- Config is host-injected into the plugin: `backend` pushes the effective
+  `resolve()` snapshot into `backend/ocrmypad/settings.py` (at startup, on
+  settings save, and in the CLI). The plugin package never imports
+  `backend.config` — engine code reads its own store via
+  `ocrmypad_settings.snapshot()` / `get()`.
 - `max_tokens` must stay `< 32768`.
 - ocrmypdf runs must use `use_threads=True` (the engines are HTTP/IO-bound;
   a forked child could not report progress through the work files).
@@ -64,6 +69,7 @@ backend/
   config.py               # external setting resolution (resolve())
   page_store.py           # engine-agnostic page interchange (sidecar/hOCR/cancel)
   ocrmypad/               # OCRmyPDF plugin package (unlimited engine)
+    settings.py           # host-injected config store (configure()/snapshot())
     unlimited_engine.py   # OcrEngine plugin + get_ocr_engine hook
     engine_client.py      # OpenAI-compatible client (retry/timeout/truncation)
     parser.py             # <|det|> markers -> blocks -> hOCR
@@ -86,7 +92,8 @@ AGENTS.md  README.md  DESIGN.md  config.example.toml  .gitignore
 
 This is the ONLY channel the rest of the backend uses to talk about pages —
 no engine's raw output format ever leaks past it, and the backend never
-imports `backend.ocrmypad`:
+imports any `backend.ocrmypad` internals (engine/client/parser); the only
+backend→plugin import is the config-injection seam (`backend.ocrmypad.settings`):
 
 - **Block sidecar** (`work/<job>/hocr/000001_ocr_hocr.blocks.json`) — the
   normalized page representation (blocks in raw pixel space) the WebUI edits.
@@ -149,8 +156,11 @@ def get_ocr_engine(options):
 ### Steps
 
 1. **Create `backend/ocrmypad/<engine>_engine.py`** implementing the contract.
-   Read settings via `backend.config.resolve()` (never `os.environ`), resolve
-   defaults in the client constructor, not per call.
+   Settings are host-injected: the backend pushes the effective config into
+   `backend.ocrmypad.settings` (`configure()` at startup / on settings save).
+   Read them with `ocrmypad_settings.snapshot()` / `get()` — never import
+   `backend.config` and never `os.environ`. Resolve defaults in the client
+   constructor, not per call.
 2. **Emit hOCR** matching what `ocrmypdf.hocrtransform` parses:
    `div.ocr_page` (title: `bbox 0 0 W H; ppageno N; scan_res DPI DPI`) →
    `p.ocr_par` → `span.ocr_line` → `span.ocrx_word` (bbox in **raw pixels**,
@@ -181,7 +191,8 @@ def get_ocr_engine(options):
       `x1<=x2`, `y1<=y2`; `scan_res` present.
 - [ ] Block sidecar JSON written next to the hOCR (WebUI edits it).
 - [ ] Missing optional dependency raises `UnavailableError`, not a traceback.
-- [ ] No hardcoded keys/URLs; settings come from `resolve()`.
+- [ ] No hardcoded keys/URLs; settings come from the host-injected plugin
+      store (`backend.ocrmypad.settings`), never `backend.config` / `os.environ`.
 - [ ] Works via `ocrmypdf.api._pdf_to_hocr(..., plugins=[backend/ocrmypad/__init__.py])`.
 
 ## Conventions & gotchas

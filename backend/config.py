@@ -59,6 +59,7 @@ _FILE_KEYS = (
     "ocrmypdf_optimize",    # 0..3, applied at finalize (default 0)
     "ocrmypdf_output_type", # pdf | pdfa (default pdf)
     "ocrmypdf_language",    # tesseract needs it; the unlimited engine ignores it
+    "tess_lang",            # legacy name for ocrmypdf_language (auto-mapped)
     "ocrmypdf_deskew",      # boolean, default off
     "ocrmypdf_clean",       # boolean, default off (requires unpaper)
     "ocrmypdf_rotate_pages",  # boolean, default off (needs an OSD-capable engine)
@@ -110,6 +111,11 @@ def _load_file_config() -> Dict[str, str]:
         val = data.get(key)
         if val is not None:
             cfg[key] = _as_str(val)
+    # Legacy ``tess_lang`` (pre-rebuild name) maps onto ``ocrmypdf_language``
+    # so an existing config keeps working; ``ocrmypdf_language`` wins if both
+    # are present.
+    if cfg.get("tess_lang") and not cfg.get("ocrmypdf_language"):
+        cfg["ocrmypdf_language"] = cfg["tess_lang"]
     return cfg
 
 
@@ -186,6 +192,7 @@ def get_effective_settings() -> Dict[str, Any]:
         "ocrmypdf_jobs": cfg.get("ocrmypdf_jobs", "0"),
         "ocrmypdf_optimize": cfg.get("ocrmypdf_optimize", "0"),
         "ocrmypdf_output_type": cfg.get("ocrmypdf_output_type", "pdf"),
+        "ocrmypdf_language": cfg.get("ocrmypdf_language", ""),
         "ocrmypdf_deskew": as_bool(cfg.get("ocrmypdf_deskew", "false")),
         "ocrmypdf_clean": as_bool(cfg.get("ocrmypdf_clean", "false")),
         "api_key_masked": _mask_key(cfg.get("api_key", "")),

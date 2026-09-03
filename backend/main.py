@@ -51,6 +51,11 @@ async def lifespan(_app: FastAPI):
     # Keep orphaned temp files from accumulating: periodically delete
     # unreferenced files older than cleanup_max_age_hours.
     cleanup_mod.start_background_cleanup()
+    # Push the effective config into the OCR engine plugin — the plugin never
+    # reads backend.config itself; the host initializes it here (and again
+    # whenever the settings change, see save_settings).
+    from backend.ocrmypad import settings as ocrmypad_settings
+    ocrmypad_settings.configure(config.resolve())
     yield
     cleanup_mod.stop_background_cleanup()
 
@@ -81,6 +86,7 @@ class SettingsModel(BaseModel):
     ocrmypdf_jobs: Optional[str] = None
     ocrmypdf_optimize: Optional[str] = None
     ocrmypdf_output_type: Optional[str] = None
+    ocrmypdf_language: Optional[str] = None
     ocrmypdf_deskew: Optional[bool] = None
     ocrmypdf_clean: Optional[bool] = None
     ocrmypdf_rotate_pages: Optional[bool] = None
@@ -177,7 +183,7 @@ def save_settings(payload: SettingsModel) -> dict:
         data["api_key"] = payload.api_key
     for key in ("provider", "base_url", "model", "ocr_engine",
                 "ocrmypdf_mode", "ocrmypdf_jobs", "ocrmypdf_optimize",
-                "ocrmypdf_output_type"):
+                "ocrmypdf_output_type", "ocrmypdf_language"):
         value = getattr(payload, key, None)
         if value is not None:
             data[key] = value
@@ -188,7 +194,12 @@ def save_settings(payload: SettingsModel) -> dict:
     if data:
         # Persist via config.save (handles masked-key preservation, and only
         # writes the fields actually present in the payload).
-        return config.save(data)
+        result = config.save(data)
+        # Keep the engine plugin's injected config in sync with a WebUI save
+        # (same host-initializes-plugin contract as the startup push above).
+        from backend.ocrmypad import settings as ocrmypad_settings
+        ocrmypad_settings.configure(config.resolve())
+        return result
     # Read-only display mode.
     return config.get_effective_settings()
 
@@ -202,6 +213,7 @@ async def upload_pdf(
     base_url: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    lang: Optional[str] = Form(None),
 ) -> dict:
     """Upload one or more PDFs; each file becomes its own OCR job.
 
@@ -212,6 +224,9 @@ async def upload_pdf(
     there is no separate queue manager.
 
     ``concurrency`` (optional) maps to the OCRmyPDF worker count for this job.
+    ``lang`` (optional) is the OCR language for engines that use one (e.g.
+    Tesseract: ``chi_sim+eng``); it overrides the persisted
+    ``ocrmypdf_language`` for this run.
     """
     uploads: List[UploadFile] = []
     seen: set = set()
@@ -225,7 +240,8 @@ async def upload_pdf(
 
     extra = {}
     for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
-                 ("api_key", api_key), ("model", model)):
+                 ("api_key", api_key), ("model", model),
+                 ("language", lang)):
         if v is not None and v != "":
             extra[k] = v
     if concurrency is not None and int(concurrency) > 0:
@@ -313,6 +329,7 @@ async def retry_ocr(
     base_url: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    lang: Optional[str] = Form(None),
     page_start: Optional[int] = Form(None),
     page_end: Optional[int] = Form(None),
     force: Optional[bool] = Form(False),
@@ -320,7 +337,7 @@ async def retry_ocr(
     """Re-run OCR on an already-uploaded job without re-uploading the PDF.
 
     All fields are optional form fields so old clients keep working:
-      - ocr_engine / base_url / api_key / model / concurrency — as before.
+      - ocr_engine / base_url / api_key / model / concurrency / lang — as before.
       - page_start / page_end: a 1-based inclusive page range to run
         (both optional; e.g. page_start=1,page_end=20 runs pages 1..20).
       - force: boolean, default false — when true, already-successful pages in
@@ -332,7 +349,8 @@ async def retry_ocr(
         raise HTTPException(status_code=404, detail="Job not found")
     extra = {}
     for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
-                 ("api_key", api_key), ("model", model)):
+                 ("api_key", api_key), ("model", model),
+                 ("language", lang)):
         if v is not None and v != "":
             extra[k] = v
     if concurrency is not None and int(concurrency) > 0:

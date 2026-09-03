@@ -83,3 +83,40 @@ def test_engine_env_aliases(monkeypatch):
     assert cfg["ocr_engine"] == "tesseract"
     assert cfg["ocrmypdf_mode"] == "redo"
     assert cfg["ocrmypdf_jobs"] == "2"
+
+
+def test_legacy_tess_lang_maps_to_ocrmypdf_language(monkeypatch, tmp_path):
+    """The pre-rebuild config key ``tess_lang`` still controls the OCR
+    language; ``ocrmypdf_language`` wins when both are present."""
+    cfg_file = tmp_path / "ocr_config.toml"
+    monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
+    monkeypatch.setattr(config, "_saved", {})
+    cfg_file.write_text('tess_lang = "chi_sim+eng"\n', encoding="utf-8")
+    cfg = config.resolve()
+    assert cfg.get("ocrmypdf_language") == "chi_sim+eng"
+    # Explicit ocrmypdf_language takes precedence over the legacy alias.
+    cfg_file.write_text('tess_lang = "eng"\nocrmypdf_language = "chi_sim+eng"\n',
+                        encoding="utf-8")
+    assert config.resolve().get("ocrmypdf_language") == "chi_sim+eng"
+
+
+def test_effective_settings_exposes_ocrmypdf_language(monkeypatch, tmp_path):
+    """The WebUI settings page reads/writes ocrmypdf_language; it must be
+    returned by /api/settings (and visible when coming from tess_lang)."""
+    cfg_file = tmp_path / "ocr_config.toml"
+    monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
+    monkeypatch.setattr(config, "_saved", {})
+    cfg_file.write_text('tess_lang = "chi_sim+eng"\n', encoding="utf-8")
+    eff = config.get_effective_settings()
+    assert eff["ocrmypdf_language"] == "chi_sim+eng"
+
+
+def test_settings_save_persists_ocrmypdf_language(monkeypatch, tmp_path):
+    cfg_file = tmp_path / "ocr_config.toml"
+    cfg_file.write_text('tess_lang = "eng"\n', encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", cfg_file)
+    monkeypatch.setattr(config, "_saved", {})
+    config.save({"ocrmypdf_language": "chi_sim+eng"})
+    saved = config._load_file_config()
+    assert saved.get("ocrmypdf_language") == "chi_sim+eng"
+    assert config.resolve().get("ocrmypdf_language") == "chi_sim+eng"

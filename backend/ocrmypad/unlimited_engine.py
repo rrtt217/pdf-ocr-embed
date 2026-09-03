@@ -20,8 +20,9 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from backend.ocrmypad import settings as ocrmypad_settings
 from backend.ocrmypad.engine_client import (
     UnlimitedOcrClient,
     image_dpi,
@@ -141,13 +142,11 @@ class UnlimitedOcrEngine(OcrEngine):
         dpi = image_dpi(input_file)
         page_index = _page_index_from_name(output_hocr.name)
 
-        cfg: dict[str, Any] = {}
-        try:
-            from backend.config import resolve
-            cfg = resolve()
-        except Exception:  # noqa: BLE001
-            log.debug("resolve() failed in engine; using defaults", exc_info=True)
-        client = UnlimitedOcrClient(config=cfg)
+        # Config is host-injected: the backend pushes the effective config into
+        # backend.ocrmypad.settings at startup / on settings changes, so the
+        # engine never reads backend.config itself.  An empty store falls back
+        # to the client's built-in defaults.
+        client = UnlimitedOcrClient(config=ocrmypad_settings.snapshot())
 
         raw = client.recognize(input_file)
         page = parse_response(raw, width, height, page_index)

@@ -9,8 +9,9 @@ Ported from the pre-rebuild ``unlimited_ocr_adapter``.  Single-page requests
 * one retry on degenerate results (the hosted vLLM endpoint occasionally
   returns a 1-token empty response for pages that DO contain text).
 
-HTTP retry / rate-limit knobs come from ``backend.config.resolve()`` — never
-hardcoded, never read from ``os.environ`` outside ``resolve()``.
+HTTP retry / rate-limit knobs come from the plugin settings store — the host
+backend pushes the effective config in via ``backend.ocrmypad.settings``
+(still never hardcoded, never read from ``os.environ`` here).
 """
 from __future__ import annotations
 
@@ -22,9 +23,9 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from backend.config import resolve
 from backend.errors import UnavailableError
 from backend.http_retry import RateLimiter, post_json_with_retry
+from backend.ocrmypad import settings as ocrmypad_settings
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +50,9 @@ class UnlimitedOcrClient:
     def __init__(self, base_url: str | None = None, api_key: str | None = None,
                  model: str | None = None, max_tokens: int | None = None,
                  config: Dict[str, str] | None = None):
-        cfg = dict(config) if config is not None else resolve()
+        # No explicit config -> the host-injected plugin settings store (the
+        # backend pushes ``config.resolve()`` into it).  Never backend.config.
+        cfg = dict(config) if config is not None else ocrmypad_settings.snapshot()
         self.base_url = (base_url or cfg.get("base_url") or
                          "https://api.llm.ustc.edu.cn/v1").rstrip("/")
         self.api_key = api_key or cfg.get("api_key") or ""

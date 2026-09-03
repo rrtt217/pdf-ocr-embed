@@ -65,24 +65,77 @@ def is_cancelled(job_dir: Path) -> bool:
 
 # --- page inventory ----------------------------------------------------------
 
-def page_numbers(hocr_dir: Path) -> List[int]:
-    """Sorted 1-based page numbers that have ANY result on disk.
+def _page_no_from_name(path: Path) -> Optional[int]:
+    """The 1-based page number encoded in an hOCR/sidecar file name."""
+    try:
+        return int(path.name.split("_", 1)[0])
+    except (ValueError, IndexError):
+        return None
 
-    The union of hOCR files and block sidecars: an engine may produce either
-    (or both).  This is what "retry remaining", progress display and the
-    embed guard count — for every engine.
+
+def _hocr_complete(hocr_file: Path) -> bool:
+    """True when an hOCR file looks *fully written*, not mid-write.
+
+    ocrmypdf's built-in Tesseract writes ``<n>_ocr_hocr.hocr`` progressively
+    while it OCRs the page — the closing ``</html>`` only lands when the page
+    is done — so a bare file existing in the folder is NOT a finished page
+    (parsing a half-written file spams "hOCR parse failed: no element found").
+
+    A page counts as complete when:
+      * its hOCR file is non-empty and carries its closing ``</html>`` tag —
+        the only reliable content signal.  A stale ``<n>_hocr.json`` from a
+        previous run must NOT count: a forced re-run rewrites the hOCR in
+        place while the old marker is still on disk, and the marker is only
+        refreshed after the page finishes again; or
+      * its hOCR is EMPTY and ocrmypdf's per-page marker ``<n>_hocr.json``
+        exists — an intentionally empty hOCR (ocrmypdf's null page for a
+        timeout / empty page) has no closing tag but is a finished page,
+        whereas an empty file with no marker is just tesseract creating it.
+    """
+    marker = hocr_file.with_name(hocr_file.name.replace(
+        "_ocr_hocr.hocr", "_hocr.json"))
+    try:
+        size = hocr_file.stat().st_size
+    except OSError:
+        return False
+    if size == 0:
+        return marker.exists()
+    try:
+        with open(hocr_file, "rb") as fh:
+            fh.seek(max(0, size - 128))
+            tail = fh.read()
+    except OSError:
+        return False
+    return b"</html>" in tail.rstrip()
+
+
+def page_numbers(hocr_dir: Path) -> List[int]:
+    """Sorted 1-based page numbers that have a COMPLETE result on disk.
+
+    The union of block sidecars and *fully written* hOCR files: an engine may
+    produce either (or both).  This is what "retry remaining", progress
+    display and the embed guard count — for every engine.
+
+    The bare hOCR file is only a completion signal once it is fully written
+    (see ``_hocr_complete``): engines such as ocrmypdf's built-in Tesseract
+    stream the file while they run, and a half-written page otherwise shows up
+    as "done" in progress and fails to parse downstream.
     """
     hdir = Path(hocr_dir)
     if not hdir.exists():
         return []
-    numbers = set()
-    for pattern, suffix_len in (("*_ocr_hocr.hocr", None),
-                                ("*_ocr_hocr.blocks.json", None)):
-        for path in hdir.glob(pattern):
-            try:
-                numbers.add(int(path.name.split("_", 1)[0]))
-            except (ValueError, IndexError):
-                continue
+    numbers: set[int] = set()
+    # Block sidecars are complete by construction (one JSON blob per page).
+    for path in hdir.glob("*_ocr_hocr.blocks.json"):
+        page_no = _page_no_from_name(path)
+        if page_no is not None:
+            numbers.add(page_no)
+    for path in hdir.glob("*_ocr_hocr.hocr"):
+        page_no = _page_no_from_name(path)
+        if page_no is None or page_no in numbers:
+            continue
+        if _hocr_complete(path):
+            numbers.add(page_no)
     return sorted(numbers)
 
 
@@ -137,8 +190,11 @@ def hocr_to_page(hocr_file: Path, origin_pdf: Optional[Path] = None,
     try:
         from ocrmypdf.hocrtransform.hocr_parser import HocrParser
         tree = HocrParser(hocr_file).parse()
-    except Exception:  # noqa: BLE001
-        log.warning("hOCR parse failed for %s", hocr_file, exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        # One line, not a full traceback: the underlying parser already
+        # reported the concrete reason (usually "no element found" for a
+        # truncated file), and a mid-write file must not spam the log.
+        log.warning("hOCR parse failed for %s: %s", hocr_file, exc)
         return None, None
 
     if page_no is None:

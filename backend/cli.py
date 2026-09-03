@@ -125,6 +125,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     hocr_dir = work_dir / "hocr"
     hocr_dir.mkdir(parents=True, exist_ok=True)
 
+    # The engine plugin reads host-injected settings, not backend.config:
+    # push the effective config in before the pipeline runs.
+    from backend.config import resolve as resolve_config
+    from backend.ocrmypad import settings as ocrmypad_settings
+    ocrmypad_settings.configure(resolve_config())
+
     try:
         # Phase 1: OCR -> per-page hOCR + block sidecars (plugin engine runs).
         ocrmypdf.api._pdf_to_hocr(
