@@ -555,8 +555,16 @@ function jobCard(job) {
     stop.onclick = () => stopJob(job.id);
     actions.appendChild(stop);
   } else {
-    if (job.status === "error" || job.current > 0) {
-      const retry = el("button", "primary", job.current > 0 ? t("job.retryRemaining") : t("job.retry"));
+    // Start / resume: every inactive job that is not already complete gets a
+    // run button.  A stopped/recovered job with zero *reported* pages must
+    // still be startable — the backend keeps its completed pages on disk and
+    // the retry endpoint resumes exactly the pages that are missing.
+    const complete = job.status === "done" || job.status === "embedded";
+    if (!complete) {
+      const started = job.current > 0;
+      const retry = el("button", "primary",
+        started ? t("job.retryRemaining")
+                : job.status === "error" ? t("job.retry") : t("job.start"));
       retry.disabled = !!job.busy;
       retry.onclick = () => retryJob(job.id);
       actions.appendChild(retry);

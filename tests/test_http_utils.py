@@ -1,7 +1,9 @@
-"""Tests for backend.sources.http_utils (retry + rate limiter).
+"""Tests for the plugin's HTTP retry + rate limiter (ocrmypdf_unlimited).
 
 All tests are network-free: httpx.MockTransport stands in for the wire, and
 the backoff/retry sleeps are injected (fake ``sleep``) so the suite stays fast.
+The retry helpers now live in the standalone plugin (the app's copy was
+removed); they are exercised through the plugin's own module.
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ import time
 import httpx
 import pytest
 
-from backend.http_retry import (
+from ocrmypdf_unlimited.http_retry import (
     RateLimiter,
     _backoff_delay,
     post_json_with_retry,

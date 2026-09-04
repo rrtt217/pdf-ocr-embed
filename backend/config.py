@@ -45,15 +45,15 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
 
 # Keys accepted in ocr_config.toml.
 _FILE_KEYS = (
-    # unlimited engine (backend.ocrmypad) provider fields
+    # unlimited engine (ocrmypdf_unlimited plugin) provider fields
     "api_key", "base_url", "model", "provider",
     # engine selection: 'unlimited' (plugin), 'tesseract' (ocrmypdf built-in),
     # 'none' (no OCR).  Default 'unlimited'.
     "ocr_engine",
-    # unlimited engine HTTP retry / rate-limit knobs (backend.http_retry):
+    # unlimited engine HTTP retry / rate-limit knobs (ocrmypdf_unlimited.http_retry):
     # do NOT affect OCR output.
     "max_retries", "retry_base_delay", "retry_max_delay", "rate_limit_rps",
-    # unlimited engine multi-page batching (backend.ocrmypad.batching):
+    # unlimited engine multi-page batching (ocrmypdf_unlimited.batching):
     # 0=disabled (default).  >1 groups concurrent pages into one request.
     "ocr_batch_size",            # pages per multi-image request
     "ocr_batch_timeout_ms",      # batch window flush timeout (backstop, ms)

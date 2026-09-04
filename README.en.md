@@ -29,11 +29,16 @@ nothing is hardcoded in the code.
   tesseract + ghostscript, no qpdf). The backend calls it in-process through its
   official edit-round-trip channel: `_pdf_to_hocr` (OCR → per-page hOCR) +
   `_hocr_to_ocr_pdf` (edited hOCR → final PDF).
-- **unlimited-ocr as an OCRmyPDF plugin** (`backend/ocrmypad/`) — an `OcrEngine`
-  plugin that OCRs each page through an OpenAI-compatible vision API (USTC
+- **unlimited-ocr as a standalone OCRmyPDF plugin** ([`ocrmypdf_unlimited/`](ocrmypdf_unlimited/README.md),
+  a `pip install`-able plugin package built strictly from the
+  [official plugin docs](https://ocrmypdf.readthedocs.io/en/latest/plugins.html)) — an
+  `OcrEngine` plugin that OCRs each page through an OpenAI-compatible vision API (USTC
   `unlimited-ocr` model), parses the `<|det|>type [bbox]<|/det|>content` markers
   (1000×1000 canvas scaled per-axis back to **raw pixel coordinates**) and writes
-  hOCR + a block sidecar JSON (the WebUI's editable representation).
+  hOCR + a block sidecar JSON (the WebUI's editable representation). It carries its
+  own `--unlimited-*` CLI/API arguments and `ocr_engine='unlimited'` selection, so it
+  can run fully independently of this app — and this app keeps working (built-in
+  Tesseract) when the plugin is not installed.
   `ocr_engine = "tesseract"` falls back to ocrmypdf's built-in Tesseract;
   `"none"` disables OCR.
 - **Engine-agnostic page store** (`backend/page_store.py`) — the ONLY channel the

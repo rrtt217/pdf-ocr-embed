@@ -46,6 +46,13 @@ def cancel_path(job_dir: Path) -> Path:
 
 # --- cancel flag (service -> engine, via the filesystem) ---------------------
 
+# Cancellation is an EXCLUSIVE capability of the unlimited engine plugin: the
+# plugin polls <job_dir>/cancel per page (its own mirror of this contract,
+# ocrmypdf_unlimited.files) and stops gracefully, keeping completed pages —
+# ocrmypdf itself can only be hard-interrupted.  This module is the host's
+# WRITE side; the plugin's files.py is the READ side.  Same path, no imports
+# either way (pinned by tests).
+
 def request_cancel(job_dir: Path) -> None:
     """Ask the engine to stop processing more pages for this job.
 

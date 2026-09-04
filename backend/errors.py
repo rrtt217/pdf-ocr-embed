@@ -1,18 +1,23 @@
-"""Shared error types + coordinate helpers for the OCR pipeline.
+"""Shared error types + coordinate helpers for the app backend.
 
-The old ``OcrSource`` adapter ABC is gone: the backend now runs OCRmyPDF with
-the ``backend.ocrmypad`` plugin as its OCR engine, and ``UnavailableError``
-surfaces missing-dependency/setup problems to users gracefully.
+``UnavailableError`` is the app-side alias of the standalone plugin's own
+:class:`ocrmypdf_unlimited.errors.UnavailableError`: the plugin raises it for
+pure setup problems (missing dependency / missing configuration), and the
+backend catches it to surface a friendly message instead of a stack trace.
+When the plugin is not installed the backend defines its own copy so nothing
+else in the app breaks (the app must work without the plugin).
 """
 from __future__ import annotations
 
+try:  # The standalone plugin (when installed) owns the canonical class.
+    from ocrmypdf_unlimited.errors import UnavailableError
+except ImportError:  # pragma: no cover - app must also run without the plugin
+    class UnavailableError(RuntimeError):
+        """Raised when an OCR engine (or its dependencies) is not usable.
 
-class UnavailableError(RuntimeError):
-    """Raised when an OCR engine (or its dependencies) is not usable.
-
-    A pure setup problem (missing dependency, missing configuration) — the
-    backend surfaces the message to the user instead of a stack trace.
-    """
+        A pure setup problem (missing dependency, missing configuration) — the
+        backend surfaces the message to the user instead of a stack trace.
+        """
 
 
 def map_normalized_to_pixels(x: float, y: float, width: int, height: int) -> tuple[float, float]:

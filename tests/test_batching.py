@@ -86,11 +86,15 @@ def test_serial_pages_each_get_their_own_batch():
         calls.append(list(paths))
         return [f"P{paths[0].name}"]
 
-    # pending stays empty -> every page alone looks like the last page.
-    batcher = _batcher(sender, pending=set(), batch_size=4)
+    # Serial arrivals: nothing else is pending, so each lone page is flushed by
+    # the window timeout (no premature "empty pending -> flush" fast path —
+    # that raced with still-rasterizing pages).
+    batcher = _batcher(sender, pending=set(), batch_size=4, timeout=0.2,
+                       max_wait=5.0)
     assert batcher.submit(0, Path("/tmp/p0.png")) == "Pp0.png"
     assert batcher.submit(1, Path("/tmp/p1.png")) == "Pp1.png"
     assert len(calls) == 2 and all(len(c) == 1 for c in calls)
+    assert calls[0] == [Path("/tmp/p0.png")] and calls[1] == [Path("/tmp/p1.png")]
 
 
 def test_sender_failure_degrades_to_batch_timeout():
@@ -154,11 +158,114 @@ def test_partial_window_flushed_by_backstop_timer():
         calls.append(list(paths))
         return ["S0"]
 
-    # pending stays non-empty forever (page 1 never joins) -> only the timer
-    # can flush the lone page 0.
-    batcher = _batcher(sender, pending={1}, timeout=0.2, batch_size=4)
+    # nothing else is pending -> the lone page is flushed by the backstop timer
+    # (the empty-pending fast path is gone, so the timer is the only flusher).
+    batcher = _batcher(sender, pending=set(), timeout=0.2, batch_size=4,
+                       max_wait=5.0)
     assert batcher.submit(0, Path("/tmp/p0.png")) == "S0"
     assert len(calls) == 1 and calls[0] == [Path("/tmp/p0.png")]
+
+
+def test_partial_window_holds_while_pages_are_pending_outside(monkeypatch):
+    """Anti-collapse fix: a partial window is NOT flushed at expiry while the
+    scan shows rasterized-but-unstaged pages outside it — those pages are about
+    to submit(), so a bounded hold lets them join one batch."""
+    calls = []
+
+    def sender(paths):
+        calls.append(list(paths))
+        return [f"S{Path(p).stem[1]}" for p in paths]
+
+    batcher = MultiPageBatcher(
+        batch_size=4, timeout=0.15, sender=sender,
+        pending_pages=lambda wd: set(), max_wait=5.0,
+        grace=0.4, max_extensions=2,
+    )
+
+    def work(args, out):
+        try:
+            out.append((args, batcher.submit(*args)))
+        except BaseException as exc:  # noqa: BLE001 - test harness
+            out.append((args, exc))
+
+    results = []
+    t0 = threading.Thread(
+        target=work, args=((0, Path("/tmp/hocr/p0.png")), results), daemon=True)
+    t0.start()
+
+    # wait until page 0 is staged, then let page 1's PNG appear as pending
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        with batcher._lock:
+            w = batcher._window
+        if w is not None and len(w.pages) == 1:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("page 0 never staged")
+    monkeypatch.setattr(batcher, "pending_pages", lambda wd: {0, 1})
+
+    # let the window expire and be held (page 1 provably pending), then join
+    time.sleep(0.3)
+    work((1, Path("/tmp/hocr/p1.png")), results)
+    t0.join(5)
+
+    assert len(results) == 2
+    assert all(not isinstance(r, BaseException) for _, r in results)
+    assert len(calls) == 1 and len(calls[0]) == 2  # ONE batch, both pages
+
+
+def test_hold_is_bounded_when_pending_page_never_arrives():
+    """A stuck/phantom pending page cannot hold the window forever: after
+    max_extensions holds the window flushes with what it has."""
+    calls = []
+
+    def sender(paths):
+        calls.append(list(paths))
+        return [f"S{Path(p).stem[1]}" for p in paths]
+
+    batcher = MultiPageBatcher(
+        batch_size=4, timeout=0.1, sender=sender,
+        pending_pages=lambda wd: {1}, max_wait=5.0,  # page 1 never submits
+        grace=0.1, max_extensions=2,
+    )
+    t_start = time.monotonic()
+    assert batcher.submit(0, Path("/tmp/hocr/p0.png")) == "S0"
+    elapsed = time.monotonic() - t_start
+    assert len(calls) == 1 and calls[0] == [Path("/tmp/hocr/p0.png")]
+    assert elapsed < 2.0  # bounded well below an unbounded hold
+
+
+def test_maybe_extend_only_fires_for_confirmably_pending_pages():
+    """Unit-level: holds happen only when the window is expired, has hold
+    budget left, AND the scan shows rasterized-but-unstaged pages outside."""
+    from ocrmypdf_unlimited.batching import _BatchWindow
+
+    batcher = MultiPageBatcher(
+        batch_size=4, timeout=1.0, sender=lambda ps: ["S"] * len(ps),
+        pending_pages=lambda wd: {0}, grace=0.5, max_extensions=2,
+    )
+    w = _BatchWindow(4, 1.0)
+    w.work_dir = Path("/tmp/hocr")
+    w.add(0, Path("/tmp/hocr/p0.png"))  # staged page 0
+
+    # 1) not expired -> no hold
+    w.deadline = time.monotonic() + 10
+    assert batcher._maybe_extend(w) is False
+
+    # 2) expired but NOTHING pending outside (only the staged page) -> flush
+    w.deadline = time.monotonic() - 1
+    assert batcher._maybe_extend(w) is False
+
+    # 3) expired + page 3 pending outside -> hold (deadline pushed forward)
+    batcher.pending_pages = lambda wd: {0, 3}
+    old_deadline = w.deadline
+    assert batcher._maybe_extend(w) is True
+    assert w.extensions == 1 and w.deadline > old_deadline
+
+    # 4) bounded: no more holds once max_extensions is reached
+    w.extensions = 2
+    assert batcher._maybe_extend(w) is False
 
 
 # --- batch-window logging ----------------------------------------------------
@@ -172,7 +279,7 @@ def test_batch_window_logs_pages_on_each_update(caplog):
         calls.append(list(paths))
         return ["S0", "S1"]
 
-    with caplog.at_level(logging.INFO, logger="backend.ocrmypad.batching"):
+    with caplog.at_level(logging.INFO, logger="ocrmypdf_unlimited.batching"):
         batcher = _batcher(sender, pending={0, 1})
         results, errors = _run_concurrent(batcher, jobs=[0, 1])
     assert errors == {}
@@ -195,8 +302,9 @@ def test_serial_windows_each_log_their_own_pages(caplog):
     def sender(paths):
         return [f"P{paths[0].name}"]
 
-    with caplog.at_level(logging.INFO, logger="backend.ocrmypad.batching"):
-        batcher = _batcher(sender, pending=set(), batch_size=4)
+    with caplog.at_level(logging.INFO, logger="ocrmypdf_unlimited.batching"):
+        batcher = _batcher(sender, pending=set(), batch_size=4, timeout=0.2,
+                           max_wait=5.0)
         assert batcher.submit(0, Path("/tmp/p0.png")) == "Pp0.png"
         assert batcher.submit(1, Path("/tmp/p1.png")) == "Pp1.png"
 

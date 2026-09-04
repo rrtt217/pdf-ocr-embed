@@ -13,7 +13,8 @@ from pathlib import Path
 from backend.ocrmypad import settings as ocrmypad_settings
 from backend.ocrmypad.engine_client import UnlimitedOcrClient
 
-PKG_DIR = Path(__file__).resolve().parents[1] / "backend" / "ocrmypad"
+# The real plugin package (backend/ocrmypad is only a compatibility alias).
+PKG_DIR = Path(__file__).resolve().parents[1] / "ocrmypdf_unlimited"
 
 
 def _reset_store() -> None:
@@ -97,23 +98,20 @@ def test_explicit_config_still_wins_over_store():
 
 
 def test_plugin_package_never_imports_backend_config():
-    """The decoupling contract: no file in the plugin package may IMPORT backend.config.
+    """The decoupling contract: no file in the standalone plugin may import ANY
+    ``backend.*`` module.
 
-    This is what lets the plugin be configured purely by injection: the host
-    pushes a snapshot and the plugin reads only its own store.  (Prose that
-    merely *mentions* ``backend.config`` — e.g. in a docstring explaining the
-    rule — is fine; only real import statements are checked.)
+    `ocrmypdf_unlimited/` is the real, self-contained plugin (`backend/ocrmypad/`
+    is just a compatibility alias).  The host pushes a snapshot into its store
+    and the plugin reads only its own state — in a fully separate package that
+    imports nothing from the app.
     """
     import re
-    import_re = re.compile(
-        r"^\s*(?:import backend\.config|from backend\.config\b"
-        r"|from backend import config\b)",
-        re.MULTILINE,
-    )
+    import_re = re.compile(r"^\s*(?:import backend|from backend\b)", re.MULTILINE)
     offenders = []
     for py in sorted(PKG_DIR.glob("*.py")):
         text = py.read_text(encoding="utf-8")
         if import_re.search(text):
             offenders.append(py.name)
     assert not offenders, (
-        f"ocrmypad must not import backend.config; found in: {offenders}")
+        f"ocrmypdf_unlimited must not import backend.*; found in: {offenders}")

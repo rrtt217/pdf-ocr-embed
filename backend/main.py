@@ -12,8 +12,8 @@ Endpoints:
   GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
 
-The OCR core is OCRmyPDF; the unlimited engine ships as the
-``backend.ocrmypad`` plugin.
+The OCR core is OCRmyPDF; the unlimited engine ships as the standalone
+``ocrmypdf_unlimited`` plugin (``backend/ocrmypad`` is a compat alias).
 """
 from __future__ import annotations
 
@@ -51,13 +51,31 @@ async def lifespan(_app: FastAPI):
     # Keep orphaned temp files from accumulating: periodically delete
     # unreferenced files older than cleanup_max_age_hours.
     cleanup_mod.start_background_cleanup()
-    # Push the effective config into the OCR engine plugin — the plugin never
-    # reads backend.config itself; the host initializes it here (and again
-    # whenever the settings change, see save_settings).
-    from backend.ocrmypad import settings as ocrmypad_settings
-    ocrmypad_settings.configure(config.resolve())
+    # Push the effective config into the standalone OCR engine plugin — the
+    # plugin never reads backend.config itself; the host initializes its
+    # settings store here (and again whenever the settings change, see
+    # save_settings).  The plugin is optional: the app runs without it, so
+    # wire it up only when it is actually importable.
+    _inject_plugin_settings()
     yield
     cleanup_mod.stop_background_cleanup()
+
+
+def _inject_plugin_settings() -> bool:
+    """Push the app's effective config into the plugin's settings store.
+
+    Guards against the standalone ``ocrmypdf_unlimited`` plugin being absent
+    ("vice versa" decoupling): without it the app keeps running on the
+    built-in engines.  Returns True when the injection happened.
+    """
+    try:
+        from ocrmypdf_unlimited import settings as ocrmypad_settings
+    except ImportError:
+        log.info("ocrmypdf-unlimited plugin not installed; unlimited engine "
+                 "unavailable (built-in tesseract still works)")
+        return False
+    ocrmypad_settings.configure(config.resolve())
+    return True
 
 
 app = FastAPI(title="PDF OCR Embed", version="1.0.0", lifespan=lifespan)
@@ -117,15 +135,19 @@ def index() -> str:
 
 @app.get("/api/health")
 def health() -> dict:
-    from backend.ocrmypad.unlimited_engine import UnlimitedOcrEngine
+    engines = {
+        "tesseract": "ocrmypdf built-in Tesseract",
+        "none": "no OCR",
+    }
+    try:
+        from ocrmypdf_unlimited.engine import UnlimitedOcrEngine
+        engines["unlimited"] = str(UnlimitedOcrEngine())
+    except ImportError:
+        engines["unlimited"] = "plugin not installed (ocrmypdf_unlimited)"
     return {
         "status": "ok",
-        "adapters": ["unlimited"],
-        "engines": {
-            "unlimited": str(UnlimitedOcrEngine()),
-            "tesseract": "ocrmypdf built-in Tesseract",
-            "none": "no OCR",
-        },
+        "adapters": ["unlimited", "tesseract"],
+        "engines": engines,
     }
 
 
@@ -195,10 +217,9 @@ def save_settings(payload: SettingsModel) -> dict:
         # Persist via config.save (handles masked-key preservation, and only
         # writes the fields actually present in the payload).
         result = config.save(data)
-        # Keep the engine plugin's injected config in sync with a WebUI save
-        # (same host-initializes-plugin contract as the startup push above).
-        from backend.ocrmypad import settings as ocrmypad_settings
-        ocrmypad_settings.configure(config.resolve())
+        # Keep the standalone engine plugin's injected config in sync with a
+        # WebUI save (same host-initializes-plugin contract as above).
+        _inject_plugin_settings()
         return result
     # Read-only display mode.
     return config.get_effective_settings()

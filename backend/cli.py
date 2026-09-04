@@ -125,17 +125,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     hocr_dir = work_dir / "hocr"
     hocr_dir.mkdir(parents=True, exist_ok=True)
 
-    # The engine plugin reads host-injected settings, not backend.config:
-    # push the effective config in before the pipeline runs.
-    from backend.config import resolve as resolve_config
-    from backend.ocrmypad import settings as ocrmypad_settings
-    ocrmypad_settings.configure(resolve_config())
+    # The plugin reads its own settings store, not backend.config: push the
+    # effective config in before the pipeline runs (a no-op when the
+    # standalone plugin is not installed).
+    try:
+        from ocrmypdf_unlimited import settings as ocrmypad_settings
+    except ImportError:
+        ocrmypad_settings = None
+    if ocrmypad_settings is not None:
+        from backend.config import resolve as resolve_config
+        ocrmypad_settings.configure(resolve_config())
+
+    plugins = [ocr_service.plugin_path()] if ocr_service.plugin_path() else []
+    if args.engine == "unlimited" and not ocr_service.plugin_available():
+        print("error: the 'unlimited' OCR engine is not available: the "
+              "standalone ocrmypdf-unlimited plugin is not installed "
+              "(choose --engine tesseract, or install the plugin).",
+              file=sys.stderr)
+        return 1
 
     try:
         # Phase 1: OCR -> per-page hOCR + block sidecars (plugin engine runs).
         ocrmypdf.api._pdf_to_hocr(
             input_path, hocr_dir,
-            plugins=[ocr_service.plugin_path()],
+            plugins=plugins,
             **ocr_service._ocrmypdf_options(**overrides),
             **({"pages": pages_arg} if pages_arg else {}),
         )

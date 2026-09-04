@@ -23,10 +23,14 @@
   （≥17.11，系统依赖 tesseract + ghostscript，无需 qpdf）。后端通过
   `ocrmypdf.api` 进程内调用其官方**编辑回写**通道：
   `_pdf_to_hocr`（OCR → 每页 hOCR）+ `_hocr_to_ocr_pdf`（编辑后合成最终 PDF）。
-- **unlimited-ocr 以 OCRmyPDF 插件实现**（`backend/ocrmypad/`）：一个
-  `OcrEngine` 插件，逐页调 OpenAI 兼容视觉 API（USTC `unlimited-ocr` 模型），
+- **unlimited-ocr 以独立 OCRmyPDF 插件实现**（[`ocrmypdf_unlimited/`](ocrmypdf_unlimited/README.md)，
+  一个可单独 `pip install` 的 OCROmyPDF 插件包，严格遵循
+  [官方插件文档](https://ocrmypdf.readthedocs.io/en/latest/plugins.html)）：
+  一个 `OcrEngine` 插件，逐页调 OpenAI 兼容视觉 API（USTC `unlimited-ocr` 模型），
   解析 `<|det|>type [bbox]<|/det|>content` 标记（1000×1000 归一化画布逐维缩放回
   **原始像素坐标**），写成 hOCR + 块 sidecar JSON（WebUI 的可编辑表示）。
+  插件自带 `--unlimited-*` 命令行/API 参数与 `ocr_engine='unlimited'` 引擎选择，
+  可脱离本应用独立运行；本应用缺装插件时仍可用内置 Tesseract。
   `ocr_engine = "tesseract"` 时回退 ocrmypdf 内置 Tesseract；`"none"` 关闭 OCR。
 - **OCR 设置完全外部化**：本地 TOML 配置 `backend/ocr_config.toml` + WebUI 设置页
   （WebUI 保存时写入同一个 TOML 文件）。`OCR_*` **环境变量可选地覆盖**全部设置

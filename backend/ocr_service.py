@@ -1,10 +1,11 @@
 """OCR orchestration on OCRmyPDF: upload -> hOCR -> editable pages -> finalize.
 
 The OCR core is OCRmyPDF (https://github.com/ocrmypdf/OCRmyPDF); the
-``unlimited`` engine ships as the ``backend.ocrmypad`` plugin.  Job flow:
+``unlimited`` engine ships as the standalone ``ocrmypdf_unlimited`` plugin
+(see ``ocrmypdf_unlimited/``).  Job flow:
 
 1. ``create_job`` stores the upload and opens a job.
-2. ``run_ocr`` calls ``ocrmypdf._pdf_to_hocr`` in a worker thread: OCRmyPDF
+2. ``run_ocr`` calls ``ocrmypdf._pdf_to_hocr``: OCRmyPDF
    rasterizes the PDF, runs the plugin engine per page (with ``jobs``-way
    concurrency), and leaves per-page hOCR + block sidecars under
    ``work/<job_id>/hocr/``.
@@ -19,6 +20,7 @@ startup, so a restart keeps every job's hOCR work folder usable.
 """
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import shutil
@@ -47,13 +49,62 @@ _jobs_lock = threading.Lock()
 _STREAMS: Dict[str, Deque[dict]] = {}
 _streams_lock = threading.Lock()
 
-# The OCRmyPDF plugin package (the unlimited engine).
-PLUGIN_PATH = Path(__file__).resolve().parent / "ocrmypad" / "__init__.py"
+# The OCRmyPDF plugin package (the unlimited engine).  Loaded by its dotted
+# module name, packaged-plugin style — the plugin is the standalone
+# `ocrmypdf_unlimited` package at the repo root, and it is OPTIONAL: the app
+# must keep working without it (the built-in Tesseract engine still runs).
+PLUGIN_MODULE = "ocrmypdf_unlimited"
 
 
-def plugin_path() -> str:
-    """The ocrmypad plugin path passed to ocrmypdf ``plugins=``."""
-    return str(PLUGIN_PATH)
+def plugin_module() -> Optional[str]:
+    """The unlimited plugin's dotted module name, or None when not installed.
+
+    ``None`` means the standalone plugin package is not importable: jobs that
+    request the ``unlimited`` engine fail with a friendly message (see
+    ``run_ocr``) while every other engine keeps working.
+    """
+    try:
+        __import__(PLUGIN_MODULE)
+    except ImportError:
+        return None
+    return PLUGIN_MODULE
+
+
+def plugin_available() -> bool:
+    """True when the unlimited engine can run (its plugin is importable)."""
+    return plugin_module() is not None
+
+
+def plugin_auto_loaded() -> bool:
+    """True when ocrmypdf auto-loads the plugin via its ``ocrmypdf`` entry
+    point (the plugin is pip-installed into the same venv).
+
+    In that case the plugin must NOT also be passed in ``plugins=``: pluggy
+    rejects registering the same module twice, so the app only requests it
+    explicitly when it is NOT auto-loaded.
+    """
+    try:
+        entries = importlib.metadata.entry_points()
+    except Exception:  # noqa: BLE001  (metadata query must never break OCR)
+        return False
+    try:
+        group = entries.select(group="ocrmypdf")  # Python >= 3.10
+    except AttributeError:  # pragma: no cover - Python < 3.10
+        group = entries.get("ocrmypdf", ())
+    return any(getattr(ep, "name", None) == "unlimited" for ep in group)
+
+
+def plugin_path() -> Optional[str]:
+    """The plugin value passed to ocrmypdf ``plugins=``, or None.
+
+    None when the plugin is absent, or when ocrmypdf already auto-loads it
+    through its entry point (passing it again would make pluggy reject the
+    duplicate).  A None here does NOT mean the unlimited engine is
+    unavailable — use :func:`plugin_available` for that.
+    """
+    if plugin_module() is None or plugin_auto_loaded():
+        return None
+    return PLUGIN_MODULE
 
 
 def select_pages(num_pages: int, statuses, page_range=None, force: bool = False) -> list:
@@ -209,8 +260,33 @@ def restore_jobs() -> int:
         except (OSError, ValueError):
             log.warning("restore_jobs: skipping corrupt %s", state)
             continue
+        # Normalize ANY restored job into the full job shape.  A legacy or
+        # partial job.json (older format, a crashed write, a hand-made test
+        # job) must never 500 the WebUI job list — missing keys get defaults
+        # and the job stays visible/clearable.
+        if not isinstance(job, dict):
+            log.warning("restore_jobs: skipping non-dict %s", state)
+            continue
+        template = _new_job(str(job.get("filename") or "document.pdf"))
+        template.update(job)
+        job = template
         job_id = job.get("job_id") or jdir.name
         job["job_id"] = job_id
+        # A job without a persistence timestamp sorts last; keep it visible.
+        job.setdefault("created", 0)
+        # A forced shutdown mid-run persisted `pages_done` at run start (0),
+        # losing what actually finished.  Recount from the pages whose results
+        # are really on disk so the recovered job shows true progress (which
+        # also restores the WebUI's "retry remaining" / "edit" buttons).
+        hocr_dir = Path(job.get("hocr_dir") or "")
+        total = int(job.get("num_pages") or 0)
+        if hocr_dir.exists():
+            done = len(page_store.page_numbers(hocr_dir))
+            job["pages_done"] = done
+            if total > 0 and done >= total:
+                # Every page has a result: the OCR phase is effectively done.
+                job["status"] = "done"
+                job["error"] = ""
         # A job interrupted mid-run shows as stopped, not running.
         if job.get("status") in ("running", "queued", "stopping"):
             job["status"] = "stopped"
@@ -251,16 +327,16 @@ def list_jobs() -> List[dict]:
                   reverse=True)
     return [{
         # current names
-        "job_id": j["job_id"],
-        "filename": j["filename"],
-        "status": j["status"],
+        "job_id": j.get("job_id") or "",
+        "filename": j.get("filename") or "document.pdf",
+        "status": j.get("status") or "error",
         "num_pages": j.get("num_pages", 0),
         "pages_done": j.get("pages_done", 0),
         "has_embedded": bool(j.get("embedded_path")),
         "created_at": j.get("created_at", ""),
         "error": j.get("error", ""),
         # pre-rebuild aliases the WebUI depends on
-        "id": j["job_id"],
+        "id": j.get("job_id") or "",
         "current": j.get("pages_done", 0),
         "total": j.get("num_pages", 0),
         "created": j.get("created") or 0,
@@ -352,13 +428,29 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
                          "message": "OCR started (OCRmyPDF)"})
     _persist_if_live(job_id)
 
+    engine = str(overrides.get("ocr_engine")
+                 or resolve().get("ocr_engine") or "unlimited")
+    plugins = [plugin_path()] if plugin_path() else []
+
+    # The unlimited engine IS the standalone plugin: without it the run cannot
+    # start.  Fail fast with a friendly message instead of an import traceback.
+    if engine == "unlimited" and not plugin_available():
+        message = (
+            "The 'unlimited' OCR engine is not available: the standalone "
+            "ocrmypdf-unlimited plugin is not installed. Install it (it lives "
+            "in ocrmypdf_unlimited/), or choose another engine (tesseract / none)."
+        )
+        _set(job_id, status="error", error=message)
+        _push_event(job_id, {"type": "error", "message": message})
+        _persist_if_live(job_id)
+        return
+
     try:
         ocrmypdf.api._pdf_to_hocr(
             Path(job["pdf_path"]),
             Path(job["hocr_dir"]),
-            plugins=[plugin_path()],
-            ocr_engine=overrides.get("ocr_engine")
-            or resolve().get("ocr_engine") or "unlimited",
+            plugins=plugins,
+            ocr_engine=engine,
             **options,
         )
     except UnavailableError as exc:
@@ -482,7 +574,9 @@ def get_page_dicts(job_id: str) -> List[Optional[dict]]:
     pages: List[Optional[dict]] = []
     job = get_job(job_id)
     total = int((job or {}).get("num_pages") or 0)
-    hdir = Path(job["hocr_dir"]) if job else None
+    # An empty/absent hocr_dir must mean "no results", never Path("") == "."
+    # (which would scan the whole repo for stray hOCR files).
+    hdir = Path(job["hocr_dir"]) if (job or {}).get("hocr_dir") else None
     done = sorted(page_store.page_numbers(hdir)) if hdir else []
     for page_no in range(1, max(total, max(done, default=0)) + 1):
         if hdir is None or page_no not in done:

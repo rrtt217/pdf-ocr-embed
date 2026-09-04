@@ -81,7 +81,8 @@ def test_update_page_persists_and_restore_roundtrip(monkeypatch, tmp_path):
 
     revived = ocr_service.get_job(job["job_id"])
     assert revived is not None
-    assert revived['status'] == 'stopped'
+    # Both pages have results on disk, so the restored job is `done`.
+    assert revived['status'] == 'done'
     assert [p is not None for p in ocr_service.get_page_dicts(job["job_id"])] \
         == [True, True]
     pages = ocr_service.get_pages(job["job_id"])
@@ -101,6 +102,45 @@ def test_restore_normalizes_crashed_status(monkeypatch, tmp_path):
     assert ocr_service.get_job(job["job_id"])["status"] == "stopped"
 
 
+def test_restore_recounts_pages_done_from_disk(monkeypatch, tmp_path):
+    """A forced shutdown persisted pages_done=0 at run start; restore must
+    recount the pages whose results are really on disk so the recovered job
+    shows true progress (and the WebUI's retry-remaining / edit buttons)."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], status='running', num_pages=3,
+                     pages_done=0)
+    ocr_service._persist_if_live(job["job_id"])
+    _write_sidecar(job, 1, "page one")
+    _write_sidecar(job, 2, "page two")
+    _simulate_restart()
+    ocr_service.restore_jobs()
+
+    revived = ocr_service.get_job(job["job_id"])
+    assert revived["status"] == "stopped"
+    assert revived["pages_done"] == 2
+    # The WebUI reads `current` = pages_done from /api/jobs.
+    entry = {j["job_id"]: j for j in ocr_service.list_jobs()}[job["job_id"]]
+    assert entry["current"] == 2 and entry["total"] == 3
+
+
+def test_restore_marks_complete_job_done(monkeypatch, tmp_path):
+    """When every page has a result on disk, a crashed job restores as `done`
+    (the OCR phase is effectively finished) instead of `stopped`."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], status='running', num_pages=2,
+                     pages_done=0)
+    ocr_service._persist_if_live(job["job_id"])
+    _write_sidecar(job, 1, "page one")
+    _write_sidecar(job, 2, "page two")
+    _simulate_restart()
+    ocr_service.restore_jobs()
+    revived = ocr_service.get_job(job["job_id"])
+    assert revived["status"] == "done"
+    assert revived["pages_done"] == 2
+
+
 def test_restore_skips_corrupt_state(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
     ok = ocr_service.create_job('ok.pdf', _real_pdf())
@@ -113,6 +153,32 @@ def test_restore_skips_corrupt_state(monkeypatch, tmp_path):
     assert ocr_service.restore_jobs() == 1
     assert ocr_service.get_job(ok['job_id']) is not None
     assert ocr_service.get_job('bad000000000') is None
+
+
+def test_restore_normalizes_partial_job_json(monkeypatch, tmp_path):
+    """A partial/legacy job.json (missing most keys) must restore into the full
+    job shape: it stays visible in /api/jobs instead of 500ing the list."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    legacy = tmp_path / 'work' / 'legacy12345678'
+    legacy.mkdir(parents=True)
+    (legacy / 'job.json').write_text(
+        json.dumps({"job_id": "legacy12345678", "status": "running",
+                    "num_pages": 4}), encoding='utf-8')
+
+    _simulate_restart()
+    ocr_service.restore_jobs()
+
+    job = ocr_service.get_job('legacy12345678')
+    assert job is not None
+    # normalized defaults keep every consumer (list_jobs, pages, retry) safe
+    assert job["filename"] == "document.pdf"
+    assert job["status"] == "stopped"  # running -> interrupted
+    assert job.get("pages_done", 0) is not None
+
+    entry = {j["job_id"]: j for j in ocr_service.list_jobs()}['legacy12345678']
+    assert entry["filename"] == "document.pdf" and entry["status"] == "stopped"
+    # a phantom job without a real upload cannot be run
+    assert ocr_service.retry_job('legacy12345678') is False
 
 
 def test_clear_job_removes_state_file(monkeypatch, tmp_path):
