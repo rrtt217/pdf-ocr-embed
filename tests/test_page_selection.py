@@ -157,6 +157,125 @@ def test_upload_route_threads_lang_to_run_ocr(monkeypatch, tmp_path):
             ocr_service._JOBS.clear()
 
 
+def test_upload_route_threads_page_range_to_run_ocr(monkeypatch, tmp_path):
+    """The WebUI's per-file start flow sends ``page_start``/``page_end`` on
+    upload; they must reach run_ocr's overrides (as ``pages``) so a first run
+    can be restricted to a page range."""
+    import fitz
+
+    _stub_lifespan(monkeypatch)
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+
+    captured = {}
+
+    def fake_run_ocr(job_id, overrides=None):
+        captured.update(job_id=job_id, overrides=overrides)
+
+    monkeypatch.setattr(ocr_service, "run_ocr", fake_run_ocr)
+
+    doc = fitz.open()
+    for _ in range(4):
+        doc.new_page(width=200, height=200)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    try:
+        with TestClient(app) as client:
+            r = client.post("/api/ocr/upload",
+                            data={"page_start": "2", "page_end": "3"},
+                            files={"files": ("doc.pdf", pdf_bytes,
+                                             "application/pdf")})
+            assert r.status_code == 200, r.text
+            assert captured["overrides"] and \
+                captured["overrides"].get("pages") == "2-3"
+    finally:
+        with ocr_service._jobs_lock:
+            ocr_service._JOBS.clear()
+
+
+def test_upload_route_open_end_range_resolves_to_page_count(monkeypatch,
+                                                           tmp_path):
+    """Only ``page_start`` given -> the range's end is filled from the
+    document's page count (open-ended, like the retry flow's semantics)."""
+    import fitz
+
+    _stub_lifespan(monkeypatch)
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+
+    captured = {}
+
+    def fake_run_ocr(job_id, overrides=None):
+        captured.update(job_id=job_id, overrides=overrides)
+
+    monkeypatch.setattr(ocr_service, "run_ocr", fake_run_ocr)
+
+    doc = fitz.open()
+    for _ in range(4):
+        doc.new_page(width=200, height=200)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    try:
+        with TestClient(app) as client:
+            r = client.post("/api/ocr/upload",
+                            data={"page_start": "3"},
+                            files={"files": ("doc.pdf", pdf_bytes,
+                                             "application/pdf")})
+            assert r.status_code == 200, r.text
+            assert captured["overrides"] and \
+                captured["overrides"].get("pages") == "3-4"
+    finally:
+        with ocr_service._jobs_lock:
+            ocr_service._JOBS.clear()
+
+
+def test_upload_route_rejects_invalid_page_range(monkeypatch, tmp_path):
+    """Bad ranges are client errors (400) and never leave a job behind."""
+    import fitz
+
+    _stub_lifespan(monkeypatch)
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+
+    calls = []
+    monkeypatch.setattr(ocr_service, "run_ocr",
+                        lambda job_id, overrides=None: calls.append(job_id))
+
+    doc = fitz.open()
+    for _ in range(4):
+        doc.new_page(width=200, height=200)
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    try:
+        with TestClient(app) as client:
+            # start > end: rejected before any job is created.
+            r = client.post("/api/ocr/upload",
+                            data={"page_start": "3", "page_end": "2"},
+                            files={"files": ("doc.pdf", pdf_bytes,
+                                             "application/pdf")})
+            assert r.status_code == 400
+            assert "range" in r.json()["detail"].lower()
+            assert not calls
+            assert not ocr_service._JOBS
+
+            # start beyond the document's page count: rejected (and the
+            # half-created job is cleaned up).
+            r = client.post("/api/ocr/upload",
+                            data={"page_start": "9"},
+                            files={"files": ("doc.pdf", pdf_bytes,
+                                             "application/pdf")})
+            assert r.status_code == 400
+            assert "exceeds" in r.json()["detail"]
+            assert not calls
+            assert not ocr_service._JOBS
+    finally:
+        with ocr_service._jobs_lock:
+            ocr_service._JOBS.clear()
+
+
 def _stub_lifespan(monkeypatch):
     monkeypatch.setattr(ocr_service, "restore_jobs", lambda: 0)
     monkeypatch.setattr(cleanup_mod, "start_background_cleanup", lambda: None)

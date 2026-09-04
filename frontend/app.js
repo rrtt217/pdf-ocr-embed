@@ -56,6 +56,7 @@ const state = {
   jobs: [],     // job summaries: {id, filename, status, current, total, error, has_embedded, created, busy}
   sel: null,    // editor session for the selected job: {jobId, pages, pageIndex, embedded}
   zipSel: new Set(),  // job ids ticked for the "Download ZIP" batch action
+  pendingFiles: [],   // staged uploads: {file, engine, lang, concurrency, pageStart, pageEnd}
   zoom: 100,
   es: {},       // jobId -> EventSource
   logTimer: null,
@@ -187,19 +188,23 @@ function currentEngineCfg() {
   return cfg;
 }
 
-async function uploadOne(file, cfg, concurrency) {
+async function uploadOne(file, cfg) {
   const fd = new FormData();
   fd.append("files", file);            // multi-file field (a single file works too)
   fd.append("ocr_engine", cfg.ocr_engine);
   if (cfg.lang) fd.append("lang", cfg.lang);
-  fd.append("concurrency", String(concurrency));
+  fd.append("concurrency", String(Math.max(1, Math.min(32,
+    parseInt(cfg.concurrency || "1", 10) || 1))));
+  if (cfg.page_start) fd.append("page_start", String(cfg.page_start));
+  if (cfg.page_end) fd.append("page_end", String(cfg.page_end));
   return api("/api/ocr/upload", { method: "POST", body: fd });
 }
 
-/* Batch upload: drop/select one or more PDFs. Each file becomes its own job
-   on the server (own card + SSE); we fire every upload concurrently — no N
-   sequential awaits blocking the UI — then refresh the authoritative job list
-   from the server and let it re-connect the per-job streams. */
+/* Drop/select: PDFs are NOT started right away.  Design change — the task must
+   wait until the user picks parameters for each file (engine / language /
+   concurrency / page range) and clicks "Start OCR"; only then are the jobs
+   created on the server.  Files are staged in state.pendingFiles and shown in
+   the inline #pending-panel inside the upload card. */
 async function handleFiles(fileList) {
   const msg = $("#upload-msg");
   if (msg) msg.textContent = "";
@@ -212,33 +217,235 @@ async function handleFiles(fileList) {
     }
     return;
   }
-  const cfg = currentEngineCfg();
-  const concurrency = Math.max(1, Math.min(32,
-    parseInt($("#concurrency").value || "1", 10)));
+  // Defaults for the new file(s) come from the shared upload/retry options
+  // (which remember the last choices through prefs).
+  const d = pendingDefaults();
+  state.pendingFiles = (state.pendingFiles || []).concat(
+    files.map((f) => ({
+      file: f,
+      engine: d.engine,
+      lang: d.lang,
+      concurrency: d.concurrency,
+      pageStart: "",
+      pageEnd: "",
+    })));
+  renderPendingPanel();
+  toast(t("upload.pending", { n: state.pendingFiles.length }), "info");
+}
 
+function pendingDefaults() {
+  return {
+    engine: $("#adapter") ? $("#adapter").value : "unlimited",
+    lang: $("#tess-lang") ? ($("#tess-lang").value || "").trim() : "",
+    concurrency: String(Math.max(1, Math.min(32,
+      parseInt($("#concurrency") ? $("#concurrency").value : "1", 10) || 1))),
+  };
+}
+
+function renderPendingPanel() {
+  const panel = $("#pending-panel");
+  const box = $("#pending-files");
+  const list = state.pendingFiles || [];
+  panel.classList.toggle("hidden", list.length === 0);
+  const title = $("#pending-title");
+  if (title) title.textContent = t("upload.pending", { n: list.length });
+  if (box) box.innerHTML = "";
+  list.forEach((p, i) => box.appendChild(buildPendingRow(p, i)));
+  validatePendingPanel();
+}
+
+/* One per-file parameter row.  Every control writes back into its staged
+   entry (state.pendingFiles[i]) so a locale-triggered re-render or the
+   discard path never loses what the user typed. */
+function buildPendingRow(p, i) {
+  const row = el("div", "pending-file");
+  row.dataset.i = String(i);
+  const head = el("div", "pending-file-head");
+  head.appendChild(el("span", "job-filename", p.file.name));
+  head.appendChild(el("span", "hint", fmtBytes(p.file.size)));
+  row.appendChild(head);
+
+  const opts = el("div", "pending-file-opts");
+
+  const eng = el("label", "inline-label");
+  eng.appendChild(el("span", null, t("upload.engine")));
+  const engSel = el("select", "sf-engine");
+  [["unlimited", t("upload.engine.unlimited")],
+   ["tesseract", t("upload.engine.tesseract")],
+   ["none", t("upload.engine.none")]].forEach(([v, label]) => {
+    const o = el("option", null, label);
+    o.value = v;
+    engSel.appendChild(o);
+  });
+  engSel.value = p.engine;
+  engSel.onchange = () => {
+    p.engine = engSel.value;
+    const langRow = row.querySelector(".sf-lang-row");
+    if (langRow) langRow.classList.toggle("hidden", p.engine !== "tesseract");
+  };
+  eng.appendChild(engSel);
+  opts.appendChild(eng);
+
+  const lang = el("label",
+    "inline-label sf-lang-row" + (p.engine === "tesseract" ? "" : " hidden"));
+  lang.appendChild(el("span", null, t("upload.lang")));
+  const langIn = el("input", "sf-lang");
+  langIn.type = "text";
+  langIn.placeholder = "eng";
+  langIn.value = p.lang;
+  langIn.oninput = () => { p.lang = langIn.value.trim(); };
+  lang.appendChild(langIn);
+  opts.appendChild(lang);
+
+  const conc = el("label", "inline-label");
+  conc.appendChild(el("span", null, t("upload.concurrency")));
+  const concIn = el("input", "sf-conc");
+  concIn.type = "number";
+  concIn.min = "1";
+  concIn.max = "32";
+  concIn.value = p.concurrency;
+  concIn.oninput = () => { p.concurrency = concIn.value.trim(); };
+  conc.appendChild(concIn);
+  opts.appendChild(conc);
+
+  const ps = el("label", "inline-label");
+  ps.appendChild(el("span", null, t("upload.pageStart")));
+  const psIn = el("input", "sf-start");
+  psIn.type = "number";
+  psIn.min = "1";
+  psIn.placeholder = "1";
+  psIn.value = p.pageStart;
+  psIn.oninput = () => { p.pageStart = psIn.value.trim(); validatePendingPanel(); };
+  ps.appendChild(psIn);
+  opts.appendChild(ps);
+
+  const pe = el("label", "inline-label");
+  pe.appendChild(el("span", null, t("upload.pageEnd")));
+  const peIn = el("input", "sf-end");
+  peIn.type = "number";
+  peIn.min = "1";
+  peIn.placeholder = "all";
+  peIn.value = p.pageEnd;
+  peIn.oninput = () => { p.pageEnd = peIn.value.trim(); validatePendingPanel(); };
+  pe.appendChild(peIn);
+  opts.appendChild(pe);
+
+  row.appendChild(opts);
+  return row;
+}
+
+/* Parse a staged entry's page range (1-based inclusive).  Both bounds empty
+   -> {set:false}.  Open bounds stay null (the server fills them from the
+   document's page count).  Invalid (start<1 / end<1 / start>end) -> invalid. */
+function pendingRange(p) {
+  const sRaw = (p.pageStart || "").trim();
+  const eRaw = (p.pageEnd || "").trim();
+  const bothEmpty = sRaw === "" && eRaw === "";
+  const s = sRaw === "" ? 1 : parseInt(sRaw, 10);
+  const e = eRaw === "" ? null : parseInt(eRaw, 10);
+  if (bothEmpty) return { set: false, invalid: false, start: null, end: null };
+  const invalid = !Number.isFinite(s) || s < 1 ||
+    (e !== null && (!Number.isFinite(e) || e < 1)) || (e !== null && s > e);
+  return { set: true, invalid, start: s, end: e };
+}
+
+function validatePendingPanel() {
+  const btn = $("#btn-start-jobs");
+  const msgEl = $("#pending-msg");
+  const list = state.pendingFiles || [];
+  if (!list.length) {
+    if (btn) btn.disabled = true;
+    if (msgEl) msgEl.textContent = "";
+    return;
+  }
+  const invalid = list.some((p) => pendingRange(p).invalid);
+  if (btn) btn.disabled = invalid;
+  if (msgEl) msgEl.textContent = invalid ? t("upload.pageRangeInvalid") : "";
+}
+
+/* "Start OCR": upload every staged file with ITS OWN parameters, one request
+   per file (so per-file page ranges reach the backend).  Only afterwards is
+   the job list reloaded; the started files leave the panel while failures
+   stay staged so the user can fix (or discard) them. */
+async function startPendingJobs() {
+  const list = state.pendingFiles || [];
+  if (!list.length) return;
+  const btn = $("#btn-start-jobs");
+  if (btn) btn.disabled = true;
+  const msgEl = $("#pending-msg");
+  if (msgEl) msgEl.textContent = t("upload.starting");
   setStatus("uploading", "running");
-  const settled = await Promise.allSettled(
-    files.map((f) => uploadOne(f, cfg, concurrency)));
 
-  // The server is the single source of truth for what jobs exist — reload it
-  // (this also connects EventSources for every running job and re-renders).
-  await loadJobs();
+  const settled = [];
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    const range = pendingRange(p);
+    if (range.invalid) continue;  // validation above disabled Start anyway
+    const cfg = { ocr_engine: p.engine, concurrency: p.concurrency || "1" };
+    if (p.engine === "tesseract" && p.lang) cfg.lang = p.lang;
+    if (range.set) {
+      cfg.page_start = range.start;
+      if (range.end !== null) cfg.page_end = range.end;
+    }
+    try {
+      const res = await uploadOne(p.file, cfg);
+      settled.push({ ok: true, i, jobId: res.job_id, cfg });
+    } catch (e) {
+      settled.push({ ok: false, i, name: p.file.name, msg: e.message || String(e) });
+    }
+  }
+  const ok = settled.filter((r) => r.ok);
+  const failed = settled.filter((r) => !r.ok);
 
-  const ok = settled.filter((r) => r.status === "fulfilled");
-  const failed = settled.filter((r) => r.status === "rejected");
+  await loadJobs();  // authoritative job list + SSE (unique per started job)
+
+  // Drop started files; failures stay staged for a retry (or discard).
+  const failedIdx = new Set(failed.map((r) => r.i));
+  state.pendingFiles = list.filter((_, i) => failedIdx.has(i));
+  if (ok.length && ok[0].cfg) syncSharedFromConfig(ok[0].cfg);
+  renderPendingPanel();
+
   if (ok.length === 1) {
-    selectJob(ok[0].value.job_id);
+    selectJob(ok[0].jobId);
     toast(t("upload.started"), "success");
   } else if (ok.length > 1) {
     toast(t("upload.multiStarted", { n: ok.length }), "success");
   }
   if (failed.length) {
-    const errMsg = (failed[0].reason && failed[0].reason.message) || "";
-    if (msg) msg.textContent = t("upload.failedSome", { n: failed.length, msg: errMsg });
+    const errMsg = failed[0].msg || "";
     toast(t("upload.failedSome", { n: failed.length, msg: errMsg }), "error");
+    if (msgEl) msgEl.textContent = t("upload.failedSome", { n: failed.length, msg: errMsg });
   }
-  setStatus(anyRunning() ? "running" : "idle",
-            anyRunning() ? "running" : "");
+  setStatus(anyRunning() ? "running" : "idle", anyRunning() ? "running" : "");
+}
+
+/* Remember the choices actually used, so the shared upload/retry options
+   become the defaults for the next dropped file. */
+function syncSharedFromConfig(cfg) {
+  const engine = cfg.ocr_engine || "unlimited";
+  const adapterEl = $("#adapter");
+  if (adapterEl) {
+    adapterEl.value = engine;
+    setPref(PREFS.adapter, engine);
+    updateAdapterUI();
+  }
+  if (engine === "tesseract" && cfg.lang) {
+    const langEl = $("#tess-lang");
+    if (langEl) {
+      langEl.value = cfg.lang;
+      setPref(PREFS.tessLang, cfg.lang);
+    }
+  }
+  const concEl = $("#concurrency");
+  if (concEl && cfg.concurrency) {
+    concEl.value = cfg.concurrency;
+    setPref(PREFS.concurrency, cfg.concurrency);
+  }
+}
+
+function discardPending() {
+  state.pendingFiles = [];
+  renderPendingPanel();
 }
 
 /* ---------- ZIP download of selected embedded jobs ---------- */
@@ -1708,6 +1915,7 @@ function onLocaleChanged() {
   updateZipButton();   // the job ZIP button label is locale-dependent (count)
   setGlobalStatus();
   renderJobs();
+  renderPendingPanel();   // per-file rows are built from i18n labels
   if (state.sel) {
     const job = jobById(state.sel.jobId);
     $("#editing-job").textContent = job ? t("workspace.editing", { name: job.filename }) : "";
@@ -1781,6 +1989,8 @@ async function init() {
   drop.addEventListener("drop", (e) => handleFiles(e.dataTransfer.files));
   $("#file-input").addEventListener("change", (e) => handleFiles(e.target.files));
   $("#btn-zip").onclick = downloadZip;
+  $("#btn-start-jobs").onclick = startPendingJobs;
+  $("#btn-discard-files").onclick = discardPending;
 
   $("#btn-prev").onclick = prevPage;
   $("#btn-next").onclick = nextPage;
@@ -1883,6 +2093,7 @@ async function init() {
   updateAdapterUI();
   updatePageRangeHint();
   updateZipButton();
+  renderPendingPanel();
 
   try { await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }

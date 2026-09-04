@@ -116,7 +116,7 @@ class OcrEngine(ABC):
 | --- | --- |
 | `GET /api/health` | 状态 + 引擎映射（unlimited/tesseract/none） |
 | `GET/POST /api/settings` | provider 配置（key 打码）+ 流水线旋钮 |
-| `POST /api/ocr/upload` | `files`（多文件）或 `file`；`ocr_engine`、`concurrency`（→ ocrmypdf jobs） |
+| `POST /api/ocr/upload` | `files`（多文件）或 `file`；`ocr_engine`、`concurrency`（→ ocrmypdf jobs）、`page_start/page_end`（首次运行页码范围） |
 | `GET /api/ocr/stream/{job_id}` | SSE：status + 每页 `progress` 事件 |
 | `POST /api/ocr/retry/{job_id}` | `page_start/page_end/force` 页范围重跑 |
 | `POST /api/ocr/stop/{job_id}` | 请求停止（引擎逐页检查取消标志） |

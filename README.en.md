@@ -209,11 +209,15 @@ uvicorn backend.main:app --port 8000
 ### Batch upload & ZIP download
 
 The upload zone accepts **multiple PDFs** in one drag or file-picker (single-file
-uploads still work exactly as before). Every file becomes an **independent job** —
-its own card, SSE progress stream and persisted state, running in parallel; there
-is no separate queue manager. All uploads fire concurrently, then the job list is
-refreshed from the server (`/api/jobs` — the single source of truth) and each
-running job subscribes to its own EventSource.
+uploads still work the same way). Dropping a PDF does **not** start OCR
+immediately: the files appear in an inline **per-file parameter panel** below the
+drop zone, where you pick each file's own engine / language / concurrency / page
+range, then click **Start OCR** to launch the jobs. A page range limits a first
+run to part of the document (an open bound extends to the document's length).
+Every file becomes an **independent job** — its own card, SSE progress stream and
+persisted state, running in parallel; there is no separate queue manager. Only
+after starting is the job list refreshed from the server (`/api/jobs` — the
+single source of truth), and each running job subscribes to its own EventSource.
 
 Once a job has been embedded (**Embed invisible text**), its card gains a
 **checkbox**: tick any number of finished jobs and click **⬇ Download ZIP** at the

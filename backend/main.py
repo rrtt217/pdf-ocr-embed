@@ -214,6 +214,8 @@ async def upload_pdf(
     api_key: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
     lang: Optional[str] = Form(None),
+    page_start: Optional[int] = Form(None),
+    page_end: Optional[int] = Form(None),
 ) -> dict:
     """Upload one or more PDFs; each file becomes its own OCR job.
 
@@ -227,6 +229,13 @@ async def upload_pdf(
     ``lang`` (optional) is the OCR language for engines that use one (e.g.
     Tesseract: ``chi_sim+eng``); it overrides the persisted
     ``ocrmypdf_language`` for this run.
+
+    ``page_start`` / ``page_end`` (optional, 1-based inclusive) restrict the
+    first run to a page range of the document — the WebUI's per-file start
+    panel lets the user choose a range before launching the job.  When only
+    one bound is given the range is bounded by the document's page count; an
+    explicit ``end`` beyond the document length is harmless (OCRmyPDF only
+    visits existing pages).
     """
     uploads: List[UploadFile] = []
     seen: set = set()
@@ -237,6 +246,15 @@ async def upload_pdf(
         uploads.append(uf)
     if not uploads:
         raise HTTPException(status_code=400, detail="No file uploaded")
+
+    # Page-range sanity for the per-file start flow (bounds are 1-based).
+    if (page_start is not None and page_start < 1) or \
+       (page_end is not None and page_end < 1):
+        raise HTTPException(status_code=400, detail="Invalid page range")
+    if page_start is not None and page_end is not None and page_start > page_end:
+        raise HTTPException(
+            status_code=400, detail="Invalid page range: start > end")
+    has_page_range = page_start is not None or page_end is not None
 
     extra = {}
     for k, v in (("ocr_engine", ocr_engine), ("base_url", base_url),
@@ -258,10 +276,27 @@ async def upload_pdf(
         except ValueError as exc:
             # Unreadable / non-PDF bytes: a client error, not a 500.
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        job_options = dict(extra)
+        if has_page_range:
+            total = int(job.get("num_pages") or 0)
+            start = page_start if page_start is not None else 1
+            end = page_end if page_end is not None else total
+            if start > end:
+                # The open bound resolved past the document's length (or an
+                # explicit start beyond an explicit end) — this document
+                # cannot satisfy the request.  Drop the half-created job.
+                ocr_service.clear_job(job["job_id"])
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Page range {start}..{end} exceeds the "
+                           f"document's {total} page(s)")
+            job_options["pages"] = f"{start}-{end}"
         loop.run_in_executor(
-            None, ocr_service.run_ocr, job["job_id"], extra or None)
-        log.info("upload job %s: %s (engine=%s)", job["job_id"],
-                 job["filename"], extra.get("ocr_engine") or "unlimited")
+            None, ocr_service.run_ocr, job["job_id"], job_options or None)
+        log.info("upload job %s: %s (engine=%s%s)", job["job_id"],
+                 job["filename"], extra.get("ocr_engine") or "unlimited",
+                 f", pages={job_options['pages']}"
+                 if "pages" in job_options else "")
         jobs.append({
             "job_id": job["job_id"],
             "filename": job["filename"],

@@ -72,6 +72,11 @@ const I18N_DICT = {
     "upload.notPdf": "Please choose a PDF file.",
     "upload.failed": "Upload failed: {msg}",
     "upload.started": "Job started — OCR is running.",
+    // --- per-file pre-start panel ---
+    "upload.pending": "Ready: {n} file(s) selected — set each file's parameters below, then click Start.",
+    "upload.startJobs": "Start OCR",
+    "upload.starting": "Starting…",
+    "upload.discard": "Discard",
 
     // --- jobs ---
     "jobs.title": "Jobs",
@@ -321,6 +326,11 @@ const I18N_DICT = {
     "upload.notPdf": "请选择一个 PDF 文件。",
     "upload.failed": "上传失败：{msg}",
     "upload.started": "任务已开始，OCR 处理中。",
+    // --- per-file pre-start panel ---
+    "upload.pending": "已就绪：选择了 {n} 个文件——请先为每个文件设置参数，再点击“开始”。",
+    "upload.startJobs": "开始 OCR",
+    "upload.starting": "正在启动…",
+    "upload.discard": "丢弃",
 
     // --- jobs ---
     "jobs.title": "任务",
