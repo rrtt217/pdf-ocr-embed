@@ -1,7 +1,7 @@
 """Invariant: every bbox is integer raw-pixel [x1,y1,x2,y2], x1<=x2, y1<=y2."""
 from __future__ import annotations
 
-from backend.sources.base import map_normalized_to_pixels, normalize_bbox
+from backend.errors import map_normalized_to_pixels, normalize_bbox
 
 
 def test_map_corners():

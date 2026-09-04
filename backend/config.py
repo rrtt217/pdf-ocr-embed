@@ -43,79 +43,59 @@ PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
     },
 }
 
-# Keys accepted in ocr_config.toml (core provider fields + per-adapter knobs).
+# Keys accepted in ocr_config.toml.
 _FILE_KEYS = (
+    # unlimited engine (backend.ocrmypad) provider fields
     "api_key", "base_url", "model", "provider",
-    # tesseract adapter knobs
-    "tess_lang", "tess_psm", "tess_oem", "tess_config",
-    "tessdata_dir", "tess_cmd",
-    # generic_openai adapter knob
-    "generic_prompt",
-    # unlimited adapter document-level (multi-page) parsing knobs
-    "unlimited_batch_enabled", "unlimited_max_pages_per_batch",
-    # guard: cap concurrent pages-in-flight = batch_size x concurrency
-    "max_inflight_pages",
-    # HTTP adapter retry / rate-limit knobs (see backend/sources/http_utils.py):
-    # shared by unlimited_ocr & generic_openai; do NOT affect OCR output.
+    # engine selection: 'unlimited' (plugin), 'tesseract' (ocrmypdf built-in),
+    # 'none' (no OCR).  Default 'unlimited'.
+    "ocr_engine",
+    # unlimited engine HTTP retry / rate-limit knobs (backend.http_retry):
+    # do NOT affect OCR output.
     "max_retries", "retry_base_delay", "retry_max_delay", "rate_limit_rps",
-    # embedded-text font (system font name / path used for the text layer)
-    "embed_font",
+    # unlimited engine multi-page batching (backend.ocrmypad.batching):
+    # 0=disabled (default).  >1 groups concurrent pages into one request.
+    "ocr_batch_size",            # pages per multi-image request
+    "ocr_batch_timeout_ms",      # batch window flush timeout (backstop, ms)
+    "ocr_batch_per_page_tokens", # per-page output token budget inside a batch
+    # ocrmypdf pipeline knobs (backend.ocr_service builds OcrOptions from these)
+    "ocrmypdf_mode",        # force | skip | redo | default (default: force)
+    "ocrmypdf_jobs",        # 0 = auto (cpu count)
+    "ocrmypdf_optimize",    # 0..3, applied at finalize (default 0)
+    "ocrmypdf_output_type", # pdf | pdfa (default pdf)
+    "ocrmypdf_language",    # tesseract needs it; the unlimited engine ignores it
+    "tess_lang",            # legacy name for ocrmypdf_language (auto-mapped)
+    "ocrmypdf_deskew",      # boolean, default off
+    "ocrmypdf_clean",       # boolean, default off (requires unpaper)
+    "ocrmypdf_rotate_pages",  # boolean, default off (needs an OSD-capable engine)
     # temp-file cleanup (see backend/cleanup.py)
     "cleanup_max_age_hours", "cleanup_interval_hours",
-    # OCR result cache (see backend/ocr_cache.py)
-    "ocr_cache_enabled", "ocr_cache_max_age_hours",
     # logging verbosity (see backend/logging_config.py)
     "log_level",
-    # OCR-input image preprocessing (see backend/pdf_processing.preprocess_image)
-    "preprocess_enabled", "preprocess_grayscale", "preprocess_denoise",
-    "preprocess_contrast", "preprocess_binarize",
 )
-
-# Preprocessing flags (flat keys, mirrored in _FILE_KEYS / _ENV_ALIASES).
-# The master switch defaults OFF; when a user enables preprocessing, the common
-# trio (grayscale + denoise + contrast) is on by default and binarize stays
-# opt-in.  Single source of truth — the render pipeline
-# (backend/pdf_processing._preprocess_opts_from_config) reads the same defaults.
-_PREPROCESS_KEYS = (
-    "preprocess_enabled", "preprocess_grayscale", "preprocess_denoise",
-    "preprocess_contrast", "preprocess_binarize",
-)
-PREPROCESS_DEFAULTS: Dict[str, bool] = {
-    "preprocess_enabled": False,
-    "preprocess_grayscale": True,
-    "preprocess_denoise": True,
-    "preprocess_contrast": True,
-    "preprocess_binarize": False,
-}
 
 # Map environment variables -> resolved config field names.  These restore the
 # legacy OCR_* names as highest-priority overrides for the running process.
 _ENV_ALIASES = {
-    "OCR_TESS_LANG": "tess_lang",
-    "OCR_TESS_PSM": "tess_psm",
-    "OCR_TESS_OEM": "tess_oem",
-    "OCR_TESS_CONFIG": "tess_config",
-    "OCR_TESSDATA_DIR": "tessdata_dir",
-    "OCR_TESS_CMD": "tess_cmd",
-    "OCR_GENERIC_PROMPT": "generic_prompt",
-    "OCR_UNLIMITED_BATCH_ENABLED": "unlimited_batch_enabled",
-    "OCR_UNLIMITED_MAX_PAGES_PER_BATCH": "unlimited_max_pages_per_batch",
-    "OCR_MAX_INFLIGHT_PAGES": "max_inflight_pages",
+    "OCR_ENGINE": "ocr_engine",
     "OCR_MAX_RETRIES": "max_retries",
     "OCR_RETRY_BASE_DELAY": "retry_base_delay",
     "OCR_RETRY_MAX_DELAY": "retry_max_delay",
     "OCR_RATE_LIMIT_RPS": "rate_limit_rps",
-    "OCR_EMBED_FONT": "embed_font",
+    "OCR_BATCH_SIZE": "ocr_batch_size",
+    "OCR_BATCH_TIMEOUT_MS": "ocr_batch_timeout_ms",
+    "OCR_BATCH_PER_PAGE_TOKENS": "ocr_batch_per_page_tokens",
+    "OCRMYPDF_MODE": "ocrmypdf_mode",
+    "OCRMYPDF_JOBS": "ocrmypdf_jobs",
+    "OCRMYPDF_OPTIMIZE": "ocrmypdf_optimize",
+    "OCRMYPDF_OUTPUT_TYPE": "ocrmypdf_output_type",
+    "OCRMYPDF_LANGUAGE": "ocrmypdf_language",
+    "OCRMYPDF_DESKEW": "ocrmypdf_deskew",
+    "OCRMYPDF_CLEAN": "ocrmypdf_clean",
+    "OCRMYPDF_ROTATE_PAGES": "ocrmypdf_rotate_pages",
     "OCR_CLEANUP_MAX_AGE_HOURS": "cleanup_max_age_hours",
     "OCR_CLEANUP_INTERVAL_HOURS": "cleanup_interval_hours",
-    "OCR_CACHE_ENABLED": "ocr_cache_enabled",
-    "OCR_CACHE_MAX_AGE_HOURS": "ocr_cache_max_age_hours",
     "OCR_LOG_LEVEL": "log_level",
-    "OCR_PREPROCESS_ENABLED": "preprocess_enabled",
-    "OCR_PREPROCESS_GRAYSCALE": "preprocess_grayscale",
-    "OCR_PREPROCESS_DENOISE": "preprocess_denoise",
-    "OCR_PREPROCESS_CONTRAST": "preprocess_contrast",
-    "OCR_PREPROCESS_BINARIZE": "preprocess_binarize",
 }
 
 # In-memory overrides from the WebUI settings page (applied at runtime).
@@ -139,6 +119,11 @@ def _load_file_config() -> Dict[str, str]:
         val = data.get(key)
         if val is not None:
             cfg[key] = _as_str(val)
+    # Legacy ``tess_lang`` (pre-rebuild name) maps onto ``ocrmypdf_language``
+    # so an existing config keeps working; ``ocrmypdf_language`` wins if both
+    # are present.
+    if cfg.get("tess_lang") and not cfg.get("ocrmypdf_language"):
+        cfg["ocrmypdf_language"] = cfg["tess_lang"]
     return cfg
 
 
@@ -174,7 +159,7 @@ def _load_env() -> Dict[str, str]:
         cfg["model"] = os.environ["OCR_MODEL"]
     if os.environ.get("OCR_PROVIDER"):
         cfg["provider"] = os.environ["OCR_PROVIDER"]
-    # Per-adapter knobs and other file keys read straight from env.
+    # Per-key overrides read straight from env.
     for env_key, field in _ENV_ALIASES.items():
         val = os.environ.get(env_key)
         if val:
@@ -206,14 +191,23 @@ def resolve() -> Dict[str, str]:
 def get_effective_settings() -> Dict[str, Any]:
     """Return a safe, masked view of the current effective settings for the WebUI."""
     cfg = resolve()
-    preprocess = {k: as_bool(cfg.get(k, PREPROCESS_DEFAULTS[k])) for k in _PREPROCESS_KEYS}
     return {
         "provider": cfg.get("provider", "ustc"),
         "base_url": cfg.get("base_url", ""),
         "model": cfg.get("model", ""),
+        "ocr_engine": cfg.get("ocr_engine", "unlimited"),
+        "ocrmypdf_mode": cfg.get("ocrmypdf_mode", "force"),
+        "ocrmypdf_jobs": cfg.get("ocrmypdf_jobs", "0"),
+        "ocrmypdf_optimize": cfg.get("ocrmypdf_optimize", "0"),
+        "ocrmypdf_output_type": cfg.get("ocrmypdf_output_type", "pdf"),
+        "ocrmypdf_language": cfg.get("ocrmypdf_language", ""),
+        "ocrmypdf_deskew": as_bool(cfg.get("ocrmypdf_deskew", "false")),
+        "ocrmypdf_clean": as_bool(cfg.get("ocrmypdf_clean", "false")),
         "api_key_masked": _mask_key(cfg.get("api_key", "")),
         "has_api_key": bool(cfg.get("api_key")),
-        **preprocess,
+        "ocr_batch_size": cfg.get("ocr_batch_size", "0"),
+        "ocr_batch_timeout_ms": cfg.get("ocr_batch_timeout_ms", "3000"),
+        "ocr_batch_per_page_tokens": cfg.get("ocr_batch_per_page_tokens", "2048"),
     }
 
 
@@ -221,9 +215,8 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     """Save settings from the WebUI to ocr_config.toml (masked keys preserved).
 
     If 'api_key' looks masked (contains '*') it is treated as "unchanged" and
-    the previously configured key is kept.  All other file settings (per-adapter
-    knobs, cleanup, log level) are preserved and only the editor-relevant
-    provider fields are updated.
+    the previously configured key is kept.  All other file settings are
+    preserved and only the editor-relevant fields are updated.
     """
     prev = _load_file_config()
     api_key = str(settings.get("api_key", "")).strip()
@@ -231,9 +224,6 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
         api_key = prev.get("api_key", _saved.get("api_key", ""))
 
     # Start from the existing file so a WebUI save does not drop unrelated keys.
-    # Only fields actually present in the payload are written, so a save that
-    # carries just the preprocessing toggles never clears the provider fields
-    # (or a previously configured api_key / custom base_url).
     data: Dict[str, str] = dict(prev)
     if "api_key" in settings:
         data["api_key"] = api_key
@@ -243,13 +233,21 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
         data["model"] = str(settings.get("model", "")).strip()
     if "provider" in settings:
         data["provider"] = str(settings.get("provider", "ustc")).strip()
+    if "ocr_engine" in settings:
+        data["ocr_engine"] = str(settings.get("ocr_engine", "unlimited")).strip()
 
-    # Persist the preprocessing toggles from the WebUI payload.  Only keys the
-    # client actually sent are written; anything absent keeps its previous
-    # value (data already starts from the existing file).
-    for key in _PREPROCESS_KEYS:
+    # Persist the ocrmypdf pipeline toggles from the WebUI payload.  Only keys
+    # the client actually sent are written; anything absent keeps its value.
+    for key in ("ocrmypdf_mode", "ocrmypdf_jobs", "ocrmypdf_optimize",
+                "ocrmypdf_output_type", "ocrmypdf_language"):
+        if settings.get(key) is not None:
+            data[key] = str(settings[key]).strip()
+    for key in ("ocrmypdf_deskew", "ocrmypdf_clean", "ocrmypdf_rotate_pages"):
         if settings.get(key) is not None:
             data[key] = "true" if as_bool(settings[key]) else "false"
+    for key in ("ocr_batch_size", "ocr_batch_timeout_ms", "ocr_batch_per_page_tokens"):
+        if settings.get(key) is not None:
+            data[key] = str(settings[key]).strip()
 
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)

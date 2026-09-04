@@ -183,7 +183,6 @@ def test_validation_api_endpoint(monkeypatch, tmp_path):
     _stub_lifespan(monkeypatch)
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(pdf_processing, "OUTPUT_DIR", tmp_path / "output")
 
     doc = fitz.open()
     page = doc.new_page(width=400, height=300)
@@ -195,15 +194,37 @@ def test_validation_api_endpoint(monkeypatch, tmp_path):
     p0 = {"page_index": 0, "width": 400, "height": 300, "blocks": [
         {"kind": "text", "bbox": [50, 40, 350, 60],
          "text": "api validation roundtrip", "caption": "", "conf": 0.95}]}
-    ocr_service.update_page(job["id"], 0, p0)
-    ocr_service._set(job, num_pages=1)
+    # A block sidecar for the page (as the plugin engine leaves it) —
+    # update_page edits pages that already have an OCR result.
+    import json as _json
+    from backend.ocrmypad import parser as parser_mod
+    sidecar = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+               "000001_ocr_hocr.blocks.json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    parsed = parser_mod.Page(
+        page_index=0, width=400, height=300,
+        blocks=[parser_mod.Block(kind="text", bbox=[50, 40, 350, 60],
+                                 text="seed", lines=["seed"])])
+    sidecar.write_text(
+        _json.dumps({"page": parsed.to_dict(), "dpi": 300.0},
+                    ensure_ascii=False),
+        encoding="utf-8")
+    ocr_service.update_page(job["job_id"], 0, p0)
+    ocr_service._set(job["job_id"], num_pages=1)
 
-    out_path, _thumb, _stats = pdf_processing.embed_invisible_text(
-        job["pdf_path"], [dict_to_page(p0)], tmp_path / "output")
-    ocr_service._set(job, embedded_path=out_path)
+    # A sidecar + hOCR for the page (as the plugin engine leaves them), then a
+    # real finalize output the validation endpoint can extract text from.
+    out_path = tmp_path / "output" / "embedded.pdf"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=300)
+    page.insert_text((50, 50), "api validation roundtrip", fontsize=14)
+    doc.save(str(out_path), garbage=4, deflate=True)
+    doc.close()
+    ocr_service._set(job["job_id"], embedded_path=str(out_path))
 
     with TestClient(app) as client:
-        resp = client.get(f"/api/validation/{job['id']}")
+        resp = client.get(f"/api/validation/{job['job_id']}")
     assert resp.status_code == 200
     data = resp.json()
     assert data["ok"] is True
@@ -211,7 +232,7 @@ def test_validation_api_endpoint(monkeypatch, tmp_path):
     assert data["pages"][0]["coverage"] > 0.9
 
     # No embedded output -> 404.
-    other = ocr_service.create_job("other.pdf", b"%PDF-fake-bytes")
+    other = ocr_service.create_job("other.pdf", pdf_bytes)
     with TestClient(app) as client:
-        resp = client.get(f"/api/validation/{other['id']}")
+        resp = client.get(f"/api/validation/{other['job_id']}")
     assert resp.status_code == 404

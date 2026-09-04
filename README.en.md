@@ -3,12 +3,12 @@
 > English ｜ [中文](README.md)
 
 A cross-platform tool that turns image-only (scanned) PDFs into documents with a
-**searchable, selectable, copyable invisible text layer**. Upload a scanned PDF; the
-app OCRs every page and embeds the recognized text **invisibly** (PyMuPDF
-`render_mode=3`) at the detected coordinates — the text stays hidden visually but is
-fully searchable, selectable and copyable. A single-page WebUI lets you edit the
-recognized text, tune per-block font sizes, watch live progress (SSE) and download
-the `*_embedded.pdf`.
+**searchable, selectable, copyable invisible text layer**. Upload a scanned PDF;
+[OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF) rasterizes the pages, runs the
+selected OCR engine, and grafts the recognized text **invisibly** at the detected
+coordinates — the text stays hidden visually but is fully searchable, selectable
+and copyable. A single-page WebUI lets you edit the recognized text, watch live
+progress (SSE) and download the `*_embedded.pdf`.
 
 This is a **fully standalone program**: API keys come from external configuration —
 nothing is hardcoded in the code.
@@ -18,52 +18,53 @@ nothing is hardcoded in the code.
 > when extending, review security, edge cases and dependency versions.
 >
 > **For AI agents**: `AGENTS.md` is the agent-oriented project guide — architecture,
-> hard invariants, and the full steps + checklist for writing a new OCR adapter.
-> Read it before changing anything.
+> hard invariants, and the full steps + checklist for writing a new OCR engine
+> (`OcrEngine` plugin). Read it before changing anything.
 
 ---
 
-## Feature Highlights
-
-- **Generic OCR abstraction (Adapter pattern)** — the backend speaks only the
-  normalized `OcrPage` interface; each engine is one adapter that converts its raw
-  output to `OcrPage` (bboxes unified to **raw pixel coordinates**).
-  - `unlimited_ocr_adapter` (full implementation, default): parses
-    `<|det|>type [bbox]<|/det|>content` markers and maps the 1000×1000 normalized
-    canvas back to real pixels (per-axis scale).
-  - `tesseract_adapter` (full implementation): local Tesseract OCR, no API key.
-    Word-level TSV is grouped into line blocks (one per line), auto-classified as
-    text/heading/equation; Chinese needs a language pack such as `chi_sim`.
-  - `generic_openai_adapter` (full implementation): any OpenAI-compatible vision
-    model, prompted to return structured JSON with bboxes, mapped back to pixels.
+- **OCR core = OCRmyPDF** — rasterization, engine scheduling, concurrency, text-layer
+  rendering (its built-in fpdf2 renderer), grafting, PDF/A and optimization all live
+  in [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF) (≥17.11, system deps:
+  tesseract + ghostscript, no qpdf). The backend calls it in-process through its
+  official edit-round-trip channel: `_pdf_to_hocr` (OCR → per-page hOCR) +
+  `_hocr_to_ocr_pdf` (edited hOCR → final PDF).
+- **unlimited-ocr as an OCRmyPDF plugin** (`backend/ocrmypad/`) — an `OcrEngine`
+  plugin that OCRs each page through an OpenAI-compatible vision API (USTC
+  `unlimited-ocr` model), parses the `<|det|>type [bbox]<|/det|>content` markers
+  (1000×1000 canvas scaled per-axis back to **raw pixel coordinates**) and writes
+  hOCR + a block sidecar JSON (the WebUI's editable representation).
+  `ocr_engine = "tesseract"` falls back to ocrmypdf's built-in Tesseract;
+  `"none"` disables OCR.
+- **Engine-agnostic page store** (`backend/page_store.py`) — the ONLY channel the
+  backend uses to talk about pages: block sidecars (the normalized editable form),
+  hOCR (the interchange format every engine implements — a Tesseract-only page is
+  derived into an editable sidecar via ocrmypdf's own parser), the `<job>/cancel`
+  flag file, and the page inventory (hOCR ∪ sidecars). No engine's raw output
+  ever leaks past it.
 - **Fully externalized OCR settings** — local TOML config `backend/ocr_config.toml`
   plus the WebUI settings page (the WebUI saves into the same TOML file). Any
   `OCR_*` **environment variable optionally overrides** the corresponding key
   (highest priority: env var > WebUI in-memory value > TOML file); JSON / `.env`
   file config has been removed.
-- **PDF pipeline** — PyMuPDF renders each page to an image, OCR runs per page, and
-  the text is embedded invisibly with `render_mode=3`; pixel→PDF coordinates are
-  flipped correctly (y axis) and scaled by the page rect, saved as `*_embedded.pdf`.
-- **Progress streaming** — SSE pushes per-page OCR progress.
-- **Parallel OCR** — configurable concurrency (`concurrency`). For the unlimited
-  engine, concurrency applies to **multi-page batches**: `concurrency` requests
-  ("`unlimited_max_pages_per_batch` pages each") run at the same time (pages in
-  flight ≈ concurrency × batch size, clamped by the `max_inflight_pages` guard);
-  per-page engines like tesseract degrade to one request per page in parallel.
-- **Single-page WebUI** — editable text blocks on the left, page preview + bbox
-  overlay on the right, settings form, embed button, progress bars, concurrency input.
+- **Frontend stays our own WebUI** (zero-build vanilla JS): editable text blocks on
+  the left, page preview + bbox overlay on the right, settings form, embed button,
+  SSE progress. OCRmyPDF's `misc/_webservice.py` was NOT adopted (a Streamlit form
+  app with no per-page editing / progress; rationale in DESIGN.md).
+- **Progress streaming** — SSE pushes per-page OCR progress (derived from the
+  page-store file inventory, engine-agnostic).
+- **Parallel OCR** — `concurrency` maps to OCRmyPDF's worker count
+  (`ocrmypdf_jobs`); `use_threads` is always on (the engines are HTTP/IO-bound,
+  and thread-based runs suit file-based progress).
 - **Confidence review** — every block shows a confidence badge (green/amber/red at
-  85/60), low-confidence blocks get a red outline; a "Low confidence only" filter
-  with an adjustable threshold (default 60%) and per-page badge counts on the tabs.
-  Engines that report no confidence (the API adapters) show a hint — Tesseract reports it.
-- **Output optimization** — optionally recompress page images to **JPEG / grayscale
-  JPEG** and **downscale** them (1/2, 1/4) at embed time; only replacements smaller
-  than the original are applied (soft-masked images are always kept). Optional
-  **linearization** degrades gracefully to a normal save where the bundled MuPDF
-  dropped it. Embed finishes with an "N image(s) replaced, saved X" note.
-- **Job persistence** — every job's state (finished pages, embed result) is written
-  to `work/<job_id>/job.json` in real time and restored on server start; crashed runs
-  revive as stopped with their completed pages ready to retry or partially download.
+  85/60), low-confidence blocks get a red outline; a "Low only" filter with an
+  adjustable threshold (default 60%) and per-page badge counts on the tabs.
+- **Output options** — at finalize, choose **optimization level** (0–3, handled by
+  ocrmypdf's optimize stage) and **output type** (PDF / PDF/A).
+- **Job persistence** — every job's state is written to `work/<job_id>/job.json` in
+  real time; per-page OCR results live as block sidecars under
+  `work/<job_id>/hocr/`, and both are restored on server start — recognized pages
+  can be finalized without re-uploading.
 - **Batch upload + ZIP download** — drop/select several PDFs at once: each file
   becomes its own independent job (parallel cards + SSE progress); once embedded,
   tick any finished jobs and one click packages their embedded PDFs into a single
@@ -75,20 +76,24 @@ nothing is hardcoded in the code.
   in localStorage; Auto follows the system `prefers-color-scheme` (native controls and
   scrollbars adapt too).
 - **WebUI UX polish** — toast notifications, `Ctrl/⌘+Enter` to embed, `←/→` to flip
-  pages, remembered preferences (theme/engine/language/zoom/font), visible focus
-  styles, `prefers-reduced-motion` support, inline SVG favicon and a theme-aware
-  `theme-color`.
+  pages, remembered preferences (theme/engine/…), visible focus styles,
+  `prefers-reduced-motion` support, inline SVG favicon and a theme-aware `theme-color`.
 - **No CUDA / NVIDIA** dependency.
 
 ---
 
 ## Installation
 
+**System dependencies** (required by OCRmyPDF): tesseract-ocr and ghostscript; no
+qpdf requirement.
+
 ```bash
+# Debian/Ubuntu
+sudo apt-get install tesseract-ocr ghostscript
 cd /home/david/vibe-arena/pdf-ocr-embed
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # includes ocrmypdf>=17.11
 ```
 
 ## OCR Configuration
@@ -115,16 +120,16 @@ model = "unlimited-ocr"
 ```
 
 Any OpenAI-compatible endpoint works — switch engines by changing
-`base_url` + `model`. Every other option (Tesseract, the generic-OpenAI prompt,
-the embed font, temp-file cleanup, log level) is documented as a comment inside
-`config.example.toml`.
+`base_url` + `model`. Every other option (engine selection, ocrmypdf pipeline
+knobs, retry/rate limits, temp-file cleanup, log level) is documented as a comment
+inside `config.example.toml`.
 
 ### 2) WebUI Settings page
 
 Fill in and save via the **Settings** button at the top-right of the page (the key
 is stored masked). The form is pre-filled from `backend/ocr_config.toml`, and saving
-writes the four provider fields back to that file without touching the rest
-(tesseract, cleanup, `log_level`, ...); clearing a field before saving resets it.
+writes the provider fields plus the pipeline knobs back to that file without
+touching unrelated keys; clearing a field before saving resets it to the preset.
 
 > If no key is configured, OCR calls return a clear error; everything else
 > (upload, preview) keeps working.
@@ -149,18 +154,21 @@ is not set). The mapping from environment variables to TOML keys is:
 | `OCR_BASE_URL` | `base_url` |
 | `OCR_MODEL` | `model` |
 | `OCR_PROVIDER` | `provider` |
-| `OCR_TESS_LANG` | `tess_lang` |
-| `OCR_TESS_PSM` | `tess_psm` |
-| `OCR_TESS_OEM` | `tess_oem` |
-| `OCR_TESS_CONFIG` | `tess_config` |
-| `OCR_TESSDATA_DIR` | `tessdata_dir` |
-| `OCR_TESS_CMD` | `tess_cmd` |
-| `OCR_GENERIC_PROMPT` | `generic_prompt` |
-| `OCR_EMBED_FONT` | `embed_font` |
+| `OCR_ENGINE` | `ocr_engine` |
+| `OCRMYPDF_MODE` | `ocrmypdf_mode` |
+| `OCRMYPDF_JOBS` | `ocrmypdf_jobs` |
+| `OCRMYPDF_OPTIMIZE` | `ocrmypdf_optimize` |
+| `OCRMYPDF_OUTPUT_TYPE` | `ocrmypdf_output_type` |
+| `OCRMYPDF_LANGUAGE` | `ocrmypdf_language` |
+| `OCRMYPDF_DESKEW` | `ocrmypdf_deskew` |
+| `OCRMYPDF_CLEAN` | `ocrmypdf_clean` |
+| `OCRMYPDF_ROTATE_PAGES` | `ocrmypdf_rotate_pages` |
+| `OCR_MAX_RETRIES` | `max_retries` |
+| `OCR_RETRY_BASE_DELAY` | `retry_base_delay` |
+| `OCR_RETRY_MAX_DELAY` | `retry_max_delay` |
+| `OCR_RATE_LIMIT_RPS` | `rate_limit_rps` |
 | `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
 | `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
-| `OCR_CACHE_ENABLED` | `ocr_cache_enabled` |
-| `OCR_CACHE_MAX_AGE_HOURS` | `ocr_cache_max_age_hours` |
 | `OCR_LOG_LEVEL` | `log_level` |
 
 ---
@@ -177,37 +185,27 @@ Open <http://localhost:8000> and drag a PDF in.
 
 ### Choosing the OCR engine
 
-The upload zone has a dropdown with three engines:
+The upload zone has a dropdown with three engines (`ocr_engine`):
 
-- **Unlimited OCR (API)** (default) — requires an API key / base_url / model (see above).
-- **Tesseract (local)** — local OCR, **no API key needed**. Set the language pack in
-  "Tesseract language", e.g. `chi_sim` (Chinese), `eng` (English), or `chi_sim+eng`
-  (mixed).
-- **Generic OpenAI (API)** — any OpenAI-compatible vision model; the key goes through
-  Settings.
+- **Unlimited OCR (API)** (default) — the OCRmyPDF plugin engine; requires an API
+  key / base_url / model (see above).
+- **Tesseract (local)** — ocrmypdf's built-in Tesseract, **no API key needed**. Set
+  the language pack in "OCR language", e.g. `chi_sim` (Chinese), `eng` (English),
+  or `chi_sim+eng` (mixed).
+- **No OCR** — no OCR at all (ocrmypdf image processing / optimization only).
+
+The Settings dialog also offers pipeline knobs (persisted to the same TOML):
+`mode` (force-ocr | skip-text | redo-ocr), `language` (Tesseract), `deskew`,
+`clean` (needs unpaper).
 
 Command line (tesseract example):
 
 ```bash
-# put this in backend/ocr_config.toml (or use the WebUI's "Tesseract language" field)
-echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
+# put this in backend/ocr_config.toml (or use the Settings dialog)
+echo 'ocrmypdf_language = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
-### Image preprocessing (optional)
-
-Scanned pages are often skewed, noisy and grey, which hurts recognition. The
-Settings dialog offers a set of **PIL preprocessing toggles** (`preprocess_*`)
-that clean the rendered page image before OCR:
-
-- `preprocess_enabled` (master switch, default off), `grayscale`, `denoise`
-  (median filter), `contrast` (histogram stretch), `binarize` (Otsu threshold).
-
-**Never changes dimensions**: preprocessing runs only on freshly rendered page
-images and preserves the exact input width/height, so every block bbox keeps its
-pixel-space meaning. Toggles can be set in `backend/ocr_config.toml` or via
-`OCR_PREPROCESS_*` environment variables (highest priority). Only newly rendered
-pages are affected (cache-hit pages are not re-rendered or preprocessed).
 ### Batch upload & ZIP download
 
 The upload zone accepts **multiple PDFs** in one drag or file-picker (single-file
@@ -225,6 +223,7 @@ The server packages it by streaming each file straight from disk
 (`GET /api/ocr/zip?jobs=id1,id2,...`), so the archive is never buffered in RAM;
 it returns 404 when none of the requested jobs have embedded results yet — jobs
 that do have results are always included.
+
 ### Post-embed validation & quality report
 
 After embedding, the backend re-opens the embedded PDF with PyMuPDF, extracts
@@ -243,7 +242,8 @@ Usage: the embed response carries a `report`; you can also hit the workspace
 **Validate** button to re-run `GET /api/validation/{job_id}` anytime. Validation
 only reads artifacts — it never modifies the embedded file and never fails an
 embed (a broken report is surfaced as `ok:false` without blocking download).
-### Block editing & operations (#6)
+
+### Block editing & operations
 
 The block list on the left and the preview pane on the right let you fix
 recognition results directly:
@@ -262,48 +262,44 @@ recognition results directly:
 - **Undo**: every structural edit (add/delete/merge/split/move/resize) takes a
   snapshot; the toolbar **Undo** steps back through them (session-only).
 - All bbox adjustments stay **integer pixel coordinates** clamped to the page
-  (`x1<=x2`, `y1<=y2`), consistent with the coordinate invariant; edits keep
-  using the existing "send the whole page at embed time" path.
+  (`x1<=x2`, `y1<=y2`), consistent with the coordinate invariant; edits are baked
+  in when the page's hOCR is regenerated for finalize.
 
 ### Headless CLI
 
-Run the whole "OCR → embed" pipeline from the command line without the web
-server (reuses the exact `backend.ocr_service` / `backend.pdf_processing`
-backend logic):
+Run the whole "OCR → finalize" pipeline from the command line without the web
+server (reuses the exact `backend.ocr_service` backend logic):
 
 ```bash
-python -m backend.cli book.pdf --adapter tesseract --pages 1-20 --concurrency 2
-python -m backend.cli book.pdf --adapter unlimited --no-embed --pages 1-5   # OCR only, print per-page text
-python -m backend.cli book.pdf --adapter list                               # list available engines
+python -m backend.cli book.pdf --engine tesseract --pages 1-20 --jobs 2
+python -m backend.cli book.pdf --engine unlimited --pages 1-5 --sidecar-text  # print per-page text
 ```
 
-Options: `--adapter` (default `unlimited`), `--pages` (1-based; `"1-20"` / `"1,3,5-7"` /
-`"1-"` / `"-5"`), `--concurrency`, `--out` (default `output/`), `--no-embed`,
-`--max-tokens` (guard `< 32768`), `--json`. Writes `<stem>_embedded_<id>.pdf`.
-Config (API keys etc.) still resolves via `resolve()` (TOML / env var), never hardcoded.
+Options: `--engine` (default `unlimited`), `--pages` (1-based; `"1-20"` / `"1,3,5-7"` /
+`"1-"` / `"-5"`), `--jobs` (worker count), `--out` (default `output/`),
+`--sidecar-text`. Writes `<stem>_embedded_<id>.pdf`. Config (API keys etc.) still
+resolves via `resolve()` (TOML / env var), never hardcoded.
 
 ### API Overview
 
 | Method | Path | Description |
 | ---- | ---- | ---- |
 | GET | `/` | WebUI page |
-| GET | `/api/health` | Health check + available adapters |
-| GET/POST | `/api/settings` | Read / save provider config (masked) |
-| POST | `/api/ocr/upload` | Upload PDF → background per-page OCR (`concurrency`, `adapter` engine, `lang/psm/oem` for tesseract, `base_url/api_key/model` for API engines) → returns a job id |
+| GET | `/api/health` | Health check + engine map |
+| GET/POST | `/api/settings` | Read / save provider config (masked) + pipeline knobs |
+| POST | `/api/ocr/upload` | Upload PDF → background OCRmyPDF OCR (`files` multi / `file` single; `ocr_engine` select, `concurrency` → workers, `lang` for tesseract, `base_url/api_key/model` overrides) → returns job id(s) |
 | GET | `/api/ocr/zip?jobs=id1,id2` | Package the embedded PDFs of the selected jobs into one ZIP (`jobs` = comma-separated job ids; 404 when none of them have embedded results yet) |
-| POST | `/api/ocr/retry/{job_id}` | Re-run OCR for failed/interrupted jobs (default: only missing pages, not from scratch; params same as upload, plus optional `page_start`/`page_end` range and `force` to re-run already-successful pages) |
-| POST | `/api/ocr/stop/{job_id}` | Stop a running OCR job (completed pages are kept: download or retry the rest) |
+| POST | `/api/ocr/retry/{job_id}` | Re-run OCR for failed/interrupted jobs (default: only missing pages, not from scratch; same params as upload, plus `page_start`/`page_end` range and `force` to re-run already-successful pages) |
+| POST | `/api/ocr/stop/{job_id}` | Stop a running OCR job (completed pages are kept on disk; retry the rest) |
 | GET | `/api/logs` | Recent backend debug logs |
-| GET | `/api/ocr/stream/{job_id}` | SSE progress stream |
-| GET | `/api/pages/{job_id}` | All per-page OCR data |
+| GET | `/api/ocr/stream/{job_id}` | SSE progress stream (status + per-page progress events) |
+| GET | `/api/pages/{job_id}` | All per-page OCR data (block sidecar JSON) |
 | GET | `/api/pages/{job_id}/{i}/image` | Page preview PNG |
-| POST | `/api/pages/{job_id}/{i}` | Update one editable page |
-| POST | `/api/embed/{job_id}` | Embed (edited) text → `*_embedded.pdf` |
+| POST | `/api/pages/{job_id}/{i}` | Update one editable page (writes sidecar + regenerates hOCR) |
+| POST | `/api/embed/{job_id}` | Finalize (edited) text → `<source>_embedded.pdf` (`optimize`, `output_type`; with `pages`, produces a `<source>_partial.pdf` with exactly those pages) |
 | GET | `/api/download/{job_id}.pdf` | Download the embedded result |
 | GET | `/api/cleanup` | Temp-file cleanup overview (unreferenced work/output/uploads counts + sizes) |
 | POST | `/api/cleanup/run` | Run/preview cleanup (`older_than_hours`, `dry_run` preview, `force` to ignore the age limit; in-use job files are never deleted) |
-| GET | `/api/cache` | OCR result-cache status (entries/bytes, hit and miss counts, TTL, enabled flag) |
-| POST | `/api/cache/clear` | Drop all cached OCR results (never touches OCR results held in job state) |
 
 ---
 
@@ -314,110 +310,90 @@ pdf-ocr-embed/
 ├── backend/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI app + all routes
-│   ├── config.py               # external setting resolution (TOML config file / WebUI)
-│   ├── models.py               # normalized OcrPage / OcrBlock schema
-│   ├── pdf_processing.py       # page render → PNG + invisible text embedding
-│   ├── ocr_service.py          # OCR orchestration, jobs, progress, concurrency
-│   └── sources/
-│       ├── __init__.py
-│       ├── base.py             # OcrSource ABC + coordinate helpers
-│       ├── factory.py          # adapter registry + get_adapter
-│       ├── unlimited_ocr_adapter.py   # full implementation (<|det|> marker parsing)
-│       ├── tesseract_adapter.py       # full implementation (local Tesseract)
-│       └── generic_openai_adapter.py  # full implementation (any OpenAI-compatible vision model)
+│   ├── config.py               # external setting resolution (TOML / WebUI / OCR_* env)
+│   ├── page_store.py           # engine-agnostic page interchange (sidecar/hOCR/cancel)
+│   ├── ocrmypad/               # OCRmyPDF plugin package (unlimited-ocr engine)
+│   │   ├── unlimited_engine.py # OcrEngine plugin + get_ocr_engine hook
+│   │   ├── engine_client.py    # OpenAI-compatible client (truncation/retry/timeout)
+│   │   ├── parser.py           # <|det|> marker parsing + hOCR emission
+│   │   └── text_norm.py        # math/table text normalization
+│   ├── errors.py               # UnavailableError + 1000-canvas → pixel bbox mapping
+│   ├── http_retry.py           # HTTP retry/rate-limit (engine API calls)
+│   ├── ocr_service.py          # OCRmyPDF orchestration (_pdf_to_hocr + _hocr_to_ocr_pdf) + job state
+│   ├── models.py               # editor page JSON (OcrPage/OcrBlock compatible)
+│   ├── pdf_processing.py       # page preview rendering (PyMuPDF)
+│   ├── validation.py           # post-embed coverage report
+│   ├── batch.py                # ZIP packaging (streamed)
+│   ├── cleanup.py              # temp-file cleanup
+│   ├── logging_config.py       # logging
+│   └── cli.py                  # headless CLI (python -m backend.cli)
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # EN + 中文 UI strings
-├── tests/                      # pytest suite (coordinate mapping / parsers / cache, ...)
+├── tests/                      # pytest suite (146 tests)
 ├── requirements-dev.txt        # dev dependencies (pytest)
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
-├── AGENTS.md     # agent-oriented project guide (incl. how to write an OCR adapter)
-└── DESIGN.md     # design doc + roadmap (stable release first, then feature expansion)
+├── AGENTS.md     # agent-oriented project guide (engine plugins + page store)
+└── DESIGN.md     # design doc (OCRmyPDF architecture + frontend rationale)
 ```
 
 ---
 
 ## Notes & Limitations
 
-- bboxes are `[x1,y1,x2,y2]` integers; adapters convert normalized canvases back to
-  real pixels; the frontend and embedding uniformly use pixel coordinates.
+- bboxes are `[x1,y1,x2,y2]` **integers in raw pixel space** (top-left origin). The
+  1000×1000 normalized canvas → real-pixel mapping is centralized in
+  `backend/errors.normalize_bbox`; the hOCR `scan_res` carries the true DPI (the
+  fpdf2 renderer's px→pt transform depends on it).
 - `max_tokens` defaults to 16384 (must stay < 32768 or the API returns HTTP 400).
-  Raise it via the CLI `--max-tokens N` (API engines). A truncated response
-  (`finish_reason=length`, or `completion_tokens >= max_tokens`) is treated as a
-  page **failure** with a clear error — retry re-runs it instead of silently
-  caching a partial result.
-- Pixel → PDF coordinates are flipped along the y axis (PDF origin is bottom-left,
-  pixel origin top-left) and scaled by the page rect / rendered size.
-- **Tesseract adapter (local, no key)**:
-  - Language is configured via `tess_lang` in `backend/ocr_config.toml` (or the
-    WebUI upload zone): `chi_sim` for Chinese, combinable as `chi_sim+eng`.
-  - Requires the `tesseract` binary + matching language packs (Fedora: `tesseract` +
-    `tesseract-langpack-chi_sim`). Use `tess_cmd` if the binary is not on PATH,
-    and `tessdata_dir` if tessdata is not in the default location.
-  - Each text line is aggregated into one block, auto-classified as
-    heading/equation/text, with a confidence score.
-- **generic_openai adapter (any OpenAI-compatible vision model)**: same
-  api_key/base_url/model config as unlimited; `generic_prompt` overrides the default
-  bbox-JSON prompt.
-- **Concurrency**: set it on upload, via the WebUI input or the `concurrency` form
-  field of `POST /api/ocr/upload` (1–32). For the unlimited engine, `concurrency`
-  multi-page batch requests run at the same time (in-flight pages ≈ concurrency ×
-  batch size, clamped by `max_inflight_pages`); tesseract and other per-page
-  engines process pages concurrently in a thread pool (`concurrency=1` =
-  sequential). Higher concurrency means more load on the OCR engine/API — match
-  it to your quota.
+  A truncated response (`finish_reason=length`, or
+  `completion_tokens >= max_tokens`) is treated as a page **failure** with a clear
+  error — retry re-runs it instead of silently accepting a partial result.
+- Coordinate entry into the PDF layer is OCRmyPDF's job: the fpdf2 renderer and
+  hOCR share the top-left origin, so no y-flip is needed; page rotation is handled
+  by ocrmypdf's rotate/graft flow.
+- **Tesseract engine (local, no key)**: ocrmypdf's built-in implementation.
+  Language via `ocrmypdf_language` (`chi_sim`, combinable as `chi_sim+eng`);
+  requires the `tesseract` binary + matching language packs.
+- **unlimited engine result handling**: `table` blocks convert HTML to row/column
+  text (no `<tr>/<td>` tags reach the text layer); equation/table-cell spacing from
+  the model's tokenization is tightened (`X _ p`→`X_p`, `f (x)`→`f(x)`); adjacent
+  single digits are never auto-merged; `image_caption` captions keep their own
+  bbox (`caption_bbox`) and are embedded into the text layer.
+- **Worker count (concurrency / ocrmypdf_jobs)**: set it on upload (1–32) — maps to
+  OCRmyPDF's OCR worker count; `use_threads` is always on. Higher concurrency means
+  more load on the OCR engine/API — match it to your quota.
 - **Smart retry**: after an OCR error or a mid-job stop, the WebUI shows a
-  **Retry remaining** button. Retry only re-runs failed/incomplete pages; successful
-  pages are kept (fixes the "99% done then restart from scratch" problem). You can
-  also call `POST /api/ocr/retry/{job_id}` reusing the uploaded PDF — no re-upload.
+  **Retry remaining** button. Retry only re-runs failed/incomplete pages
+  (`force=true` re-runs every selected page). You can also call
+  `POST /api/ocr/retry/{job_id}` reusing the uploaded PDF — no re-upload.
 - **Mid-job stop**: click **Stop** while OCR is running (or
-  `POST /api/ocr/stop/{job_id}`). Completed pages are kept — download them as a
-  partial `*_embedded.pdf` via **Download partial**, or finish the rest with
-  **Retry remaining**.
-- **OCR result cache**: identical work (same PDF content + page + engine + settings)
-  is cached by content hash under `cache/ocr/` (key = source-PDF hash + page number +
-  render parameters + engine fingerprint; no secrets or page images are ever written).
-  Re-OCRing the same document hits the cache instead of re-calling the engine.
-  TTL comes from `ocr_cache_max_age_hours` (default 720h); `ocr_cache_enabled = false`
-  disables it entirely. The background cleanup loop also expires old entries;
-  `GET /api/cache` shows hit/miss stats and `POST /api/cache/clear` wipes the cache.
-  Only *pristine* recognition results are cached — your per-page edits are unaffected.
-  **Hits skip rendering entirely**: re-uploading the same document does not
-  re-rasterize any cached page (preview PNGs render lazily on first view).
-  SSE progress is split into a `render` (preprocessing) phase and an `ocr`
-  phase, so the progress bar keeps moving while large files are rasterized.
-- **Output-optimization notes**: image recompression is **lossy** — it only affects
-  the scanned background, never the text layer; soft-masked (transparent) images and
-  images that would grow are always kept. Per-run stats come back in the
-  `/api/embed` response (`images.replaced` / `saved_bytes` / `attempted` / `skipped`).
-  This MuPDF build dropped linearization: requesting it degrades to a normal save
-  with `images.linearized = false` — everything else is unaffected.
+  `POST /api/ocr/stop/{job_id}`) — the engine polls the `<job>/cancel` flag between
+  pages (the unlimited plugin supports it; ocrmypdf's built-in Tesseract has no
+  cancel hook, so the run completes and the UI says so). Completed pages are kept
+  on disk: **Retry remaining** finishes the rest or finalize downloads the partial
+  result.
 - **Debug logs**: full pipeline logging, verbosity controlled by `log_level` in
   `backend/ocr_config.toml` (default INFO; DEBUG for detail). The **Logs** button at the
   top-right of the WebUI shows live server logs, or call `GET /api/logs`.
 - **Temp file cleanup**: job state is **persisted** in `work/<job_id>/job.json` and
-  restored at startup, so a restart no longer loses tasks (a job that crashed mid-run
-  comes back as stopped — its completed pages are kept for Retry / partial download).
-  Cleanup only ever removes **unreferenced** files older than
-  `cleanup_max_age_hours` (default 168h = 7 days) — e.g. state files deleted/corrupt
-  or leftover upload fragments. It runs at startup and every
-  `cleanup_interval_hours` (default 6h); both values come from
-  `backend/ocr_config.toml`. Files referenced by a job are
+  restored at startup, so a restart no longer loses tasks (a job that crashed
+  mid-run comes back as stopped — its hOCR work folder keeps every recognized page
+  finalizable). Cleanup only ever removes **unreferenced** files older than
+  `cleanup_max_age_hours` (default 168h = 7 days); it runs at startup and every
+  `cleanup_interval_hours` (default 6h). Files referenced by a job are
   **never deleted**. The **Cleanup** button at the top-right of the WebUI shows a
-  summary, lets you adjust the retention window and clean manually (Preview first,
-  then Clean now); or call `/api/cleanup` and `/api/cleanup/run`.
-  The same dialog's **OCR result cache** section shows cache stats (entries/size/
-  hits/misses/TTL) with a one-click **Clear OCR cache** button (`POST /api/cache/clear`).
-- **Batch upload / ZIP packaging (#10)**: multi-file uploads each become their own
-  job (reusing the parallel worker pool — no queue manager); ZIP members are named
-  after the source PDFs (colliding names get a ` (2)` suffix). Only **embedded**
-  jobs whose output file still exists (`job["embedded_path"]`) are packaged; the
-  rest are skipped, and a 404 is returned when none qualify. The temp archive lives
-  in the system temp dir, is served back as a streaming `FileResponse` and deleted
-  by a background task once the response has been sent — no orphan files are left.
+  summary and lets you clean manually; or call `/api/cleanup` and
+  `/api/cleanup/run`.
+- **Batch upload / ZIP packaging**: multi-file uploads each become their own job
+  (no queue manager); ZIP members are named after the source PDFs (colliding names
+  get a ` (2)` suffix). Only **embedded** jobs whose output file still exists are
+  packaged; the rest are skipped, and a 404 is returned when none qualify. The temp
+  archive lives in the system temp dir, is served as a streaming `FileResponse` and
+  deleted by a background task once the response has been sent.
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `backend/ocr_config.toml`) must
   not be committed to the repository.

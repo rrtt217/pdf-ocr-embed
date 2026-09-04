@@ -1,4 +1,9 @@
-"""Job persistence: work/<job>/job.json survives restarts and resumes cleanly."""
+"""Job persistence: work/<job>/job.json survives restarts and resumes cleanly.
+
+The OCR core is OCRmyPDF; per-page OCR results live in the job's hOCR work
+folder as block sidecars (``000001_ocr_hocr.blocks.json``), so a restart keeps
+every recognized page and the job can be finalized without re-uploading.
+"""
 from __future__ import annotations
 
 import json
@@ -6,14 +11,12 @@ import json
 import fitz
 
 from backend import ocr_service
-from backend import pdf_processing
-from backend.models import OcrBlock, OcrPage
+from backend.ocrmypad import parser as parser_mod
 
 
 def _use_tmp_dirs(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr_service, 'WORK_DIR', tmp_path / 'work')
     monkeypatch.setattr(ocr_service, 'UPLOAD_DIR', tmp_path / 'uploads')
-    monkeypatch.setattr(pdf_processing, 'OUTPUT_DIR', tmp_path / 'output')
 
 
 def _simulate_restart():
@@ -22,233 +25,287 @@ def _simulate_restart():
     ocr_service._STREAMS.clear()
 
 
-def _state_of(job):
-    return (ocr_service._state_path(job)).read_text(encoding='utf-8')
+def _state_path(job):
+    return ocr_service._job_dir(job["job_id"]) / "job.json"
+
+
+def _real_pdf(text: str = "hello page") -> bytes:
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=200)
+    page.insert_text(fitz.Point(20, 100), text)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
+
+def _write_sidecar(job, page_no: int, text: str = "block text"):
+    """Drop a block sidecar (as the plugin engine would) into the job's hOCR."""
+    sidecar = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+               f"{page_no:06d}_ocr_hocr.blocks.json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    page = parser_mod.Page(
+        page_index=page_no - 1, width=1000, height=2000,
+        blocks=[parser_mod.Block(kind="text", bbox=[100, 100, 900, 200],
+                                 text=text, lines=[text])],
+    )
+    sidecar.write_text(
+        json.dumps({"page": page.to_dict(), "dpi": 300.0},
+                   ensure_ascii=False),
+        encoding="utf-8")
+    return sidecar
 
 
 def test_create_job_persists_state(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    job = ocr_service.create_job('doc.pdf', b'%PDF-fake-bytes')
-    data = json.loads(_state_of(job))
-    assert data['id'] == job['id'] and data['filename'] == 'doc.pdf'
-    assert data['pages'] == [] and data['status'] == 'uploaded'
-    assert (ocr_service._state_path(job)).exists()
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    data = json.loads(_state_path(job).read_text(encoding='utf-8'))
+    assert data['job_id'] == job['job_id'] and data['filename'] == 'doc.pdf'
+    assert data['num_pages'] == 1 and data['status'] == 'queued'
+    assert (_state_path(job)).exists()
 
 
 def test_update_page_persists_and_restore_roundtrip(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    job = ocr_service.create_job('doc.pdf', b'%PDF-fake-bytes')
-    p0 = {'page_index': 0, 'width': 10, 'height': 10, 'blocks': []}
-    p2 = {'page_index': 2, 'width': 10, 'height': 10, 'blocks': []}
-    ocr_service.update_page(job['id'], 0, p0)
-    ocr_service.update_page(job['id'], 2, p2)
-    ocr_service._set(job, status='stopped', num_pages=3)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    _write_sidecar(job, 1, "original")
+    _write_sidecar(job, 2, "page two")
+    ocr_service._set(job["job_id"], status='stopped', num_pages=2)
+
+    # An edit goes into the sidecar AND regenerates the page's hOCR.
+    edited = {"blocks": [{"kind": "text", "bbox": [100, 100, 900, 200],
+                          "text": "edited text"}]}
+    ocr_service.update_page(job["job_id"], 0, edited)
 
     _simulate_restart()
     assert ocr_service.restore_jobs() == 1
 
-    revived = ocr_service.get_job(job['id'])
+    revived = ocr_service.get_job(job["job_id"])
     assert revived is not None
     assert revived['status'] == 'stopped'
-    assert [p is not None for p in revived['pages']] == [True, False, True]
-    assert revived['current'] == 2 and revived['num_pages'] == 3
-    assert revived['pages'][0]['page_index'] == 0
-    assert revived['pages'][2]['page_index'] == 2
-    assert hasattr(revived['cancel_event'], 'set')   # rebuilt, not serialized
+    assert [p is not None for p in ocr_service.get_page_dicts(job["job_id"])] \
+        == [True, True]
+    pages = ocr_service.get_pages(job["job_id"])
+    assert pages[0]["blocks"][0]["text"] == "edited text"
+    # The regenerated hOCR carries the edited text for finalize.
+    hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+            "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
+    assert "edited text" in hocr
 
 
 def test_restore_normalizes_crashed_status(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    job = ocr_service.create_job('doc.pdf', b'%PDF-fake-bytes')
-    ocr_service._set(job, status='running', num_pages=5)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], status='running', num_pages=5)
     _simulate_restart()
     ocr_service.restore_jobs()
-    assert ocr_service.get_job(job["id"])["status"] == "stopped"
+    assert ocr_service.get_job(job["job_id"])["status"] == "stopped"
 
 
-def test_restore_skips_corrupt_and_missing_pdf(monkeypatch, tmp_path):
+def test_restore_skips_corrupt_state(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    ok = ocr_service.create_job('ok.pdf', b'%PDF-fake-bytes')
+    ok = ocr_service.create_job('ok.pdf', _real_pdf())
 
-    # corrupt state
     bad_dir = tmp_path / 'work' / 'bad000000000'
     bad_dir.mkdir(parents=True)
     (bad_dir / 'job.json').write_text('{not valid json', encoding='utf-8')
-    # valid state but the source PDF vanished
-    gone_dir = tmp_path / 'work' / 'bad000000001'
-    gone_dir.mkdir(parents=True)
-    (gone_dir / 'job.json').write_text(json.dumps({
-        'id': 'bad000000001', 'filename': 'gone.pdf',
-        'pdf_path': str(gone_dir / 'gone.pdf'),
-        'img_dir': str(gone_dir), 'pages': [], 'status': 'done',
-    }), encoding='utf-8')
 
     _simulate_restart()
     assert ocr_service.restore_jobs() == 1
-    assert ocr_service.get_job(ok['id']) is not None
+    assert ocr_service.get_job(ok['job_id']) is not None
     assert ocr_service.get_job('bad000000000') is None
-    assert ocr_service.get_job('bad000000001') is None
 
 
 def test_clear_job_removes_state_file(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    job = ocr_service.create_job('doc.pdf', b'%PDF-fake-bytes')
-    state = ocr_service._state_path(job)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    state = _state_path(job)
     assert state.exists()
-    assert ocr_service.clear_job(job['id']) is True
+    assert ocr_service.clear_job(job['job_id']) is True
     assert not state.exists() and not state.parent.exists()
-    assert ocr_service.get_job(job['id']) is None
+    assert ocr_service.get_job(job['job_id']) is None
 
 
-def test_embed_persists_embedded_path(monkeypatch, tmp_path):
+def test_missing_sidecars_read_as_not_done(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-    doc = fitz.open()
-    page = doc.new_page(width=200, height=200)
-    page.insert_text(fitz.Point(20, 100), 'persist me')
-    pdf_bytes = doc.tobytes()
-    doc.close()
-
-    job = ocr_service.create_job('real.pdf', pdf_bytes)
-    ocr_page = OcrPage(page_index=0, width=200, height=200, blocks=[
-        OcrBlock(kind='text', bbox=[10, 90, 100, 110], text='persist me')])
-    out_path, stats = ocr_service.embed_job(job['id'], [ocr_page.to_dict()])
-    assert out_path.exists()
-
-    data = json.loads(_state_of(job))
-    assert data['status'] == 'embedded'
-    assert data['embedded_path'] == str(out_path)
-    assert data['thumb_path'] and __import__('pathlib').Path(data['thumb_path']).exists()
-    _simulate_restart()
-    ocr_service.restore_jobs()
-    revived = ocr_service.get_job(job['id'])
-    assert revived['status'] == 'embedded'
-    assert revived['embedded_path'] == str(out_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=3)
+    _write_sidecar(job, 2)
+    pages = ocr_service.get_page_dicts(job["job_id"])
+    assert [p is not None for p in pages] == [False, True, False]
+    assert ocr_service.get_pages(job["job_id"])[0]["page_index"] == 1
 
 
-def test_snapshot_keys_exclude_runtime_objects():
-    job = {'id': 'x', 'pdf_path': 'p', 'img_dir': 'd', 'pages': [],
-           'status': 'done', 'cancel_event': object()}
-    snap = ocr_service._snapshot(job)
-    assert 'cancel_event' not in snap
-    assert snap['id'] == 'x' and snap['status'] == 'done'
-
-
-def test_batched_pages_split_on_request_failure(monkeypatch, tmp_path):
-    """A failing multi-page request (e.g. a read timeout) is split in half
-    and retried; only single pages that still fail are marked failed."""
-    import threading
-    from collections import deque
-    from backend.models import OcrBlock, OcrPage as OP
-
+def test_ensure_hocr_files_regenerates_missing_hocr(monkeypatch, tmp_path):
     _use_tmp_dirs(monkeypatch, tmp_path)
-
-    class _FakeAdapter:
-        max_batch_pages = 4
-        def __init__(self):
-            self.calls = 0
-        def recognize_pages(self, specs):
-            self.calls += 1
-            if len(specs) > 1:
-                raise RuntimeError("simulated batch timeout")
-            s = specs[0]
-            return [OP(page_index=s.page_index, width=s.width, height=s.height,
-                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
-                                        text=f"p{s.page_index}")])]
-
-    adapter = _FakeAdapter()
-    job = {"id": "split-j", "current": 0, "pages": [],
-           "status": "running", "adapter": "unlimited",
-           "img_dir": str(tmp_path / "work" / "split-j"),
-           "num_pages": 3, "error": None}
-    ocr_service._JOBS[job["id"]] = job
-    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
-    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
-             for i in range(3)]
-    ocr_service._ocr_pages_batched(
-        job, job["id"], adapter, specs, 3, threading.Event(), None)
-    assert adapter.calls >= 5  # 3+2 then three singles
-    assert all(job["pages"][i] is not None for i in range(3))
-    assert job["pages"][0]["blocks"][0]["text"] == "p0"
-    assert job["pages"][2]["blocks"][0]["text"] == "p2"
-    assert job["current"] == 3
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    _write_sidecar(job, 1, "sidecar only")
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    assert not (hdir / "000001_ocr_hocr.hocr").exists()
+    ocr_service._ensure_hocr_files(job["job_id"])
+    hocr = (hdir / "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
+    assert "sidecar only" in hocr
 
 
-def test_batched_pages_run_in_parallel(monkeypatch, tmp_path):
-    """concurrency>1 must run several multi-page batches at the same time."""
-    import threading
-    import time
-    from collections import deque
-    from backend.models import OcrBlock, OcrPage as OP
-
+def test_list_jobs_carries_pre_rebuild_aliases(monkeypatch, tmp_path):
+    """The WebUI reads `id` / `current` / `total` / `created` from /api/jobs;
+    dropping those aliases breaks every job card (stream/clear 404 on
+    `undefined`).  Both field-name sets must be present."""
     _use_tmp_dirs(monkeypatch, tmp_path)
-    inflight: list = [0]
-    peak: list = [0]
-    lock = threading.Lock()
-
-    class _A:
-        max_batch_pages = 2
-        def recognize_pages(self, specs):
-            with lock:
-                inflight[0] += 1
-                peak[0] = max(peak[0], inflight[0])
-            try:
-                time.sleep(0.2)
-            finally:
-                with lock:
-                    inflight[0] -= 1
-            return [OP(page_index=s.page_index, width=s.width, height=s.height,
-                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
-                                        text=f"p{s.page_index}")])
-                    for s in specs]
-
-    adapter = _A()
-    job = {"id": "par-b", "current": 0, "pages": [],
-           "status": "running", "adapter": "unlimited",
-           "img_dir": str(tmp_path / "work" / "par-b"),
-           "num_pages": 4, "error": None}
-    ocr_service._JOBS[job["id"]] = job
-    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
-    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
-             for i in range(4)]
-    ocr_service._ocr_pages_batched(job, job["id"], adapter, specs, 4,
-                                   threading.Event(), None, concurrency=2)
-    assert peak[0] >= 2, f"expected overlapping batches, peak concurrency={peak[0]}"
-    assert all(job["pages"][i] is not None for i in range(4))
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    try:
+        listed = {j["job_id"]: j for j in ocr_service.list_jobs()}
+        entry = listed[job["job_id"]]
+        for old, new in (("id", "job_id"), ("current", "pages_done"),
+                         ("total", "num_pages")):
+            assert entry[old] == entry[new]
+        assert isinstance(entry["created"], (int, float)) and entry["created"] > 0
+        assert entry["status"] == "queued"
+        assert entry["has_embedded"] is False
+    finally:
+        ocr_service.clear_job(job["job_id"])
 
 
-def test_batched_inflight_cap_clamps_batch_size(monkeypatch, tmp_path):
-    """batch x concurrency beyond max_inflight_pages clamps the batch size
-    (parallelism kept) instead of letting a huge number of pages go in flight."""
-    import threading
-    from collections import deque
-    from backend.models import OcrBlock, OcrPage as OP
-
+def test_run_ocr_page_selection_only_runs_remaining(monkeypatch, tmp_path):
+    """Retry remaining: run_ocr passes the not-done pages to ocrmypdf as a
+    comma-separated `pages` list; an empty selection marks the job done
+    without re-running OCR."""
+    import json as _json
     _use_tmp_dirs(monkeypatch, tmp_path)
-    monkeypatch.setattr("backend.config.resolve",
-                        lambda: {"max_inflight_pages": "4"})
-    sizes: list = []
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=3)
+    _write_sidecar(job, 1, "page one")
+    _write_sidecar(job, 2, "page two")
 
-    class _A:
-        max_batch_pages = 10
-        def recognize_pages(self, specs):
-            sizes.append(len(specs))
-            return [OP(page_index=s.page_index, width=s.width, height=s.height,
-                       blocks=[OcrBlock(kind="text", bbox=[0, 0, 10, 10],
-                                        text="x")])
-                    for s in specs]
+    captured = {}
 
-    adapter = _A()
-    job = {"id": "cap-b", "current": 0, "pages": [],
-           "status": "running", "adapter": "unlimited",
-           "img_dir": str(tmp_path / "work" / "cap-b"),
-           "num_pages": 5, "error": None}
-    ocr_service._JOBS[job["id"]] = job
-    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
-    specs = [{"img_path": "x.png", "w": 100, "h": 100, "page_index": i}
-             for i in range(5)]
-    ocr_service._ocr_pages_batched(job, job["id"], adapter, specs, 5,
-                                   threading.Event(), None, concurrency=2)
-    # batch=10 x workers=2 = 20 > 4 -> batch clamped to 4//2 = 2 pages:
-    # groups of [2, 2, 1]
-    assert sorted(sizes) == [1, 2, 2]
-    assert all(job["pages"][i] is not None for i in range(5))
+    def fake_pipeline(pdf, folder, **kwargs):
+        captured["pages"] = kwargs.get("pages")
+
+    import ocrmypdf.api
+    monkeypatch.setattr(ocrmypdf.api, "_pdf_to_hocr", fake_pipeline)
+
+    # Selection [3]: page 3 is the only one without a result.
+    ocr_service.run_ocr(job["job_id"], {"_page_selection": [3]})
+    assert captured["pages"] == "3"
+    assert ocr_service.get_job(job["job_id"])["status"] == "done"
+    assert ocr_service.get_job(job["job_id"])["pages_done"] == 2
+
+    # Empty selection: everything done -> no OCR run, job marked done.
+    captured.clear()
+    ocr_service.run_ocr(job["job_id"], {"_page_selection": []})
+    assert "pages" not in captured
+    assert ocr_service.get_job(job["job_id"])["status"] == "done"
+    ocr_service.clear_job(job["job_id"])
+
+
+def test_embedded_path_named_after_source(monkeypatch, tmp_path):
+    """The finalize output is `<source stem>_embedded.pdf` in the job dir —
+    never a hardcoded name (same-named uploads must not overwrite each
+    other), and hostile characters are sanitized away."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('My Report: v2?.pdf', _real_pdf())
+    path = ocr_service._embedded_path(job)
+    assert path.parent == ocr_service._job_dir(job['job_id'])
+    assert path.name == 'My Report_ v2__embedded.pdf'
+    # A previous result of the same job is disambiguated, not overwritten.
+    path.write_bytes(b'%PDF-old-result')
+    path2 = ocr_service._embedded_path(job)
+    assert path2.name == 'My Report_ v2__embedded_' + job['job_id'] + '.pdf'
+    ocr_service.clear_job(job['job_id'])
+
+
+def _write_hocr_only(job, page_no: int, text: str = "tesseract line"):
+    """Drop ONLY an hOCR file (as ocrmypdf's built-in Tesseract would — no
+    block sidecar), with page geometry but no scan_res."""
+    hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+            f"{page_no:06d}_ocr_hocr.hocr")
+    hocr.parent.mkdir(parents=True, exist_ok=True)
+    hocr.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n<body>\n'
+        f"<div class='ocr_page' title='bbox 0 0 1000 2000; ppageno {page_no - 1}'>\n"
+        " <p class='ocr_par' title='bbox 100 100 900 200'>\n"
+        f"  <span class='ocr_line' title='bbox 100 100 900 200'>"
+        f"<span class='ocrx_word' title='bbox 100 100 900 200'>{text}</span></span>\n"
+        " </p>\n"
+        "</div>\n</body>\n</html>\n",
+        encoding="utf-8")
+    return hocr
+
+
+def test_tesseract_hocr_only_page_is_editable_and_embeddable(monkeypatch, tmp_path):
+    """An engine that writes only hOCR (ocrmypdf's built-in Tesseract) must
+    still give the WebUI editable pages and a passing embed guard: the page
+    store derives the sidecar from the hOCR via ocrmypdf's own parser."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=1)
+    _write_hocr_only(job, 1, "recognized by tesseract")
+
+    # The hOCR-only page counts as a result and is editable.
+    assert ocr_service._embedded_path(job) is not None
+    pages = ocr_service.get_pages(job["job_id"])
+    assert len(pages) == 1
+    assert pages[0]["blocks"][0]["text"] == "recognized by tesseract"
+
+    # An edit works on the derived page and regenerates the hOCR.
+    ocr_service.update_page(job["job_id"], 0, {
+        "blocks": [{"kind": "text", "bbox": [100, 100, 900, 200],
+                    "text": "edited by user"}]})
+    hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+            "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
+    assert "edited by user" in hocr
+    sidecar = (ocr_service._job_dir(job["job_id"]) / "hocr" /
+               "000001_ocr_hocr.blocks.json")
+    assert sidecar.exists()  # derived sidecar now persisted
+
+    # The embed guard passes for an hOCR-only job.
+    assert ocr_service.page_store.has_results(
+        ocr_service._job_dir(job["job_id"]) / "hocr") is True
+    ocr_service.clear_job(job["job_id"])
+
+
+def test_retry_remaining_counts_hocr_only_pages(monkeypatch, tmp_path):
+    """Pages that only have an hOCR file count as done for the retry-remaining
+    selection (engine-agnostic progress)."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=2)
+    _write_hocr_only(job, 1)
+    statuses = [bool(p) for p in ocr_service.get_page_dicts(job["job_id"])]
+    assert statuses == [True, False]
+    from backend.ocr_service import select_pages
+    assert select_pages(2, statuses) == [2]
+    ocr_service.clear_job(job["job_id"])
+
+
+def test_run_ocr_selection_preserves_other_engines_hocr(monkeypatch, tmp_path):
+    """Retry remaining with pages=2,3 must re-OCR ONLY pages 2 and 3: pages
+    1/4/5 keep their existing (tesseract) hOCR files untouched."""
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', _real_pdf())
+    ocr_service._set(job["job_id"], num_pages=5)
+    # pages 1,4,5 already have tesseract hOCR (no sidecar)
+    _write_hocr_only(job, 1, "tess p1")
+    _write_hocr_only(job, 4, "tess p4")
+    _write_hocr_only(job, 5, "tess p5")
+
+    captured = {}
+
+    def fake_pipeline(pdf, folder, **kwargs):
+        captured["pages"] = kwargs.get("pages")
+        captured["engine"] = kwargs.get("ocr_engine")
+
+    import ocrmypdf.api
+    monkeypatch.setattr(ocrmypdf.api, "_pdf_to_hocr", fake_pipeline)
+
+    ocr_service.run_ocr(job["job_id"], {
+        "ocr_engine": "unlimited", "_force": False,
+        "_page_range": (2, 3), "_page_selection": [2, 3]})
+    assert captured["pages"] == "2,3"
+    assert captured["engine"] == "unlimited"
+    # The untouched pages keep their hOCR (not deleted by the run).
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    for n in (1, 4, 5):
+        assert (hdir / f"{n:06d}_ocr_hocr.hocr").exists()
+    ocr_service.clear_job(job["job_id"])

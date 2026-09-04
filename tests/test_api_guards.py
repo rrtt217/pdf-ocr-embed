@@ -29,16 +29,33 @@ def _mk_job(tmp_path, monkeypatch, status="stopped", num_pages=2):
     """A real job in the registry with tmp dirs (no filesystem side effects)."""
     monkeypatch.setattr(ocr_service, 'WORK_DIR', tmp_path / 'work')
     monkeypatch.setattr(ocr_service, 'UPLOAD_DIR', tmp_path / 'uploads')
-    job = {"id": "guard-1", "current": 0, "pages": [],
-           "status": status, "adapter": "unlimited",
+    job = {"job_id": "guard-1", "current": 0,
+           "status": status,
            "filename": "guard-1.pdf",
-           "img_dir": str(tmp_path / "work" / "guard-1"),
+           "hocr_dir": str(tmp_path / "work" / "guard-1" / "hocr"),
+           "previews_dir": str(tmp_path / "work" / "guard-1" / "previews"),
            "pdf_path": str(tmp_path / "uploads" / "guard-1.pdf"),
-           "num_pages": num_pages, "error": None,
-           "cancel_event": __import__("threading").Event()}
-    ocr_service._JOBS[job["id"]] = job
-    ocr_service._STREAMS[job["id"]] = deque(maxlen=1000)
+           "num_pages": num_pages, "pages_done": 0, "error": "",
+           "embedded_path": "", "created_at": ""}
+    ocr_service._JOBS[job["job_id"]] = job
+    ocr_service._STREAMS[job["job_id"]] = deque(maxlen=1000)
     return job
+
+
+def _write_sidecar(job, page_no: int):
+    """A block sidecar (as the plugin engine would leave) for one page."""
+    import json
+    from backend.ocrmypad import parser as parser_mod
+    sidecar = (Path(job["hocr_dir"]) / f"{page_no:06d}_ocr_hocr.blocks.json")
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    page = parser_mod.Page(
+        page_index=page_no - 1, width=1000, height=2000,
+        blocks=[parser_mod.Block(kind="text", bbox=[100, 100, 900, 200],
+                                 text="sidecar", lines=["sidecar"])],
+    )
+    sidecar.write_text(
+        json.dumps({"page": page.to_dict(), "dpi": 300.0}, ensure_ascii=False),
+        encoding="utf-8")
 
 
 # --- POST /api/pages/{job}/{i}: index bounds ---------------------------------
@@ -56,24 +73,31 @@ def test_update_page_rejects_out_of_range_index(client, monkeypatch, tmp_path):
     assert r.status_code == 400
 
 
-def test_update_page_rejects_negative_index(client, monkeypatch, tmp_path):
-    job = _mk_job(tmp_path, monkeypatch, num_pages=2)
-    ocr_service.update_page(job["id"], 0,
-                            {"page_index": 0, "width": 10, "height": 10,
-                             "blocks": []})
-    r = client.post("/api/pages/guard-1/-1", json={"page_index": -1})
+def test_update_page_rejects_missing_sidecar(client, monkeypatch, tmp_path):
+    _mk_job(tmp_path, monkeypatch, num_pages=2)
+    # A page without a block sidecar has no OCR result to edit -> 400.
+    r = client.post("/api/pages/guard-1/0",
+                    json={"blocks": [{"kind": "text", "bbox": [0, 0, 1, 1],
+                                      "text": "x"}]})
     assert r.status_code == 400
-    # pages[-1] must not have been overwritten by the request
-    assert job["pages"][-1]["page_index"] == 0
 
 
 def test_update_page_accepts_valid_index(client, monkeypatch, tmp_path):
-    _mk_job(tmp_path, monkeypatch, num_pages=2)
+    job = _mk_job(tmp_path, monkeypatch, num_pages=2)
+    _write_sidecar(job, 2)
     r = client.post("/api/pages/guard-1/1",
-                    json={"page_index": 1, "width": 10, "height": 10,
-                          "blocks": []})
+                    json={"blocks": [{"kind": "text", "bbox": [100, 100, 900, 200],
+                                      "text": "edited"}]})
     assert r.status_code == 200
     assert r.json()["ok"] is True
+    # The edit reached the sidecar.
+    stored = json_sidecar_text(job, 2)
+    assert "edited" in stored
+
+
+def json_sidecar_text(job, page_no: int) -> str:
+    return (Path(job["hocr_dir"]) /
+            f"{page_no:06d}_ocr_hocr.blocks.json").read_text(encoding="utf-8")
 
 
 # --- POST /api/embed/{job_id}: 404 for a missing job --------------------------
@@ -115,4 +139,35 @@ def test_retry_stopped_job_still_schedules(monkeypatch, tmp_path):
     pdf = Path(ocr_service._JOBS["guard-1"]["pdf_path"])
     pdf.parent.mkdir(parents=True, exist_ok=True)
     pdf.write_bytes(b"%PDF-fake")
+    # Stub the worker thread: run_ocr would call the real ocrmypdf pipeline
+    # on the fake PDF; we only assert that scheduling happened.
+    started = []
+    monkeypatch.setattr(ocr_service.threading, "Thread",
+                        lambda **kw: started.append(kw) or
+                        type("T", (), {"start": lambda self: None})())
     assert ocr_service.retry_job("guard-1") is True
+    assert started
+
+
+# --- POST /api/ocr/retry/{job_id}: precise 409 reasons -----------------------
+
+def test_retry_route_running_job_reports_running_not_missing_file(client,
+                                                                  monkeypatch,
+                                                                  tmp_path):
+    """A running job was previously refused with the misleading "missing file"
+    message even though its source PDF is on disk."""
+    _mk_job(tmp_path, monkeypatch, status="running")
+    r = client.post("/api/ocr/retry/guard-1", data={})
+    assert r.status_code == 409
+    assert "still running" in r.json()["detail"]
+    assert "missing" not in r.json()["detail"]
+
+
+def test_retry_route_missing_pdf_still_reports_missing_file(client,
+                                                            monkeypatch,
+                                                            tmp_path):
+    _mk_job(tmp_path, monkeypatch, status="stopped")
+    # Source PDF does not exist -> the "missing file" refusal remains accurate.
+    r = client.post("/api/ocr/retry/guard-1", data={})
+    assert r.status_code == 409
+    assert "missing source PDF" in r.json()["detail"]

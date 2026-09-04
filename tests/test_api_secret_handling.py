@@ -29,9 +29,7 @@ READ_ENDPOINTS = (
     "/api/health",
     "/api/logs?n=100",
     "/api/jobs",
-    "/api/cache",
     "/api/cleanup",
-    "/api/fonts",
 )
 
 
@@ -139,25 +137,26 @@ def test_ocr_error_message_is_redacted_before_frontend(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "ocr_config.toml")
     monkeypatch.setattr(config, "_saved", {})
     monkeypatch.setenv("OCR_API_KEY", ENV_SECRET)
+    # run_ocr persists job state — keep it out of the real work/ directory.
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
 
     job_id = "audit-secret-job"
-    img_dir = tmp_path / "work"
+    hocr_dir = tmp_path / "work" / job_id / "hocr"
+    hocr_dir.mkdir(parents=True, exist_ok=True)
     job = {
-        "id": job_id,
+        "job_id": job_id,
         "filename": "audit.pdf",
         "pdf_path": str(tmp_path / "audit.pdf"),
-        "img_dir": str(img_dir),
-        "pages": [],
+        "hocr_dir": str(hocr_dir),
+        "previews_dir": str(tmp_path / "work" / job_id / "previews"),
         "num_pages": 0,
+        "pages_done": 0,
         "current": 0,
-        "status": "uploaded",
-        "adapter": "unlimited",
-        "concurrency": 1,
-        "error": None,
-        "embedded_path": None,
-        "thumb_path": None,
-        "created": 0,
-        "cancel_event": threading.Event(),
+        "status": "queued",
+        "error": "",
+        "embedded_path": "",
+        "created_at": "",
     }
     with ocr_service._jobs_lock:
         ocr_service._JOBS[job_id] = job
@@ -167,10 +166,11 @@ def test_ocr_error_message_is_redacted_before_frontend(monkeypatch, tmp_path):
     def boom(*_args, **_kwargs):
         raise RuntimeError(f"provider rejected key {ENV_SECRET}")
 
-    monkeypatch.setattr(ocr_service, "_make_adapter", boom)
+    import ocrmypdf.api  # the module ocr_service imports the pipeline from
+    monkeypatch.setattr(ocrmypdf.api, "_pdf_to_hocr", boom)
 
     try:
-        ocr_service.run_ocr(job_id, "unlimited")
+        ocr_service.run_ocr(job_id)
         assert job["error"] is not None
         assert ENV_SECRET not in job["error"]
         assert "[REDACTED]" in job["error"]

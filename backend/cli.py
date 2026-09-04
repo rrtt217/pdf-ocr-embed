@@ -1,9 +1,9 @@
 """Headless CLI entry point: ``python -m backend.cli``.
 
-Reuses the SAME backend logic as the WebUI (``backend.ocr_service`` and
-``backend.pdf_processing``) with no HTTP server running.  It reads a PDF from
-disk, OCRs its pages (optionally a selected page range) and embeds an invisible
-searchable text layer into ``<stem>_embedded_<id>.pdf`` under ``output/``.
+Reuses the SAME backend logic as the WebUI (``backend.ocr_service``) with no
+HTTP server running.  It reads a PDF from disk, runs OCRmyPDF with the
+``unlimited`` plugin engine (optionally a selected page range), and produces
+``<stem>_embedded_<id>.pdf`` under ``output/``.
 
 Config is resolved through ``backend.config.resolve()`` — no direct
 ``os.environ`` reads, no hardcoded keys.
@@ -14,25 +14,17 @@ import argparse
 import json
 import logging
 import sys
+import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from backend import ocr_service, pdf_processing
-from backend.sources.base import UnavailableError
-from backend.sources import factory as factory_mod
+from backend.errors import UnavailableError
+from backend.logging_config import setup_logging
 
 log = logging.getLogger(__name__)
 
-# The backend hard invariant that max_tokens must stay below 32768 (and be > 0).
-MAX_TOKENS_LIMIT = 32768
-
-# Default adapter mirrors the WebUI's default ("unlimited-ocr" / "unlimited").
-DEFAULT_ADAPTER = "unlimited"
-
-
-def _page_count(pdf_path: str) -> int:
-    """Total number of pages in the source PDF (via the backend's own path)."""
-    return pdf_processing.page_count(pdf_path)
+DEFAULT_ENGINE = "unlimited"
 
 
 def parse_pages(spec: Optional[str], num_pages: int) -> List[int]:
@@ -76,226 +68,106 @@ def parse_pages(spec: Optional[str], num_pages: int) -> List[int]:
     return sorted({p - 1 for p in clamped})
 
 
-def _page_text(page_dict: dict) -> str:
-    """Flatten one stored page dict into a plain-text string for stdout."""
-    lines = []
-    for block in page_dict.get("blocks", []):
-        text = block.get("text", "") or ""
-        text = text.strip()
-        if text:
-            lines.append(text)
-    return "\n".join(lines)
+def _pages_arg(pages_0based: List[int], num_pages: int) -> Optional[str]:
+    """Format a 0-based index list as an ocrmypdf 1-based ``pages`` string."""
+    if not pages_0based or len(pages_0based) == num_pages:
+        return None  # all pages: let ocrmypdf run the full document
+    return ",".join(str(i + 1) for i in pages_0based)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def main(argv: Optional[List[str]] = None) -> int:
+    setup_logging()
     parser = argparse.ArgumentParser(
         prog="python -m backend.cli",
-        description="Headless OCR + invisible-text embedding, reusing the "
-                    "backend logic (backend.ocr_service / backend.pdf_processing).",
-        epilog=(
-            "Page selection happens in the CLI itself: create_job() then run_ocr() "
-            "with only_missing=True, pre-filling skipped pages so only the "
-            "requested range is rendered and OCR'd."
-        ),
-    )
-    parser.add_argument("in_pdf", metavar="in.pdf",
-                        help="Path to the source (scanned) PDF.")
-    parser.add_argument("--adapter", default=DEFAULT_ADAPTER,
-                        help=f"OCR adapter name (default: {DEFAULT_ADAPTER}). "
-                             f"Use '--adapter list' to print available adapters.")
-    parser.add_argument("--pages", default=None, metavar="SPEC",
-                        help="1-based page range to OCR, e.g. '1-20', '1,3,5-7', "
-                             "'1-' or '-5'. Omitting embeds all pages.")
-    parser.add_argument("--concurrency", type=int, default=1, metavar="N",
-                        help="Number of parallel OCR workers (default: 1).")
-    parser.add_argument("--out", default="output", metavar="DIR",
-                        help="Output directory for the embedded PDF (default: output/).")
-    parser.add_argument("--no-embed", action="store_true",
-                        help="OCR only: print per-page recognized text to stdout "
-                             "instead of embedding.")
-    parser.add_argument("--max-tokens", type=int, default=None, metavar="N",
-                        help=f"Max completion tokens per page (0 < N < {MAX_TOKENS_LIMIT}; "
-                             f"applies to API adapters; raise it if dense pages hit "
-                             f"the 'OCR output truncated' error).")
-    parser.add_argument("--json", action="store_true",
-                        help="Print a final machine-readable JSON summary to stdout.")
-    return parser
+        description="OCR a (scanned) PDF with OCRmyPDF + the unlimited "
+                    "plugin engine; embeds a searchable invisible text layer.")
+    parser.add_argument("input", help="input PDF path")
+    parser.add_argument("-o", "--output",
+                        help="output PDF path (default: output/<stem>_embedded_<id>.pdf)")
+    parser.add_argument("--pages", default=None,
+                        help="1-based pages: '1', '1,3,5', '1-3', open '1-'")
+    parser.add_argument("--engine", default=DEFAULT_ENGINE,
+                        help=f"ocr_engine: {DEFAULT_ENGINE} (default) | tesseract | none")
+    parser.add_argument("--jobs", type=int, default=None,
+                        help="worker count (default: config ocrmypdf_jobs, else auto)")
+    parser.add_argument("--sidecar-text", action="store_true",
+                        help="print the recognized text to stdout as JSON pages")
+    args = parser.parse_args(argv)
 
-
-def _validate_args(args: argparse.Namespace) -> None:
-    if args.concurrency < 1:
-        raise ValueError(f"--concurrency must be >= 1 (got {args.concurrency})")
-    if args.max_tokens is not None and not (0 < args.max_tokens < MAX_TOKENS_LIMIT):
-        raise ValueError(
-            f"--max-tokens must satisfy 0 < N < {MAX_TOKENS_LIMIT} "
-            f"(got {args.max_tokens})")
-
-
-def _run(args: argparse.Namespace) -> int:
-    in_pdf = str(args.in_pdf)
-
-    # ``--adapter list`` prints the registry and exits before any file work.
-    if args.adapter.strip().lower() == "list":
-        for name in sorted(factory_mod._REGISTRY):
-            print(name)
-        return 0
-
-    if not Path(in_pdf).is_file():
-        print(f"error: input PDF not found: {in_pdf}", file=sys.stderr)
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"error: input not found: {input_path}", file=sys.stderr)
         return 1
-
-    _validate_args(args)
-
-    num_pages = _page_count(in_pdf)
-    if num_pages <= 0:
-        print(f"error: {in_pdf} has no pages", file=sys.stderr)
-        return 1
-
-    requested = parse_pages(args.pages, num_pages)
-    if not requested:
-        print("error: no pages selected after parsing "
-              f"--pages {args.pages!r}", file=sys.stderr)
-        return 1
-    wanted = set(requested)
-
-    # Robustly attempt the adapter up front so a missing engine / bad config
-    # fails fast with a clear message before we start rendering pages.
     try:
-        factory_mod.get_adapter(args.adapter)
-    except UnavailableError as exc:
-        print(f"error: adapter '{args.adapter}' unavailable: {exc}",
-              file=sys.stderr)
+        num_pages = pdf_processing.page_count(str(input_path))
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: cannot open PDF: {exc}", file=sys.stderr)
         return 1
+
+    try:
+        pages_0based = parse_pages(args.pages, num_pages)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    try:
-        with open(in_pdf, "rb") as fh:
-            file_bytes = fh.read()
-        job = ocr_service.create_job(Path(in_pdf).name, file_bytes)
-    except OSError as exc:
-        print(f"error: cannot read {in_pdf}: {exc}", file=sys.stderr)
-        return 1
-    job_id = job["id"]
-    log.info("job %s: %s, %d page(s), OCR pages %s",
-             job_id, Path(in_pdf).name, num_pages,
-             [i + 1 for i in sorted(wanted)])
+    out_dir = Path(__file__).resolve().parent.parent / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = (Path(args.output) if args.output else
+                   out_dir / f"{input_path.stem}_embedded_{uuid.uuid4().hex[:8]}.pdf")
 
-    # Restrict OCR to the requested pages before it runs: pre-fill every
-    # non-requested page with a placeholder so run_ocr(only_missing=True)
-    # skips them (they are never rendered nor sent to the engine).
-    for i in range(num_pages):
-        if i not in wanted:
-            ocr_service.update_page(job_id, i, {"_headless_skip": True})
+    import ocrmypdf.api
+    overrides = {"ocr_engine": args.engine}
+    if args.jobs:
+        overrides["jobs"] = args.jobs
+    pages_arg = _pages_arg(pages_0based, num_pages)
+
+    work_dir = out_dir.parent / "work" / f"cli-{uuid.uuid4().hex[:8]}"
+    hocr_dir = work_dir / "hocr"
+    hocr_dir.mkdir(parents=True, exist_ok=True)
+
+    # The engine plugin reads host-injected settings, not backend.config:
+    # push the effective config in before the pipeline runs.
+    from backend.config import resolve as resolve_config
+    from backend.ocrmypad import settings as ocrmypad_settings
+    ocrmypad_settings.configure(resolve_config())
 
     try:
-        extra_cfg = {"max_tokens": args.max_tokens} if args.max_tokens else None
-        ocr_service.run_ocr(job_id, args.adapter, extra_cfg=extra_cfg,
-                            concurrency=args.concurrency, only_missing=True)
+        # Phase 1: OCR -> per-page hOCR + block sidecars (plugin engine runs).
+        ocrmypdf.api._pdf_to_hocr(
+            input_path, hocr_dir,
+            plugins=[ocr_service.plugin_path()],
+            **ocr_service._ocrmypdf_options(**overrides),
+            **({"pages": pages_arg} if pages_arg else {}),
+        )
+        # Phase 2: (possibly edited) hOCR -> final PDF with the text layer.
+        ocrmypdf.api._hocr_to_ocr_pdf(
+            hocr_dir, output_path,
+            use_threads=True,
+        )
     except UnavailableError as exc:
-        print(f"error: adapter '{args.adapter}' unavailable: {exc}",
-              file=sys.stderr)
-        ocr_service.clear_job(job_id)
-        return 1
-    except RuntimeError as exc:
-        log.debug("run_ocr raised", exc_info=True)
-        ocr_service.clear_job(job_id)
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001
-        log.exception("job %s: OCR failed", job_id)
-        err = job.get("error") or str(exc)
-        print(f"error: OCR failed: {err}", file=sys.stderr)
-        ocr_service.clear_job(job_id)
+        from backend.config import redact_secrets
+        print(f"error: {redact_secrets(str(exc))}", file=sys.stderr)
         return 1
 
-    if job.get("status") == "error":
-        print(f"error: OCR failed: {job.get('error')}", file=sys.stderr)
-        ocr_service.clear_job(job_id)
-        return 1
-    if job.get("status") == "stopped":
-        print("error: OCR stopped before completion", file=sys.stderr)
-        ocr_service.clear_job(job_id)
+    if not output_path.exists():
+        print("error: OCR produced no output", file=sys.stderr)
         return 1
 
-    # Pull per-page results only for the requested range.
-    all_pages = ocr_service.get_pages(job_id)
-    ocr_pages = [all_pages[i] for i in sorted(wanted)
-                 if i < len(all_pages) and all_pages[i] is not None]
-    missing = sorted(i for i in wanted
-                     if i >= len(all_pages) or all_pages[i] is None)
-
-    if missing:
-        print(f"warning: {len(missing)} requested page(s) produced no text "
-              f"(skipped): {[i + 1 for i in missing]}", file=sys.stderr)
-
-    if args.no_embed:
-        for i in sorted(wanted):
-            if i < len(all_pages) and all_pages[i] is not None:
-                text = _page_text(all_pages[i])
-                print(f"===== Page {i + 1} =====")
-                print(text)
-        if args.json:
-            _dump_summary(job, "no_embed", None, sorted(wanted), missing)
-        return 0
-
-    # Embed only the requested pages that actually produced OCR results.
-    if not ocr_pages:
-        print("error: no completed pages to embed (all requested pages failed)",
-              file=sys.stderr)
-        ocr_service.clear_job(job_id)
-        return 1
-
-    out_dir = Path(args.out)
-    try:
-        out_file, img_stats = ocr_service.embed_job(job_id, ocr_pages,
-                                                    out_dir=out_dir)
-    except Exception as exc:  # noqa: BLE001
-        log.exception("job %s: embed failed", job_id)
-        print(f"error: embedding failed: {exc}", file=sys.stderr)
-        ocr_service.clear_job(job_id)
-        return 1
-
-    print(f"embedded: {out_file}")
-    if args.json:
-        _dump_summary(job, "embedded", str(out_file), sorted(wanted), missing)
-
+    print(f"ok: {output_path}")
+    if args.sidecar_text:
+        pages = []
+        for sidecar in sorted(hocr_dir.glob("*_ocr_hocr.blocks.json")):
+            try:
+                data = json.loads(sidecar.read_text(encoding="utf-8"))
+                pages.append(data.get("page") or data)
+            except (OSError, ValueError):
+                continue
+        print(json.dumps(pages, ensure_ascii=False))
     return 0
 
 
-def _dump_summary(job: dict, mode: str, out_file: Optional[str],
-                  requested: List[int], missing: List[int]) -> None:
-    summary = {
-        "job_id": job.get("id"),
-        "filename": job.get("filename"),
-        "adapter": job.get("adapter"),
-        "mode": mode,
-        "status": job.get("status"),
-        "requested_pages": [i + 1 for i in requested],
-        "missing_pages": [i + 1 for i in missing],
-        "output": out_file,
-    }
-    print(json.dumps(summary, ensure_ascii=False))
-    log.info("summary: %s", summary)
-
-
-def main(argv: Optional[list] = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        return _run(args)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-
-
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("\naborted by user", file=sys.stderr)
-        raise SystemExit(130)
+    raise SystemExit(main())

@@ -54,13 +54,13 @@
           <select id="adapter">
             <option value="unlimited" data-i18n="upload.engine.unlimited">Unlimited OCR (API)</option>
             <option value="tesseract" data-i18n="upload.engine.tesseract">Tesseract (local)</option>
-            <option value="generic_openai" data-i18n="upload.engine.generic">Generic OpenAI (API)</option>
+            <option value="none" data-i18n="upload.engine.none">No OCR</option>
           </select>
         </label>
-        <label class="inline-label" id="tess-lang-row"><span data-i18n="upload.lang">Tesseract language</span>
-          <input id="tess-lang" type="text" placeholder="chi_sim" />
+        <label class="inline-label" id="tess-lang-row"><span data-i18n="upload.lang">OCR language</span>
+          <input id="tess-lang" type="text" placeholder="eng" />
         </label>
-        <label class="inline-label"><span data-i18n="upload.concurrency">Parallel OCR pages</span>
+        <label class="inline-label"><span data-i18n="upload.concurrency">OCR worker count</span>
           <input id="concurrency" type="number" min="1" max="32" value="1" />
         </label>
         <label class="inline-label"><span data-i18n="upload.pageStart">Page start</span>
@@ -131,41 +131,29 @@
         </div>
       </div>
       <div class="embed-bar">
-        <label class="inline-label" data-i18n-title="workspace.embedFontTitle"><span data-i18n="workspace.embedFont">Embed font</span>
-          <select id="embed-font">
-            <option value="" data-i18n="workspace.autoFont">Auto (default)</option>
-          </select>
-        </label>
         <details class="embed-opts" id="embed-opts">
           <summary data-i18n="workspace.outputOptions">Output options</summary>
           <div class="embed-opts-grid">
-            <label class="inline-label"><span data-i18n="workspace.imgMode">Image mode</span>
-              <select id="img-mode">
-                <option value="none" data-i18n="workspace.imgMode.none">Keep original</option>
-                <option value="jpeg" data-i18n="workspace.imgMode.jpeg">Recompress JPEG</option>
-                <option value="gray-jpeg" data-i18n="workspace.imgMode.grayjpeg">Grayscale JPEG</option>
+            <label class="inline-label"><span data-i18n="workspace.optimize">Optimize</span>
+              <select id="opt-optimize">
+                <option value="0" data-i18n="workspace.optimize.none">None</option>
+                <option value="1" data-i18n="workspace.optimize.lossless">Lossless</option>
+                <option value="2" data-i18n="workspace.optimize.lossy">Lossy</option>
+                <option value="3" data-i18n="workspace.optimize.max">Maximum</option>
               </select>
             </label>
-            <label class="inline-label"><span data-i18n="workspace.imgQuality">JPEG quality</span>
-              <input id="img-quality" type="number" min="20" max="100" step="5" value="75" /></label>
-            <label class="inline-label"><span data-i18n="workspace.imgDownscale">Downscale</span>
-              <select id="img-downscale">
-                <option value="" data-i18n="workspace.imgDownscale.none">None</option>
-                <option value="2" data-i18n="workspace.imgDownscale.half">Half</option>
-                <option value="4" data-i18n="workspace.imgDownscale.quarter">Quarter</option>
+            <label class="inline-label"><span data-i18n="workspace.outputType">Output type</span>
+              <select id="opt-output-type">
+                <option value="pdf" data-i18n="workspace.outputType.pdf">PDF</option>
+                <option value="pdfa" data-i18n="workspace.outputType.pdfa">PDF/A</option>
               </select>
             </label>
-            <label class="inline-check"><input id="opt-linearize" type="checkbox" />
-              <span data-i18n="workspace.linearize">Fast web view (linearize)</span></label>
           </div>
         </details>
-        <button id="btn-preview" class="small" data-i18n="workspace.previewOverlay" data-i18n-title="workspace.previewOverlayTitle">Preview overlay</button>
         <button id="btn-embed" class="primary" disabled data-i18n="workspace.embed" data-i18n-title="workspace.embedTitle">Embed invisible text</button>
         <button id="btn-validate" class="small" disabled data-i18n="workspace.validate" data-i18n-title="workspace.validateTitle">Validate</button>
         <a id="download-link" class="hidden" download></a>
         <span id="embed-status"></span>
-        <span class="spacer"></span>
-        <button id="btn-dataset" class="small" data-i18n="workspace.downloadDataset" data-i18n-title="workspace.downloadDatasetTitle">Download dataset (JSON)</button>
       </div>
       <p class="embed-hint" id="embed-hint" data-i18n-html="workspace.hint"></p>
     </section>
@@ -206,19 +194,29 @@
       <label><span data-i18n="settings.apikey">API Key</span>
         <input id="set-apikey" type="password" placeholder="sk-… (masked if already set)" />
       </label>
-      <fieldset class="settings-group" id="preprocess-group">
-        <legend data-i18n="settings.preprocessTitle">OCR input preprocessing</legend>
-        <p class="hint" data-i18n-html="settings.preprocessHint"></p>
-        <label class="inline-check"><input id="set-preprocess-enabled" type="checkbox" />
-          <span data-i18n="settings.preprocessEnabled">Enable preprocessing</span></label>
-        <label class="inline-check"><input id="set-preprocess-grayscale" type="checkbox" />
-          <span data-i18n="settings.preprocessGrayscale">Grayscale</span></label>
-        <label class="inline-check"><input id="set-preprocess-denoise" type="checkbox" />
-          <span data-i18n="settings.preprocessDenoise">Denoise (median filter)</span></label>
-        <label class="inline-check"><input id="set-preprocess-contrast" type="checkbox" />
-          <span data-i18n="settings.preprocessContrast">Contrast stretch</span></label>
-        <label class="inline-check"><input id="set-preprocess-binarize" type="checkbox" />
-          <span data-i18n="settings.preprocessBinarize">Binarize (Otsu threshold)</span></label>
+      <fieldset class="settings-group" id="pipeline-group">
+        <legend data-i18n="settings.pipelineTitle">OCR pipeline (OCRmyPDF)</legend>
+        <label><span data-i18n="settings.ocrEngine">Engine</span>
+          <select id="set-ocr-engine">
+            <option value="unlimited" data-i18n="upload.engine.unlimited">Unlimited OCR (API)</option>
+            <option value="tesseract" data-i18n="upload.engine.tesseract">Tesseract (local)</option>
+            <option value="none" data-i18n="upload.engine.none">No OCR</option>
+          </select>
+        </label>
+        <label><span data-i18n="settings.ocrmypdfMode">Mode</span>
+          <select id="set-ocrmypdf-mode">
+            <option value="force" data-i18n="settings.mode.force">force-ocr (rasterize everything)</option>
+            <option value="skip" data-i18n="settings.mode.skip">skip-text (already-searchable pages)</option>
+            <option value="redo" data-i18n="settings.mode.redo">redo-ocr (replace existing text layer)</option>
+          </select>
+        </label>
+        <label><span data-i18n="settings.ocrmypdfLanguage">Language (Tesseract)</span>
+          <input id="set-ocrmypdf-language" type="text" placeholder="eng" />
+        </label>
+        <label class="inline-check"><input id="set-ocrmypdf-deskew" type="checkbox" />
+          <span data-i18n="settings.ocrmypdfDeskew">Deskew pages</span></label>
+        <label class="inline-check"><input id="set-ocrmypdf-clean" type="checkbox" />
+          <span data-i18n="settings.ocrmypdfClean">Clean pages (needs unpaper)</span></label>
       </fieldset>
       <div class="modal-actions">
         <button id="btn-settings-save" class="primary" data-i18n="settings.save">Save</button>
@@ -246,17 +244,6 @@
         <button id="btn-cleanup-preview" data-i18n="cleanup.preview">Preview</button>
         <button id="btn-cleanup-run" class="primary" data-i18n="cleanup.cleanNow">Clean now</button>
         <button id="btn-cleanup-cancel" data-i18n="cleanup.cancel">Cancel</button>
-      </div>
-
-      <!-- OCR result cache (inside the same housekeeping modal) -->
-      <div class="cache-panel">
-        <h3 data-i18n="cache.title">OCR result cache</h3>
-        <p class="hint" data-i18n-html="cache.intro"></p>
-        <div id="cache-summary" class="cleanup-summary"></div>
-        <div class="modal-actions cache-actions">
-          <button id="btn-cache-clear" class="warn" data-i18n="cache.clear">Clear OCR cache</button>
-        </div>
-        <div id="cache-status"></div>
       </div>
       <div id="cleanup-status"></div>
     </div>

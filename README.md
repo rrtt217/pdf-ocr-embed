@@ -13,42 +13,38 @@
 > 安全性、边界条件与依赖版本，别盲目信任 AI 输出。
 >
 > **给 AI Agent 的快速入口**：`AGENTS.md` 是为 AI 编码代理编写的项目指南（架构、
-> 硬性约定，以及**如何编写新的 OCR adapter** 的完整步骤与检查清单）。改动前请先读它。
+> 硬性约定，以及**如何编写新的 OCR 引擎（OcrEngine 插件）**的完整步骤与检查清单）。
+> 改动前请先读它。
 
 ---
 
-- **通用 OCR 抽象（Adapter 模式）**：后端统一走 `OcrSource` 接口，每个 OCR 引擎
-  一个 adapter，把各自的原始输出解析为归一化的 `OcrPage`（bbox 统一为**原始像素坐标**）。
-  - `unlimited_ocr_adapter`（完整实现，默认）：解析 `<|det|>type [bbox]<|/det|>content`
-    标记，并把 1000×1000 归一化画布 bbox 映射回真实像素坐标（逐维缩放）。
-  - `tesseract_adapter`（**完整实现**）：本地 Tesseract OCR，无 API key。用
-    pytesseract 读取词级 TSV，把词按行聚合成块（每行一个 block），自动划分
-    text/heading/equation，中文需安装对应语言包（如 `chi_sim`）。
-  - `generic_openai_adapter`（**完整实现**）：接任意 OpenAI 兼容视觉模型，用提示词
-    让模型返回带 bbox 的结构化 JSON，同样映射回像素坐标。
+- **OCR 核心 = OCRmyPDF**：栅格化、引擎调度、并发、文本层渲染（内置 fpdf2 渲染器）、
+  graft 回写、PDF/A 与优化全部交给 [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF)
+  （≥17.11，系统依赖 tesseract + ghostscript，无需 qpdf）。后端通过
+  `ocrmypdf.api` 进程内调用其官方**编辑回写**通道：
+  `_pdf_to_hocr`（OCR → 每页 hOCR）+ `_hocr_to_ocr_pdf`（编辑后合成最终 PDF）。
+- **unlimited-ocr 以 OCRmyPDF 插件实现**（`backend/ocrmypad/`）：一个
+  `OcrEngine` 插件，逐页调 OpenAI 兼容视觉 API（USTC `unlimited-ocr` 模型），
+  解析 `<|det|>type [bbox]<|/det|>content` 标记（1000×1000 归一化画布逐维缩放回
+  **原始像素坐标**），写成 hOCR + 块 sidecar JSON（WebUI 的可编辑表示）。
+  `ocr_engine = "tesseract"` 时回退 ocrmypdf 内置 Tesseract；`"none"` 关闭 OCR。
 - **OCR 设置完全外部化**：本地 TOML 配置 `backend/ocr_config.toml` + WebUI 设置页
   （WebUI 保存时写入同一个 TOML 文件）。`OCR_*` **环境变量可选地覆盖**全部设置
   （优先级最高：环境变量 > WebUI 会话内保存值 > TOML 文件）；JSON / .env 文件
   配置已移除。
-- **PDF 处理**：PyMuPDF 每页转图 → 逐页 OCR → 用 `render_mode=3` 不可见嵌入文字，
-  正确处理像素坐标 → PDF 坐标（y 轴翻转）、**并按每页 `/Rotate` 做位置与字形朝向的
-  反向映射**（位置经 `~rotation_matrix` 变换，字形经 `morph` 预旋转；`rotation=180`
-  的扫描书页嵌入文字与 `rotation=0` 页面逐像素一致），保存为 `*_embedded.pdf`。
-- **进度流**：SSE 推送每页 OCR 进度。
-- **并行 OCR**：支持并指定并行数（`concurrency`）。对 unlimited 引擎，并行数
-  作用于**多页批次**：`concurrency` 个「每批 `unlimited_max_pages_per_batch` 页」
-  的请求同时进行（在途页数 ≈ 并发 × 批大小，受 `max_inflight_pages` 护栏钳制）；
-  对 tesseract 等逐页引擎则退化为每页一个请求的并行。
-- **单页 WebUI**：左侧可编辑文本块，右侧页面预览 + bbox 高亮框，设置表单、嵌入按钮、进度条、
-  并行数输入框。
+- **前端沿用自研 WebUI**（零构建原生 JS）：左侧可编辑文本块，右侧页面预览 +
+  bbox 高亮框、设置表单、嵌入按钮、SSE 进度条。不采用 OCRmyPDF 的
+  `misc/_webservice.py`（Streamlit 表单应用，无逐页编辑/进度流，理由见 DESIGN.md）。
+- **进度流**：SSE 推送每页 OCR 进度（按 work 目录的文件清单统计，引擎无关）。
+- **并行 OCR**：`concurrency` 映射为 OCRmyPDF 的 worker 数（`ocrmypdf_jobs`）；
+  `use_threads` 固定开启（引擎为 HTTP/IO-bound，线程化运行也更适合文件式进度）。
 - **置信度审阅视图**：每个文本块带置信度徽标（85/60 分档绿/黄/红），低置信块红描边；
   「只看低置信度」过滤 + 可调阈值（默认 60%），页 tab 角标显示该页低置信块数。
-  未回报置信度的引擎（API 类）会在界面提示，Tesseract 提供逐块置信度。
-- **输出优化**：嵌入时可对页面图片**重压 JPEG / 灰度 JPEG**、**降采样**（1/2、1/4），
-  仅当新编码更小时才替换（软掩码图自动跳过）；可选**线性化**（当前构建不支持时自动回退
-  普通保存并在结果注明）。嵌入完成显示「图片：重压 N 张，省 X」。
-- **任务持久化**：任务状态实时写入 `work/<job_id>/job.json`（含已完成页与嵌入结果），
-  服务重启自动恢复；崩溃中的任务恢复为 stopped，可直接重跑剩余页或下载部分结果。
+- **输出选项**：合成时可选**优化级别**（0–3，交给 ocrmypdf 的 optimize 阶段）与
+  **输出类型**（PDF / PDF/A）。
+- **任务持久化**：任务状态实时写入 `work/<job_id>/job.json`；每页 OCR 结果以块
+  sidecar 存于 `work/<job_id>/hocr/`，服务重启自动恢复——已识别页可直接合成，
+  无需重传。
 - **批量上传 + 打包下载**：一次拖入/选择多个 PDF，每个文件自动成为独立 OCR 任务
   （并行运行，各自有卡片与 SSE 进度）；在任务列表勾选已嵌入完成的任务，一键把它们的
   嵌入式 PDF 打包成一个 ZIP 下载（服务端逐文件流式打包，不整包读入内存）。
@@ -57,7 +53,7 @@
 - **浅色 / 深色 / 自适应主题**：页头切换，选择记忆在 localStorage；自适应跟随系统
   `prefers-color-scheme`，深色下原生控件与滚动条同步变暗。
 - **WebUI 体验优化**：Toast 通知、`Ctrl/⌘+Enter` 快速嵌入、`←/→` 翻页快捷键、
-  主题/引擎/字号等偏好本地记忆、焦点可见样式与 `prefers-reduced-motion` 支持、
+  主题/引擎等偏好本地记忆、焦点可见样式与 `prefers-reduced-motion` 支持，
   内嵌 SVG favicon 与随主题变化的 `theme-color`。
 - **无 CUDA / NVIDIA** 依赖。
 
@@ -65,11 +61,15 @@
 
 ## 安装
 
+**系统依赖**（OCRmyPDF 需要）：tesseract-ocr 与 ghostscript；无 qpdf 要求。
+
 ```bash
+# Debian/Ubuntu
+sudo apt-get install tesseract-ocr ghostscript
 cd /home/david/vibe-arena/pdf-ocr-embed
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt   # 含 ocrmypdf>=17.11
 ```
 
 ## 配置 OCR
@@ -127,14 +127,19 @@ OCR_API_KEY=sk-xxx OCR_BASE_URL=https://example.com/v1 python -m backend.main
 | `OCR_BASE_URL` | `base_url` |
 | `OCR_MODEL` | `model` |
 | `OCR_PROVIDER` | `provider` |
-| `OCR_TESS_LANG` | `tess_lang` |
-| `OCR_TESS_PSM` | `tess_psm` |
-| `OCR_TESS_OEM` | `tess_oem` |
-| `OCR_TESS_CONFIG` | `tess_config` |
-| `OCR_TESSDATA_DIR` | `tessdata_dir` |
-| `OCR_TESS_CMD` | `tess_cmd` |
-| `OCR_GENERIC_PROMPT` | `generic_prompt` |
-| `OCR_EMBED_FONT` | `embed_font` |
+| `OCR_ENGINE` | `ocr_engine` |
+| `OCRMYPDF_MODE` | `ocrmypdf_mode` |
+| `OCRMYPDF_JOBS` | `ocrmypdf_jobs` |
+| `OCRMYPDF_OPTIMIZE` | `ocrmypdf_optimize` |
+| `OCRMYPDF_OUTPUT_TYPE` | `ocrmypdf_output_type` |
+| `OCRMYPDF_LANGUAGE` | `ocrmypdf_language` |
+| `OCRMYPDF_DESKEW` | `ocrmypdf_deskew` |
+| `OCRMYPDF_CLEAN` | `ocrmypdf_clean` |
+| `OCRMYPDF_ROTATE_PAGES` | `ocrmypdf_rotate_pages` |
+| `OCR_MAX_RETRIES` | `max_retries` |
+| `OCR_RETRY_BASE_DELAY` | `retry_base_delay` |
+| `OCR_RETRY_MAX_DELAY` | `retry_max_delay` |
+| `OCR_RATE_LIMIT_RPS` | `rate_limit_rps` |
 | `OCR_CLEANUP_MAX_AGE_HOURS` | `cleanup_max_age_hours` |
 | `OCR_CLEANUP_INTERVAL_HOURS` | `cleanup_interval_hours` |
 | `OCR_LOG_LEVEL` | `log_level` |
@@ -153,33 +158,25 @@ python -m backend.main
 
 ### 选择 OCR 引擎
 
-WebUI 上传区可下拉选择三个引擎：
+WebUI 上传区可下拉选择三个引擎（`ocr_engine`）：
 
-- **Unlimited OCR (API)**（默认）— 需配置 API key / base_url / model（见上文）。
-- **Tesseract (local)** — 本地 OCR，**无需 API key**。在"Tesseract language"
+- **Unlimited OCR (API)**（默认）— OCRmyPDF 插件引擎，需配置 API key / base_url /
+  model（见上文）。
+- **Tesseract (local)** — ocrmypdf 内置 Tesseract，**无需 API key**。在"OCR language"
   填语言包，如 `chi_sim`（中文）、`eng`（英文）、`chi_sim+eng`（中英混合）。
-- **Generic OpenAI (API)** — 接任意 OpenAI 兼容视觉模型，key 走 Settings。
+- **No OCR** — 不做 OCR（仅 ocrmypdf 的图像处理/优化）。
+
+Settings 弹窗还提供流水线旋钮（同样写入 TOML）：`mode`（force-ocr | skip-text |
+redo-ocr）、`language`（Tesseract）、`deskew`（纠偏）、`clean`（需 unpaper）。
 
 命令行方式（tesseract 示例）：
 
 ```bash
-# 把 chi_sim 写进 backend/ocr_config.toml（或 WebUI 上传区的 "Tesseract language"）
-echo 'tess_lang = "chi_sim"' >> backend/ocr_config.toml
+# 把 ocrmypdf_language 写进 backend/ocr_config.toml（或 Settings 弹窗）
+echo 'ocrmypdf_language = "chi_sim"' >> backend/ocr_config.toml
 uvicorn backend.main:app --port 8000
 ```
 
-### 图像预处理（可选）
-
-扫描件常倾斜、发灰、带噪点，会显著拉低识别率。Settings 弹窗提供一组
-**PIL 预处理开关**（`preprocess_*`），在 OCR 之前对渲染出的页面图像做清洗：
-
-- `preprocess_enabled`（总开关，默认关）、`grayscale`（灰度化）、`denoise`
-  （中值滤波去噪）、`contrast`（直方图对比度拉伸）、`binarize`（Otsu 阈值二值化）。
-
-**不改变尺寸** 是硬约束：预处理只在新渲染的页面图像上执行，输出宽高与输入
-完全一致，因此所有块 bbox 的像素坐标语义不变。开关既可写进
-`backend/ocr_config.toml`，也支持 `OCR_PREPROCESS_*` 环境变量（最高优先级）。
-仅对新渲染的页面生效（命中 OCR 缓存的页面不重新渲染、不预处理）。
 ### 批量上传与打包下载
 
 上传区支持一次拖入或选择**多个 PDF**（单个上传依旧可用）。每个文件都会成为
@@ -224,18 +221,17 @@ uvicorn backend.main:app --port 8000
 
 ### 无头 CLI 模式（headless）
 
-不启动 Web 服务，直接用命令行完成「OCR → 嵌入」整条流水线（复用
-`backend.ocr_service` / `backend.pdf_processing` 同一套后端逻辑）：
+不启动 Web 服务，直接用命令行完成「OCR → 合成」整条流水线（复用
+`backend.ocr_service` 同一套后端逻辑）：
 
 ```bash
-python -m backend.cli book.pdf --adapter tesseract --pages 1-20 --concurrency 2
-python -m backend.cli book.pdf --adapter unlimited --no-embed --pages 1-5   # 只 OCR，打印每页文本
-python -m backend.cli book.pdf --adapter list                               # 列出可用引擎
+python -m backend.cli book.pdf --engine tesseract --pages 1-20 --jobs 2
+python -m backend.cli book.pdf --engine unlimited --pages 1-5 --sidecar-text  # 打印每页文本
 ```
 
-参数：`--adapter`（默认 unlimited）、`--pages`（1 起；`"1-20"` / `"1,3,5-7"` / `"1-"` / `"-5"`）、
-`--concurrency`、`--out`（默认 `output/`）、`--no-embed`、`--max-tokens`（守卫 `< 32768`）、
-`--json`。输出 `<名>_embedded_<id>.pdf`。API key 等配置仍走 `resolve()`（TOML / 环境变量），
+参数：`--engine`（默认 unlimited）、`--pages`（1 起；`"1-20"` / `"1,3,5-7"` / `"1-"` / `"-5"`）、
+`--jobs`（worker 数）、`--out`（默认 `output/`）、`--sidecar-text`。
+输出 `<名>_embedded_<id>.pdf`。API key 等配置仍走 `resolve()`（TOML / 环境变量），
 不做任何硬编码。
 
 ### API 速览
@@ -243,23 +239,21 @@ python -m backend.cli book.pdf --adapter list                               # �
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
 | GET  | `/` | WebUI 页面 |
-| GET  | `/api/health` | 健康检查 + 可用 adapter |
-| GET/POST | `/api/settings` | 读取 / 保存 provider 配置（打码） |
-| POST | `/api/ocr/upload` | 上传 PDF → 后台逐页 OCR（支持 `concurrency` 并行数，`adapter` 引擎选择，`lang/psm/oem` 供 tesseract，`base_url/api_key/model` 供 API 类）→ 返回 job id |
+| GET  | `/api/health` | 健康检查 + 引擎映射 |
+| GET/POST | `/api/settings` | 读取 / 保存 provider 配置（打码）+ 流水线旋钮 |
+| POST | `/api/ocr/upload` | 上传 PDF → OCRmyPDF 后台 OCR（`files` 多文件 / `file` 单文件；`ocr_engine` 引擎选择，`concurrency` → worker 数，`lang` 供 tesseract，`base_url/api_key/model` 覆盖）→ 返回 job id |
 | GET  | `/api/ocr/zip?jobs=id1,id2` | 把所选任务的嵌入式 PDF 打包成一个 ZIP 下载（`jobs` 为逗号分隔的任务 id；请求的任务全都没有嵌入结果时返回 404） |
 | POST | `/api/ocr/retry/{job_id}` | 对已上传但失败/中断的任务重跑 OCR（默认只跑缺失页，不重头开始；参数同 upload，另支持 `page_start`/`page_end` 页码范围、`force` 强制重跑已成功页） |
 | POST | `/api/ocr/stop/{job_id}` | 中途停止正在运行的 OCR（已完成页保留，可下载或重试剩余） |
 | GET  | `/api/logs` | 获取最近后端调试日志 |
-| GET  | `/api/ocr/stream/{job_id}` | SSE 进度流 |
-| GET  | `/api/pages/{job_id}` | 取全部分页 OCR 数据 |
+| GET  | `/api/ocr/stream/{job_id}` | SSE 进度流（status + 每页 progress 事件） |
+| GET  | `/api/pages/{job_id}` | 取全部分页 OCR 数据（块 sidecar JSON） |
 | GET  | `/api/pages/{job_id}/{i}/image` | 页面预览 PNG |
-| POST | `/api/pages/{job_id}/{i}` | 更新单个可编辑页 |
-| POST | `/api/embed/{job_id}` | 嵌入（可编辑后的）文字 → `*_embedded.pdf` |
+| POST | `/api/pages/{job_id}/{i}` | 更新单个可编辑页（写 sidecar + 重生成 hOCR） |
+| POST | `/api/embed/{job_id}` | 合成（可编辑后的）文字 → `<源名>_embedded.pdf`（`optimize`、`output_type`；带 `pages` 时产出仅含所选页的 `<源名>_partial.pdf`） |
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
 | GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
 | POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
-| GET  | `/api/cache` | OCR 结果缓存状态（条目数/字节/命中与未命中计数、TTL、开关） |
-| POST | `/api/cache/clear` | 清空全部 OCR 缓存（不影响任务内已识别的结果） |
 
 ---
 
@@ -270,92 +264,75 @@ pdf-ocr-embed/
 ├── backend/
 │   ├── __init__.py
 │   ├── main.py                 # FastAPI 应用与全部路由
-│   ├── config.py               # 外部设置解析（TOML 配置文件 / WebUI）
-│   ├── models.py               # 归一化 OcrPage / OcrBlock 结构
-│   ├── pdf_processing.py       # PyMuPDF 转图 + 不可见文字嵌入
-│   ├── ocr_service.py          # OCR 编排 + 任务/进度状态
-│   └── sources/
-│       ├── __init__.py
-│       ├── base.py             # OcrSource 抽象基类 + 坐标换算工具
-│       ├── factory.py          # adapter 注册/获取
-│       ├── unlimited_ocr_adapter.py   # 完整实现（<|det|> 标记解析）
-│       ├── tesseract_adapter.py       # 完整实现（本地 Tesseract）
-│       └── generic_openai_adapter.py  # 完整实现（任意 OpenAI 兼容视觉模型）
+│   ├── config.py               # 外部设置解析（TOML 配置文件 / WebUI / OCR_* 环境变量）
+│   ├── page_store.py           # 引擎无关页面交换层（块 sidecar / hOCR / 取消标志）
+│   ├── ocrmypad/               # OCRmyPDF 插件包（unlimited-ocr 引擎）
+│   │   ├── unlimited_engine.py # OcrEngine 插件 + get_ocr_engine hook
+│   │   ├── engine_client.py    # OpenAI 兼容客户端（截断检测/重试/超时）
+│   │   ├── parser.py           # <|det|> 标记解析 + hOCR 生成
+│   │   └── text_norm.py        # 数学/表格文本规范化
+│   ├── errors.py               # UnavailableError + 1000 画布 → 像素坐标换算
+│   ├── http_retry.py           # HTTP 重试/限速（引擎 API 调用）
+│   ├── ocr_service.py          # OCRmyPDF 编排（_pdf_to_hocr + _hocr_to_ocr_pdf）+ 任务状态
+│   ├── models.py               # 编辑器页 JSON 结构（OcrPage/OcrBlock 兼容）
+│   ├── pdf_processing.py       # 页面预览渲染（PyMuPDF）
+│   ├── validation.py           # 嵌后校验（覆盖率报告）
+│   ├── batch.py                # ZIP 打包（流式）
+│   ├── cleanup.py              # 临时文件清理
+│   ├── logging_config.py       # 日志
+│   └── cli.py                  # 无头 CLI（python -m backend.cli）
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
-├── tests/                      # pytest 测试（坐标映射/解析器/缓存等纯函数）
+├── tests/                      # pytest 测试（146 项）
 ├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml
 ├── .gitignore
-├── AGENTS.md     # 面向 AI 编码代理的项目指南（含如何编写 OCR adapter）
-└── DESIGN.md     # 设计文档 + 路线图（先稳定版，后功能扩展）
+├── AGENTS.md     # 面向 AI 编码代理的项目指南（含插件扩展点与页面交换层）
+└── DESIGN.md     # 设计文档（OCRmyPDF 架构 + 前端沿用理由）
 ```
 
 ---
 
 ## 说明与限制
 
-- bbox 为 `[x1,y1,x2,y2]` 整数，adapter 内部把归一化画布换算为真实像素，前端/嵌入统一用像素坐标。
-- `max_tokens` 默认 16384（必须 < 32768，否则 API 400）。可通过 CLI
-  `--max-tokens N` 提高（API 引擎）；响应若被截断（`finish_reason=length` 或
-  `completion_tokens >= max_tokens`），该页按**失败**处理并给出明确错误，
-  重试即可补跑，不会把残缺结果当作成功缓存。
-- 像素 → PDF 坐标做了 y 轴翻转（PDF 原点左下、像素原点左上），并用页面 rect 与渲染宽高比例缩放。
-- **Tesseract adapter（本地，无 key）**：
-  - 语言通过 `backend/ocr_config.toml` 的 `tess_lang`（或 WebUI 上传区）配置，
-    中文用 `chi_sim`，可组合 `chi_sim+eng`。
-  - 需系统装有 `tesseract` 二进制 + 对应语言包（Fedora：`tesseract` +
-    `tesseract-langpack-chi_sim`）。二进制不在 PATH 时用 `tess_cmd` 指定，
-    tessdata 不在默认位置时用 `tessdata_dir`。
-  - 每行文本聚合成一个 block，自动识别 heading / equation / text，输出置信度。
-- **generic_openai adapter（任意 OpenAI 兼容视觉模型）**：与 unlimited 相同
-  的 api_key/base_url/model 配置，`generic_prompt` 可覆盖默认的 bbox-JSON 提示词。
-- **unlimited adapter 结果处理**：`table` 块的 HTML 会转换成行列文本（不再把
-  `<tr>/<td>` 标签写进文本层）；公式/表格单元格会收紧模型的分词空格
-  （`X _ p`→`X_p`、`f (x)`→`f(x)`）；相邻单个数字之间不会自动合并；
-  `image_caption` 图注连同其 bbox（`caption_bbox`）保留并嵌入到文字层。
-- **并行数（concurrency）**：上传时可指定，WebUI 上传区有输入框，或调用
-  `POST /api/ocr/upload` 时带 `concurrency` 表单字段（1–32）。对 unlimited 引擎，
-  `concurrency` 个多页批次请求同时进行（在途页数 ≈ 并发 × 批大小，受 `max_inflight_pages`
-  护栏钳制）；tesseract 等逐页引擎则用线程池并发处理各页，`concurrency=1` 即顺序执行。
-  注意并发越高对 OCR 引擎/API 的并发压力越大，需与引擎配额匹配。
+- bbox 为 `[x1,y1,x2,y2]` **整数、原始像素空间**（top-left origin）。1000×1000
+  归一化画布 → 真实像素的换算集中在 `backend/errors.normalize_bbox`，hOCR 的
+  `scan_res` 携带真实 DPI（fpdf2 渲染器的 px→pt 变换依赖它）。
+- `max_tokens` 默认 16384（必须 < 32768，否则 API 400）。响应若被截断
+  （`finish_reason=length` 或 `completion_tokens >= max_tokens`），该页按**失败**
+  处理并给出明确错误，重试即可补跑，不会把残缺结果当作成功。
+- 坐标进入 PDF 层由 OCRmyPDF 完成：fpdf2 渲染器与 hOCR 同为 top-left 原点，
+  无需 y 轴翻转；页面旋转由 ocrmypdf 的 rotate/graft 流程处理。
+- **Tesseract 引擎（本地，无 key）**：ocrmypdf 内置实现。语言通过
+  `ocrmypdf_language` 配置（中文 `chi_sim`，可组合 `chi_sim+eng`）；需系统装有
+  `tesseract` 二进制 + 对应语言包。
+- **unlimited 引擎结果处理**：`table` 块的 HTML 会转换成行列文本（不把 `<tr>/<td>`
+  标签写进文本层）；公式/表格单元格会收紧模型的分词空格（`X _ p`→`X_p`、
+  `f (x)`→`f(x)`）；相邻单个数字之间不会自动合并；`image_caption` 图注连同其 bbox
+  （`caption_bbox`）保留并嵌入到文字层。
+- **worker 数（concurrency / ocrmypdf_jobs）**：上传时可指定（1–32），映射为
+  OCRmyPDF 的 OCR 并发 worker 数；`use_threads` 固定开启。并发越高对 API 的
+  并发压力越大，需与引擎配额匹配。
 - **失败重试（智能）**：OCR 报错或中途停止后，WebUI 显示 **Retry remaining** 按钮。
-  重试**只重跑失败/未完成的页**，已成功的页保留不重跑（修复了"跑了 99% 重试却从头开始"的问题）。
-  也可调用 `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。
-- **中途停止**：OCR 运行中可点击 **Stop** 按钮或调用 `POST /api/ocr/stop/{job_id}` 停止。
-  已完成的页保留，停止后可点 **Download partial** 下载部分嵌入的 PDF，或 **Retry remaining** 跑完剩余页。
-- **OCR 结果缓存**：同一 PDF 页 + 相同引擎与参数的结果，按内容哈希缓存到
-  `cache/ocr/`（键 = 源 PDF 哈希 + 页码 + 渲染参数 + 引擎指纹，绝不落盘任何密钥或
-  原图）。重复 OCR 直接命中，省时省钱、且错误的缓存条目会被自动丢弃。TTL
-  `ocr_cache_max_age_hours`（默认 720h），`ocr_cache_enabled = false` 可整体关闭；
-  后台清理循环会顺带过期清理，`GET /api/cache` 看命中统计、`POST /api/cache/clear`
-  一键清空。缓存只存**识别原文**，用户在页面上做的文字/字体修改完全不受影响。
-  **命中即跳过渲染**：重新上传同一文档时，缓存命中的页不需要重新渲染 PNG
-  （预览图在首次查看时按需补渲染）。SSE 进度分 `render`（预处理渲染）与
-  `ocr`（识别）两个阶段推送，处理大文件时进度条在渲染阶段就持续前进。
-- **输出优化细节**：图片重压是**有损**的——只影响背景扫描图、不影响文字层；
-  软掩码（透明）图片与「重压后反而变大」的图片一律保持原样。统计随
-  `/api/embed` 响应返回（`images.replaced / saved_bytes / attempted / skipped`）。
-  本机 MuPDF 构建已移除线性化：勾选时自动降级普通保存并置
-  `images.linearized = false`，不影响其余功能。
+  重试**只重跑失败/未完成的页**（`force=true` 时重跑全部选中页）。也可调用
+  `POST /api/ocr/retry/{job_id}`，复用已上传的 PDF，无需重新上传。
+- **中途停止**：OCR 运行中可点击 **Stop** 按钮或调用 `POST /api/ocr/stop/{job_id}`
+  停止（引擎逐页检查取消标志）。已完成的页保留（sidecar 在磁盘上），可
+  **Retry remaining** 跑完剩余页或直接合成下载部分结果。
 - **调试日志**：后端全链路 logging（`backend/ocr_config.toml` 的 `log_level` 控制级别，
   默认 INFO，设 DEBUG 看详细）。WebUI 右上角 **Logs** 按钮可实时查看后端日志，
   或调用 `GET /api/logs`。
 - **临时文件清理**：任务状态**持久化**在 `work/<job_id>/job.json` 并在启动时自动恢复，
-  重启不再丢任务（运行中崩溃的任务恢复为 stopped，已完成页保留，可用 Retry/下载部分结果）。
-  清理只针对**无任务引用**且超过 `cleanup_max_age_hours`（默认 168h=7 天）的孤儿文件
-  （如状态文件被删/损坏、失败上传的残留）；清理间隔 `cleanup_interval_hours`（默认 6h），
-  两个值都在 `backend/ocr_config.toml` 中配置；
-  **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况、调整保留时长并手动
-  清理（Preview 先预览、Clean now 执行），也可直接调 `/api/cleanup` 与 `/api/cleanup/run`。
-  同一弹窗内的 **OCR result cache** 区块显示缓存统计（条目数/占用/命中/未命中/TTL）
-  并提供 **Clear OCR cache** 一键清空（对应 `POST /api/cache/clear`）。
-- **批量上传 / ZIP 打包（#10）**：多文件上传各自成任务（复用并行能力，无队列管理器）；
-  ZIP 成员按源文件名命名、重名自动加 ` (2)` 序号；打包只包含**已嵌入**且文件仍在
-  磁盘上的任务（`job["embedded_path"]`），其余跳过，全部无结果时返回 404。临时 ZIP
-  写在系统临时目录、随响应流式返回，发送完成后由后台任务删除，不残留孤儿文件。
+  重启不再丢任务（运行中崩溃的任务恢复为 stopped；hOCR 工作文件夹保留，
+  已识别页可直接合成）。清理只针对**无任务引用**且超过 `cleanup_max_age_hours`
+  （默认 168h=7 天）的孤儿文件；清理间隔 `cleanup_interval_hours`（默认 6h），
+  **被任务引用的文件永不删除**。WebUI 右上角 **Cleanup** 按钮可查看概况并手动清理。
+- **批量上传 / ZIP 打包**：多文件上传各自成任务（无队列管理器）；ZIP 成员按源文件名
+  命名、重名自动加 ` (2)` 序号；打包只包含**已嵌入**且文件仍在磁盘上的任务，其余跳过，
+  全部无结果时返回 404。临时 ZIP 写在系统临时目录、随响应流式返回，发送完成后由
+  后台任务删除。
 - 运行时产物（`output/`、`work/`、`uploads/`、`backend/ocr_config.toml`）均不应提交仓库。
