@@ -490,7 +490,12 @@ async def stream(job_id: str):
                     delivered_pages.add(page_no)
                     yield _sse({
                         "type": "progress",
-                        "current": page_no,
+                        # `current` is the COMPLETED-PAGE COUNT (len(done)) — not
+                        # the page number.  The job's progress is "how many pages
+                        # are done"; page identity lives in `page_index`.  A page
+                        # number here makes the WebUI's N/total count jump to the
+                        # highest done page when pages complete out of order.
+                        "current": len(done),
                         "total": total,
                         "pages_done": len(done),
                         "page_index": page_no - 1,

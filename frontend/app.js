@@ -621,9 +621,13 @@ function applyJobEvent(jobId, msg) {
       job.render = { current: msg.current, total: msg.total };
     } else {
       job.render = null;
+      // Completed-page COUNT, not the page number: the server streams `current`
+      // and `pages_done` as the running count of finished pages (page identity
+      // lives in `page_index`). Prefer the explicit count when present.
+      const pagesDone = typeof msg.pages_done === "number" ? msg.pages_done : msg.current;
       Object.assign(job, {
         status: RUNNING_STATUSES.has(msg.status) ? msg.status : job.status,
-        current: msg.current,
+        current: pagesDone,
         total: msg.total,
         error: null,
       });
