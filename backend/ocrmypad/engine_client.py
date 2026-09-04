@@ -1,7 +1,13 @@
 """Unlimited-OCR engine client (USTC / Baidu style OpenAI-compatible API).
 
-Ported from the pre-rebuild ``unlimited_ocr_adapter``.  Single-page requests
-(the per-page "document parsing." prompt) with:
+Ported from the pre-rebuild ``unlimited_ocr_adapter``.  Two request shapes:
+
+* **Single-page** ("document parsing.") — one image per request.
+* **Multi-page** ("Multi page parsing.") — K page images per request; the raw
+  response carries one ``<PAGE>``-delimited section per image
+  (``parser.split_multi_page_stream``).
+
+Common to both:
 
 * ``skip_special_tokens=False`` — CRITICAL: the model outputs <|det|> markers
   as special tokens; the default stripping would empty the content.
@@ -26,6 +32,7 @@ import httpx
 from backend.errors import UnavailableError
 from backend.http_retry import RateLimiter, post_json_with_retry
 from backend.ocrmypad import settings as ocrmypad_settings
+from backend.ocrmypad.parser import split_multi_page_stream
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +45,22 @@ class UnlimitedOcrClient:
     # image.  No system prompt needed.
     SINGLE_PROMPT = "document parsing."
 
+    # Multi-page mode ("Multi page parsing." per the model card / infer_multi):
+    # K page images go into ONE request, and the response sections are separated
+    # by <PAGE> markers (parser.split_multi_page_stream).  Multi-image is
+    # base-mode only (no crop); the coordinates stay on the 1000x1000 canvas.
+    MULTI_PROMPT = "Multi page parsing."
+
     # Output runs ~1.5-2.5k tokens per dense page (measured on the live
     # endpoint), so the default budget leaves generous headroom.
     DEFAULT_MAX_TOKENS = 16384
+
+    # Output budget per page inside a multi-page batch.  A batch's max_tokens is
+    # per_page_budget * page_count, capped by the configured per-request budget
+    # (self.max_tokens) and the <32768 hard limit.  If a batch truncates, the
+    # engine falls back to single-page requests (each with the full budget), so
+    # a tight per-page budget here is safe.
+    BATCH_PER_PAGE_TOKENS = 2048
 
     # HTTP read timeout scales with the token budget: the hosted endpoint
     # decodes at ~10-15 tok/s, so a full max_tokens generation needs minutes.
@@ -59,6 +79,10 @@ class UnlimitedOcrClient:
         self.model = model or cfg.get("model") or "unlimited-ocr"
         # Hard backend invariant: max_tokens must stay < 32768.
         self.max_tokens = min(int(max_tokens or self.DEFAULT_MAX_TOKENS), 32767)
+        # Multi-page batch: per-page output budget (see multi_payload).
+        self.batch_per_page_tokens = min(
+            int(cfg.get("ocr_batch_per_page_tokens") or self.BATCH_PER_PAGE_TOKENS),
+            32767)
         # HTTP retry / rate-limit knobs (shared HTTP settings).  These do NOT
         # affect OCR output.
         self.max_retries = int(cfg.get("max_retries") or 3)
@@ -98,9 +122,11 @@ class UnlimitedOcrClient:
         log.debug("POST %s model=%s", url, payload.get("model"))
         t0 = time.time()
         # Read timeout must cover a full generation up to max_tokens on the
-        # hosted endpoint (~10-15 tok/s).
+        # hosted endpoint (~10-15 tok/s).  Multi-page payloads carry their own
+        # (larger) max_tokens, so the timeout scales with the payload's budget.
+        budget = int(payload.get("max_tokens") or self.max_tokens)
         read_timeout = max(self.READ_TIMEOUT_MIN,
-                           self.max_tokens * self.READ_TIMEOUT_PER_TOKEN)
+                           budget * self.READ_TIMEOUT_PER_TOKEN)
         with httpx.Client(timeout=httpx.Timeout(read_timeout,
                                                 connect=30.0)) as client:
             resp = post_json_with_retry(
@@ -165,6 +191,64 @@ class UnlimitedOcrClient:
                 log.warning("OCR result looks degenerate (no text blocks); "
                             "retrying once")
         return text
+
+    def multi_payload(self, image_paths: List) -> Dict[str, Any]:
+        """Build the multi-page payload ("Multi page parsing." + K images).
+
+        All page images go into ONE user message.  The max_tokens budget is
+        ``batch_per_page_tokens * K`` capped by the configured per-request
+        budget (self.max_tokens) — the hard ``< 32768`` invariant holds because
+        self.max_tokens is already clamped in the constructor.
+        """
+        content: List[Dict[str, Any]] = [{"type": "text", "text": self.MULTI_PROMPT}]
+        for image_path in image_paths:
+            b64 = self._encode_image(image_path)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
+        n = max(1, len(image_paths))
+        max_tokens = min(self.max_tokens,
+                         self.batch_per_page_tokens * n)
+        return {
+            "model": self.model,
+            "max_tokens": max_tokens,  # must stay < 32768
+            "temperature": 0.0,
+            "skip_special_tokens": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                },
+            ],
+        }
+
+    def recognize_multi(self, image_paths: List) -> List[str]:
+        """Multi-page OCR: ONE request for K page images.
+
+        Returns the raw marker stream per image, index-aligned with
+        ``image_paths`` (parser.split_multi_page_stream).  Raises on truncation
+        (``finish_reason=length``) or a fully empty response; a degenerate
+        (text-less) batch is retried once, mirroring ``recognize``.  Per-page
+        empties are handed back as "" so the caller can fall back per page.
+        """
+        if len(image_paths) < 2:
+            return [self.recognize(image_paths[0])]
+        payload = self.multi_payload(image_paths)
+        for attempt in range(2):
+            raw = self._post(payload)
+            self._assert_not_truncated(raw, payload["max_tokens"])
+            content = self._extract_content(raw)
+            if not content:
+                raise RuntimeError(
+                    "Empty multi-page OCR response "
+                    f"({len(image_paths)} image(s))")
+            if not self._looks_degenerate_raw(content):
+                return split_multi_page_stream(content, len(image_paths))
+            if attempt == 0:
+                log.warning("multi-page OCR result looks degenerate "
+                            "(no text blocks); retrying once")
+        return split_multi_page_stream(content, len(image_paths))
 
     @staticmethod
     def _looks_degenerate_raw(text: str) -> bool:

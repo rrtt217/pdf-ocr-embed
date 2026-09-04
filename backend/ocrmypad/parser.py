@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 # Bump whenever the raw-output -> Block mapping changes, so a pre-change
 # cached/sidecar result keeps serving stale content that the new parser would
 # have handled differently.
-PARSE_VERSION = 6
+PARSE_VERSION = 7
 
 _MARKER_RE = re.compile(
     r"<\|det\|>(?P<kind>[a-z_]+)(?:\s*\[(?P<bbox>[-+0-9.,\s]+)\])?<\|/det\|>(?P<content>.*?)(?=<\|det\|>|\Z)",
@@ -111,6 +111,34 @@ def split_block_lines(text: str) -> List[str]:
     space-separated gap inside one line so the whole row stays on one baseline.
     """
     return [ln.strip() for ln in text.replace("\t", "  ").split("\n") if ln.strip()]
+
+
+def split_multi_page_stream(raw: str, n_expected: int) -> List[str]:
+    """Split a multi-page marker stream on the ``<PAGE>`` page delimiter.
+
+    baidu/Unlimited-OCR's multi-page mode ("Multi page parsing.") emits one
+    ``<PAGE>`` before each page's section.  Sections are index-aligned with the
+    request's image list — section *i* corresponds to image *i* (the model's
+    own ``infer_multi`` splits exactly this way).  Behaviour for degenerate
+    streams:
+
+    * no ``<PAGE>`` markers at all (a single-image-style response) → the whole
+      stream is section 0;
+    * fewer sections than requested images → missing sections are padded with
+      ``""`` so callers can fall back per page;
+    * more sections than images → trimmed, sections beyond the image count are
+      dropped.
+    """
+    n_expected = max(1, int(n_expected))
+    parts = raw.split("<PAGE>")
+    if len(parts) == 1:
+        sections = [raw]
+    else:
+        sections = parts[1:]
+    sections = [s.strip() for s in sections]
+    if len(sections) >= n_expected:
+        return sections[:n_expected]
+    return sections + [""] * (n_expected - len(sections))
 
 
 def parse_response(text: str, width: int, height: int, page_index: int) -> Page:

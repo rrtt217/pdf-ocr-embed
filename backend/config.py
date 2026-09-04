@@ -53,6 +53,11 @@ _FILE_KEYS = (
     # unlimited engine HTTP retry / rate-limit knobs (backend.http_retry):
     # do NOT affect OCR output.
     "max_retries", "retry_base_delay", "retry_max_delay", "rate_limit_rps",
+    # unlimited engine multi-page batching (backend.ocrmypad.batching):
+    # 0=disabled (default).  >1 groups concurrent pages into one request.
+    "ocr_batch_size",            # pages per multi-image request
+    "ocr_batch_timeout_ms",      # batch window flush timeout (backstop, ms)
+    "ocr_batch_per_page_tokens", # per-page output token budget inside a batch
     # ocrmypdf pipeline knobs (backend.ocr_service builds OcrOptions from these)
     "ocrmypdf_mode",        # force | skip | redo | default (default: force)
     "ocrmypdf_jobs",        # 0 = auto (cpu count)
@@ -77,6 +82,9 @@ _ENV_ALIASES = {
     "OCR_RETRY_BASE_DELAY": "retry_base_delay",
     "OCR_RETRY_MAX_DELAY": "retry_max_delay",
     "OCR_RATE_LIMIT_RPS": "rate_limit_rps",
+    "OCR_BATCH_SIZE": "ocr_batch_size",
+    "OCR_BATCH_TIMEOUT_MS": "ocr_batch_timeout_ms",
+    "OCR_BATCH_PER_PAGE_TOKENS": "ocr_batch_per_page_tokens",
     "OCRMYPDF_MODE": "ocrmypdf_mode",
     "OCRMYPDF_JOBS": "ocrmypdf_jobs",
     "OCRMYPDF_OPTIMIZE": "ocrmypdf_optimize",
@@ -197,6 +205,9 @@ def get_effective_settings() -> Dict[str, Any]:
         "ocrmypdf_clean": as_bool(cfg.get("ocrmypdf_clean", "false")),
         "api_key_masked": _mask_key(cfg.get("api_key", "")),
         "has_api_key": bool(cfg.get("api_key")),
+        "ocr_batch_size": cfg.get("ocr_batch_size", "0"),
+        "ocr_batch_timeout_ms": cfg.get("ocr_batch_timeout_ms", "3000"),
+        "ocr_batch_per_page_tokens": cfg.get("ocr_batch_per_page_tokens", "2048"),
     }
 
 
@@ -234,6 +245,9 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("ocrmypdf_deskew", "ocrmypdf_clean", "ocrmypdf_rotate_pages"):
         if settings.get(key) is not None:
             data[key] = "true" if as_bool(settings[key]) else "false"
+    for key in ("ocr_batch_size", "ocr_batch_timeout_ms", "ocr_batch_per_page_tokens"):
+        if settings.get(key) is not None:
+            data[key] = str(settings[key]).strip()
 
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)

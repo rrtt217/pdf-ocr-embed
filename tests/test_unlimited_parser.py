@@ -7,6 +7,7 @@ from backend.ocrmypad.engine_client import UnlimitedOcrClient
 from backend.ocrmypad.parser import (
     _parse_bbox,
     parse_response,
+    split_multi_page_stream,
 )
 from backend.ocrmypad.text_norm import (
     clean_math_spacing,
@@ -182,3 +183,133 @@ def test_max_tokens_param_is_clamped_below_hard_limit():
     assert UnlimitedOcrClient(max_tokens=99999).max_tokens == 32767
     assert UnlimitedOcrClient(max_tokens=8192).max_tokens == 8192
     assert UnlimitedOcrClient(max_tokens=None).max_tokens == 16384
+
+
+# --- multi-page <PAGE> stream splitting --------------------------------------
+
+def test_split_multi_page_stream_basic():
+    raw = ("<PAGE><|det|>text [0,0,100,100]<|/det|>page one\n"
+           "<PAGE><|det|>text [0,0,100,100]<|/det|>page two")
+    sections = split_multi_page_stream(raw, 2)
+    assert len(sections) == 2
+    assert "page one" in sections[0] and "<PAGE>" not in sections[0]
+    assert "page two" in sections[1]
+
+
+def test_split_multi_page_stream_pads_missing_sections():
+    # One <PAGE> marker for a 3-image request -> sections 1,2 empty.
+    raw = "<PAGE><|det|>text [0,0,100,100]<|/det|>only page"
+    sections = split_multi_page_stream(raw, 3)
+    assert sections == ["<|det|>text [0,0,100,100]<|/det|>only page", "", ""]
+
+
+def test_split_multi_page_stream_trims_extra_sections():
+    raw = ("<PAGE>a\n<PAGE>b\n<PAGE>c")
+    assert split_multi_page_stream(raw, 2) == ["a", "b"]
+
+
+def test_split_multi_page_stream_no_marker_is_single_section():
+    raw = "<|det|>text [0,0,100,100]<|/det|>single"
+    # A single-image-style response with no <PAGE> markers: whole stream is
+    # section 0; a >1 expectation still pads the rest (caller falls back).
+    assert split_multi_page_stream(raw, 1) == [raw]
+    assert split_multi_page_stream(raw, 2) == [raw, ""]
+
+
+def test_split_multi_page_stream_each_section_parses_independently():
+    raw = ("<PAGE><|det|>title [0,0,100,100]<|/det|>T1\n"
+           "<PAGE><|det|>text [0,0,100,100]<|/det|>hello")
+    p0 = parse_response(split_multi_page_stream(raw, 2)[0], 1000, 1000, 0)
+    p1 = parse_response(split_multi_page_stream(raw, 2)[1], 1000, 1000, 1)
+    assert p0.blocks[0].kind == "title" and p0.blocks[0].text == "T1"
+    assert p1.blocks[0].kind == "text" and p1.blocks[0].text == "hello"
+
+
+# --- multi-page payload / recognize_multi ------------------------------------
+
+def _make_png(tmp_path, name="p.png"):
+    import PIL.Image
+    p = tmp_path / name
+    PIL.Image.new("RGB", (16, 16), "white").save(p)
+    return p
+
+
+def test_multi_payload_structure(tmp_path):
+    p1 = _make_png(tmp_path, "a.png")
+    p2 = _make_png(tmp_path, "b.png")
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k", model="m",
+                                max_tokens=16384)
+    payload = client.multi_payload([p1, p2])
+    assert payload["model"] == "m"
+    assert payload["skip_special_tokens"] is False
+    assert payload["temperature"] == 0.0
+    assert payload["messages"][0]["role"] == "user"
+    content = payload["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "Multi page parsing."}
+    assert [c["type"] for c in content] == ["text", "image_url", "image_url"]
+    # budget = per_page (default 2048) * 2, capped by configured max_tokens
+    assert payload["max_tokens"] == 4096
+    # data URLs carry base64 PNGs
+    assert "data:image/png;base64," in content[1]["image_url"]["url"]
+
+
+def test_multi_payload_max_tokens_never_exceeds_the_hard_cap(tmp_path):
+    p = [_make_png(tmp_path, "cap.png")]
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k", max_tokens=32767,
+                                config={"ocr_batch_per_page_tokens": "100000"})
+    payload = client.multi_payload(p)
+    assert payload["max_tokens"] < 32768
+
+
+def test_recognize_multi_splits_by_page(tmp_path, monkeypatch):
+    p1 = _make_png(tmp_path, "a.png")
+    p2 = _make_png(tmp_path, "b.png")
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k")
+    raw_response = {
+        "choices": [{"finish_reason": "stop",
+                     "message": {"content":
+                         "<PAGE><|det|>text [0,0,100,100]<|/det|>one\n"
+                         "<PAGE><|det|>text [0,0,100,100]<|/det|>two"}}],
+        "usage": {"completion_tokens": 40},
+    }
+    posted = []
+    monkeypatch.setattr(client, "_post", lambda payload: (posted.append(payload), raw_response)[1])
+    sections = client.recognize_multi([p1, p2])
+    assert sections == ["<|det|>text [0,0,100,100]<|/det|>one",
+                        "<|det|>text [0,0,100,100]<|/det|>two"]
+    assert len(posted) == 1 and posted[0]["messages"][0]["content"][0]["text"] \
+        == "Multi page parsing."
+
+
+def test_recognize_multi_empty_response_raises(tmp_path, monkeypatch):
+    p1 = _make_png(tmp_path, "a.png")
+    p2 = _make_png(tmp_path, "b.png")
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k")
+    monkeypatch.setattr(client, "_post",
+                        lambda payload: {"choices": [{"finish_reason": "stop",
+                                                      "message": {"content": ""}}],
+                                         "usage": {}})
+    with pytest.raises(RuntimeError, match="[Ee]mpty multi-page"):
+        client.recognize_multi([p1, p2])
+
+
+def test_recognize_multi_truncation_raises(tmp_path, monkeypatch):
+    p1 = _make_png(tmp_path, "a.png")
+    p2 = _make_png(tmp_path, "b.png")
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k")
+    monkeypatch.setattr(client, "_post",
+                        lambda payload: {"choices": [{"finish_reason": "length",
+                                                      "message": {"content": "x"}}],
+                                         "usage": {"completion_tokens": 4096}})
+    with pytest.raises(RuntimeError, match="truncated"):
+        client.recognize_multi([p1, p2])
+
+
+def test_recognize_multi_single_image_delegates_to_recognize(tmp_path, monkeypatch):
+    p1 = _make_png(tmp_path, "a.png")
+    client = UnlimitedOcrClient(base_url="http://x", api_key="k")
+    calls = []
+    monkeypatch.setattr(client, "recognize",
+                        lambda path: calls.append(str(path)) or "single")
+    assert client.recognize_multi([p1]) == ["single"]
+    assert calls == [str(p1)]
