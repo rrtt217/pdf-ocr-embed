@@ -24,10 +24,13 @@ worse than running without batching.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
+
+log = logging.getLogger(__name__)
 
 #: Pending page indices for one run, from the engine's view of its work folder
 #: (pages rasterized but not yet written hOCR).  Receives a representative page
@@ -66,6 +69,23 @@ class _BatchWindow:
         if self.work_dir is None:
             self.work_dir = Path(input_file).resolve().parent
         self.pages.append((page_index, input_file))
+        # Logged on EVERY update: shows the batch window growing and the
+        # 1-based page numbers staged in it so far.
+        log.info("batch %s: staged %d/%d page(s) — pages [%s]",
+                 self._label(), len(self.pages), self.batch_size,
+                 self._pages_label())
+
+    def _label(self) -> str:
+        """Disambiguating window label for logs: the job id when the work
+        folder convention is known (``work/<job_id>/hocr``), else a unique
+        window id (anonymous / test runs)."""
+        if self.work_dir is not None:
+            return f"job/{Path(self.work_dir).resolve().parent.name}"
+        return f"window/{id(self):x}"
+
+    def _pages_label(self) -> str:
+        """1-based page numbers staged so far, in ascending order."""
+        return ", ".join(str(pi + 1) for pi, _ in sorted(self.pages))
 
     def is_full(self) -> bool:
         return len(self.pages) >= self.batch_size
@@ -151,6 +171,8 @@ class MultiPageBatcher:
 
     def _dispatch(self, window: _BatchWindow) -> None:
         """Send the batch and hand each section to its page (no locks held)."""
+        log.info("batch %s: dispatching %d page(s) — pages [%s]",
+                 window._label(), len(window.pages), window._pages_label())
         try:
             sections = self.sender([path for _, path in window.pages])
         except BaseException as exc:  # noqa: BLE001 - degrade to per-page

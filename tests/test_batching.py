@@ -1,6 +1,7 @@
 """MultiPageBatcher: windowing, leader election, failure/cancel fallback."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from pathlib import Path
@@ -158,3 +159,49 @@ def test_partial_window_flushed_by_backstop_timer():
     batcher = _batcher(sender, pending={1}, timeout=0.2, batch_size=4)
     assert batcher.submit(0, Path("/tmp/p0.png")) == "S0"
     assert len(calls) == 1 and calls[0] == [Path("/tmp/p0.png")]
+
+
+# --- batch-window logging ----------------------------------------------------
+
+def test_batch_window_logs_pages_on_each_update(caplog):
+    """Every page join logs the growing window with its 1-based page numbers;
+    the flush logs the final composition being sent."""
+    calls = []
+
+    def sender(paths):
+        calls.append(list(paths))
+        return ["S0", "S1"]
+
+    with caplog.at_level(logging.INFO, logger="backend.ocrmypad.batching"):
+        batcher = _batcher(sender, pending={0, 1})
+        results, errors = _run_concurrent(batcher, jobs=[0, 1])
+    assert errors == {}
+    assert len(calls) == 1
+
+    staged = [r.message for r in caplog.records if "staged" in r.message]
+    dispatched = [r.message for r in caplog.records if "dispatching" in r.message]
+    # Each page join is one "update": both pages log the window as it grows.
+    assert len(staged) == 2
+    assert "staged 1/2" in staged[0]
+    # The final update and the dispatch both show every staged page (1-based).
+    assert "staged 2/2 page(s) — pages [1, 2]" in staged[-1]
+    assert "dispatching 2 page(s) — pages [1, 2]" in dispatched[-1]
+
+
+def test_serial_windows_each_log_their_own_pages(caplog):
+    """Serial pages form separate windows; each window's log names only its
+    own page."""
+
+    def sender(paths):
+        return [f"P{paths[0].name}"]
+
+    with caplog.at_level(logging.INFO, logger="backend.ocrmypad.batching"):
+        batcher = _batcher(sender, pending=set(), batch_size=4)
+        assert batcher.submit(0, Path("/tmp/p0.png")) == "Pp0.png"
+        assert batcher.submit(1, Path("/tmp/p1.png")) == "Pp1.png"
+
+    staged = [r.message for r in caplog.records if "staged" in r.message]
+    dispatched = [r.message for r in caplog.records if "dispatching" in r.message]
+    assert len(staged) == 2 and all("staged 1/4" in m for m in staged)
+    assert [m for m in dispatched if "pages [1]" in m]
+    assert [m for m in dispatched if "pages [2]" in m]
