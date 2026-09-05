@@ -196,6 +196,74 @@ def test_text_across_bands_rejects_rule_graphics():
     assert split is None
 
 
+def test_text_across_bands_drops_edge_fragment_band():
+    """A thin sparse band clipped at the crop edge must not veto a split."""
+    img = _page_with_rows([40, 200], text="The quick brown fox and the lazy dog")
+    d = ImageDraw.Draw(img)
+    # 1px sparse mark at the very top of the crop: a partial glyph fragment.
+    d.line([(30, 31), (45, 31)], fill=0)
+    block = [20, 30, 620, 300]
+    text = ("The quick brown fox jumps over the lazy dog and runs far away "
+            "into the deep dark woods near the river bank.")
+    split = split_block_text_across_bands(img, block, text)
+    assert split is not None and len(split) == 2, split
+    chunks = [c for c, _ in split]
+    assert "".join(chunks) == text
+    _assert_bboxes_well_formed([bb for _, bb in split], block)
+
+
+def test_text_across_bands_drops_interior_speck_band():
+    """A stray 2px speck row between real lines must not veto a split."""
+    img = _page_with_rows([40, 200], text="The quick brown fox and the lazy dog")
+    d = ImageDraw.Draw(img)
+    d.line([(400, 140), (412, 140)], fill=0)  # speck between the two rows
+    block = [20, 30, 620, 300]
+    text = ("The quick brown fox jumps over the lazy dog and runs far away "
+            "into the deep dark woods near the river bank.")
+    split = split_block_text_across_bands(img, block, text)
+    assert split is not None and len(split) == 2, split
+    chunks = [c for c, _ in split]
+    assert "".join(chunks) == text
+
+
+def test_text_across_bands_many_rows_scales_with_text_length():
+    """A dense 8-row paragraph is split (was vetoed by max_lines=6)."""
+    tops = [40 + 80 * i for i in range(8)]  # 8 evenly spaced rows
+    img = _page_with_rows(tops, text="word", font_size=40,
+                          width=640, height=700)
+    text = ("The quick brown fox jumps over the lazy dog and runs far away "
+            "into the deep dark woods near the river bank by the old mill "
+            "where the water wheel turns slowly on warm summer afternoons "
+            "while children play in the shallow end of the pond nearby.")
+    block = [20, 30, 620, 690]
+    split = split_block_text_across_bands(img, block, text)
+    assert split is not None and len(split) == 8, split
+    chunks = [c for c, _ in split]
+    assert "".join(chunks) == text
+    _assert_bboxes_well_formed([bb for _, bb in split], block)
+
+
+def test_text_across_bands_short_text_still_capped():
+    """A few-band block with short text must not balloon into many chunks."""
+    img = _page_with_rows([40, 200], text="word")
+    block = [20, 30, 620, 300]
+    text = "A short line that spans two rows."
+    split = split_block_text_across_bands(img, block, text)
+    assert split is not None and len(split) == 2, split
+
+
+def test_text_across_bands_rule_inside_text_still_rejected():
+    """A dense thin band (rule) still rejects the split (fragment vs rule)."""
+    img = _page_with_rows([40, 200], text="word")
+    d = ImageDraw.Draw(img)
+    d.rectangle([30, 100, 600, 103], fill=0)  # dense 3px rule mid-block
+    block = [20, 30, 620, 300]
+    text = ("The quick brown fox jumps over the lazy dog and runs far away "
+            "into the deep dark woods near the river bank.")
+    split = split_block_text_across_bands(img, block, text)
+    assert split is None
+
+
 def test_engine_wiring_receives_per_line_placement(tmp_path):
     """generate_hocr's helper builds overrides the hOCR emission consumes."""
     from backend.ocrmypad import unlimited_engine

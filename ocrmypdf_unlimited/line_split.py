@@ -13,7 +13,10 @@ horizontal projection profile (a.k.a. x-height / unitive line segmentation):
 2. extract text bands (rows with ink, small gaps merged for descender /
    ascender overhang),
 3. reconcile the band count to the number of text lines the block actually has
-   (merge over-splits, split under-splits at the deepest profile valley), and
+   (merge over-splits, split under-splits at the deepest profile valley) — for
+   the collapsed-paragraph path, recover band count from the image and drop
+   thin, barely-inked fragment/speck bands when they veto an otherwise valid
+   split, and
 4. tighten each band's x-extent to its own ink columns.
 
 If the image cannot support the split (no bands, degenerate crop, or the band
@@ -37,6 +40,10 @@ _MIN_INK = 2
 # Inter-band gaps at most this many rows are merged (ascender/descender
 # overhang looks like a 1-6px "gap" between the cap line and the band bottom).
 _MIN_GAP = 8
+#: Absolute ceiling on how many bands a collapsed paragraph may split into.
+#: Dense body paragraphs legitimately span many rows; the cap is also
+#: text-length-gated inside ``split_block_text_across_bands``.
+_MAX_BANDS = 24
 
 
 def split_block_into_lines(image: Image.Image, bbox: Sequence[int],
@@ -253,9 +260,51 @@ def _band_x_extent(crop: Image.Image, start: int, end: int,
     return max(0, left - pad), min(w, right + pad)
 
 
+def _band_ink_frac(crop: Image.Image, start: int, end: int,
+                   thresh: int) -> float:
+    """Fraction of dark pixels inside one band (sampled every other column)."""
+    w, _ = crop.size
+    if end <= start or w <= 0:
+        return 0.0
+    data = crop.load()
+    dark = 0
+    for y in range(start, end):
+        for x in range(0, w, 2):
+            if data[x, y] < thresh:
+                dark += 1
+    return min(1.0, (2.0 * dark) / (w * (end - start)))
+
+
+def _clean_bands(crop: Image.Image, bands: Sequence[Tuple[int, int]],
+                 thresh: int, min_h_ratio: float = 0.35,
+                 max_frag_ink: float = 0.3) -> List[Tuple[int, int]]:
+    """Drop thin, barely-inked bands: crop-edge fragments and interior specks.
+
+    The model's block bboxes routinely clip a printed line at the crop edge
+    (leaving a 1-10px partial-glyph band) or catch a stray speck row between
+    real lines.  Real text rows stay roughly uniform in height, so a band much
+    thinner than the typical row AND nearly empty of ink is a fragment, not a
+    line; leaving it in place vetoes an otherwise valid split via
+    ``_textlike_bands``.  A thin but DENSE band (a horizontal rule) is kept,
+    so ``_textlike_bands`` still rejects it.  Callers treat a result with
+    0-1 bands as "nothing to split".
+    """
+    if len(bands) <= 1:
+        return list(bands)
+    heights = [e - s for s, e in bands]
+    median = sorted(heights)[len(heights) // 2]
+    if median <= 0:
+        return list(bands)
+    return [
+        (s, e) for s, e in bands
+        if (e - s) > min_h_ratio * median
+        or _band_ink_frac(crop, s, e, thresh) > max_frag_ink
+    ]
+
+
 def split_block_text_across_bands(
         image: Image.Image, bbox: Sequence[int], text: str,
-        max_lines: int = 6) -> Optional[List[Tuple[str, List[int]]]]:
+        max_lines: int = _MAX_BANDS) -> Optional[List[Tuple[str, List[int]]]]:
     """Split a single-line paragraph's ``text`` across its printed line bands.
 
     The unlimited model frequently reports a whole paragraph as ONE text line
@@ -269,9 +318,20 @@ def split_block_text_across_bands(
     Conservative by design — returns ``None`` (caller keeps the single-line
     behavior) unless:
 
-    * the bbox contains 2+ clearly text-like bands (roughly uniform height,
-      low ink density — rejects rules, graphics and noise), and
+    * the bbox contains 2+ text-like bands (roughly uniform height, low ink
+      density — rejects rules, graphics and noise), and
     * the text is long enough to plausibly fill several lines.
+
+    Two real-world degradations are tolerated before those checks:
+
+    * **fragment bands** — the model's block bboxes often cut a printed line
+      in half, leaving a thin low-ink band at the crop edge, or pick up a
+      stray speck row between lines; these are dropped so they cannot veto a
+      real multi-line split,
+    * **many-line paragraphs** — dense body paragraphs regularly span more
+      than 6 printed rows; the band cap scales with the text length (longer
+      text plausibly fills more bands) so whole paragraphs stop being refused
+      outright.
 
     The renderer stretches each line's word to its bbox width, so a slightly
     off chunk seam only affects horizontal tightness, never which printed line
@@ -292,11 +352,17 @@ def split_block_text_across_bands(
     if not 40 <= thresh <= 245:
         return None
     profile = _row_profile(crop, thresh)
-    bands = _band_scan(profile, min_ink=_MIN_INK, min_gap=_MIN_GAP)
-    if len(bands) < 2 or len(bands) > max_lines:
+    bands = list(_band_scan(profile, min_ink=_MIN_INK, min_gap=_MIN_GAP))
+    cap = max(6, min(int(max_lines), len(text) // 6))
+    if len(bands) < 2 or len(bands) > cap:
         return None
     if not _textlike_bands(crop, bands, thresh):
-        return None
+        # Rescue: fragment/speck bands (thin + barely inked) vetoed the
+        # split.  Drop them and re-check; never touch bands that already
+        # passed, so clean real splits are unaffected.
+        bands = _clean_bands(crop, bands, thresh)
+        if len(bands) < 2 or not _textlike_bands(crop, bands, thresh):
+            return None
 
     extents = [_band_x_extent(crop, s, e, thresh) for s, e in bands]
     weights = [max(1, ex[1] - ex[0]) for ex in extents]
