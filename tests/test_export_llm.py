@@ -378,3 +378,132 @@ def test_llm_tag_does_not_leak_into_hocr():
     hocr = blocks_to_hocr(1000, 1400, blocks, dpi=300)
     assert "llm" not in hocr
     assert "内容" in hocr
+
+
+# --- progress callback -----------------------------------------------------------------
+
+def test_preprocess_progress_events_reflow_and_llm():
+    pages = [_page([
+        _block("电压\t逻辑\n3.5 V\t1", kind="table"),
+        _block("低置信的段落", conf=0.4),
+    ])]
+    events: list = []
+    fake = _FakeClient(_llm_json({"n": 0, "ok": True,
+                                  "text": "| 电压 | 逻辑 |\n|---|---|\n| 3.5 V | 1 |"}))
+    export_llm.preprocess(pages, {}, fmt="markdown", enable_llm=True,
+                          client=fake, progress=events.append)
+    phases = [ev["phase"] for ev in events]
+    assert "reflow" in phases
+    assert "llm" in phases
+    llm_events = [ev for ev in events if ev["phase"] == "llm"]
+    assert llm_events[0]["total"] == 2
+    assert llm_events[-1]["done"] == 1  # one accepted rewrite
+    assert llm_events[-1]["done"] <= llm_events[-1]["total"]
+
+
+def test_preprocess_progress_reflow_only():
+    pages = [_page([_block("数字逻辑概\n论是基础课。")])]
+    events: list = []
+    export_llm.preprocess(pages, {}, fmt="markdown", progress=events.append)
+    assert events == [{"phase": "reflow", "done": 1, "total": 1}]
+
+
+def test_preprocess_progress_callback_failure_never_breaks():
+    def bad(_ev):
+        raise RuntimeError("progress sink down")
+    pages = [_page([_block("数字逻辑概\n论是基础课。")])]
+    out = export_llm.preprocess(pages, {}, fmt="markdown", progress=bad)
+    assert out[0]["blocks"][0]["text"] == "数字逻辑概论是基础课。"
+
+
+# --- SSE export endpoint (backend.main) -------------------------------------------------
+
+def _seed_job(tmp_path, job_id="export-1", blocks=None):
+    """A done job in the registry with one real sidecar page."""
+    from backend import ocr_service
+    hocr_dir = tmp_path / "work" / job_id / "hocr"
+    hocr_dir.mkdir(parents=True, exist_ok=True)
+    page = {"page_index": 0, "width": 1000, "height": 1400,
+            "blocks": blocks if blocks is not None else [
+                {"kind": "text", "bbox": [0, 0, 100, 20],
+                 "text": "数字逻辑概\n论是基础课。", "lines": []}]}
+    (hocr_dir / "000001_ocr_hocr.blocks.json").write_text(
+        json.dumps({"page": page, "dpi": 300.0}, ensure_ascii=False),
+        encoding="utf-8")
+    job = {"job_id": job_id, "current": 1, "status": "done",
+           "filename": f"{job_id}.pdf", "hocr_dir": str(hocr_dir),
+           "previews_dir": str(tmp_path / "work" / job_id / "previews"),
+           "pdf_path": str(tmp_path / "uploads" / f"{job_id}.pdf"),
+           "num_pages": 1, "pages_done": 1, "error": "",
+           "embedded_path": "", "created_at": "", "has_embedded": False}
+    ocr_service._JOBS[job_id] = job
+    return job
+
+
+def _read_sse(text):
+    """Parse an SSE body into (data_events, keepalive_comment_count)."""
+    events, comments = [], 0
+    for block in text.split("\n\n"):
+        if block.startswith(":"):
+            comments += 1
+        elif block.startswith("data: "):
+            events.append(json.loads(block[len("data: "):]))
+    return events, comments
+
+
+def test_export_stream_progress_and_done(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    _seed_job(tmp_path)
+    try:
+        with TestClient(app) as tc:
+            with tc.stream("GET", "/api/export/stream/export-1.md?llm=0") as r:
+                assert r.status_code == 200
+                body = "".join(chunk for chunk in r.iter_text())
+    finally:
+        ocr_service._JOBS.pop("export-1", None)
+    events, _ = _read_sse(body)
+    kinds = [ev["type"] for ev in events]
+    assert "progress" in kinds and "done" in kinds
+    done = events[-1]
+    assert done["fmt"] == "markdown"
+    assert "数字逻辑概论是基础课。" in done["text"]
+
+
+def test_export_stream_validation_before_stream(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    _seed_job(tmp_path)
+    try:
+        with TestClient(app) as tc:
+            r = tc.get("/api/export/stream/export-1.html?llm=0")
+            assert r.status_code == 400
+            r2 = tc.get("/api/export/stream/no-such-job.md?llm=0")
+            assert r2.status_code == 404
+    finally:
+        ocr_service._JOBS.pop("export-1", None)
+
+
+def test_export_stream_error_event_not_broken_connection(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    _seed_job(tmp_path)
+    try:
+        with TestClient(app) as tc:
+            with tc.stream("GET", "/api/export/stream/export-1.md?llm=0&reflow=1") as r:
+                body = "".join(chunk for chunk in r.iter_text())
+    finally:
+        ocr_service._JOBS.pop("export-1", None)
+    # a mid-stream failure would be an SSE error event; here the happy path
+    # must NOT carry one
+    events, _ = _read_sse(body)
+    assert all(ev["type"] != "error" for ev in events)

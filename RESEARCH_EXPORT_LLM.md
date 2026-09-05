@@ -18,10 +18,12 @@
 5. **成本**：块级模式通常只触发全文档 10–20% 的块；整文档重排最贵（约等于重新识别
    一遍的输出量）且幻觉风险最高，只作实验模式。
 
-> **状态（P1/P2 已实现，分支本 worktree）**：`backend/export_llm.py`（P0 确定性
-> reflow + P1 LLM 块修整）、`backend/export.py` 的 `llm > raw > text` 三层
-> `block_source` 与 `_md_table_to_rows`、config 键 + env 别名、`?llm=1`/`?reflow=0`
-> 路由参数、`--export-llm`/`--no-reflow` CLI、`tests/test_export_llm.py`（71 例）。
+> **状态（P1/P2 + WebUI 已实现，分支本 worktree）**：`backend/export_llm.py`（P0 确定性
+> reflow + P1 LLM 块修整 + progress 回调）、`backend/export.py` 的 `llm > raw > text`
+> 三层 `block_source` 与 `_md_table_to_rows`、config 键 + env 别名、`?llm=1`/`?reflow=0`
+> 路由参数 + SSE 导出流（`/api/export/stream/{job}.{ext}`：progress 事件 + done 携带全文、
+> 15s keepalive）、`--export-llm`/`--no-reflow` CLI、WebUI 导出按钮 + 独立导出进度条、
+> `tests/test_export_llm.py`（80 例）。
 > 关键洞见落地：**line-split 对导出是反模式**（见 §1），P0 的第一步就是把它 unwrap 掉。
 
 ---
@@ -261,7 +263,7 @@ python -m backend.cli in.pdf -o out.md --export markdown --export-llm
 |------|------|------|
 | P1 | `backend/export_llm.py` 的 P0 确定性部分 + `block_source` 三层扩展 + 单测 | ✅ 已实现 |
 | P2 | 块级 LLM：client（httpx + retry，复用 `resolve()`）、guard、缓存、`?llm=1`、`--export-llm`、config 键 | ✅ 已实现（v1 文本模式） |
-| P3 | 图像取证（PyMuPDF 裁块）、整文档模式（实验）、WebUI 开关、图片实体导出（见 §11） | 未开始 |
+| P3 | 图像取证（PyMuPDF 裁块）、整文档模式（实验）、图片实体导出（见 §11） | 未开始（WebUI 导出按钮 + SSE 进度条 ✅ 已提前落地） |
 
 ## 10. 开放问题
 

@@ -13,6 +13,7 @@ Endpoints:
   GET  /api/download/{job_id}.pdf   download embedded result
   GET  /api/export/{job_id}.md|.tex  export pages as markdown / LaTeX
                                      (?reflow=1 re-wrap, ?llm=1 LLM fix-up)
+  GET  /api/export/stream/{job_id}.{ext}  SSE export: progress + done(text)
 
 The OCR core is OCRmyPDF; the unlimited engine ships as the standalone
 ``ocrmypdf_unlimited`` plugin (``backend/ocrmypad`` is a compat alias).
@@ -741,6 +742,85 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
         media_type=f"{media}; charset=utf-8",
         headers={"Content-Disposition": disposition},
     )
+
+
+@app.get("/api/export/stream/{job_id}.{ext}")
+def export_document_stream(job_id: str, ext: str, raw: str = "1",
+                           llm: str = "0", reflow: str = "1"):
+    """SSE export: progress events while the pre-processing runs, then one
+    ``done`` event carrying the full document text.
+
+    The LLM fix-up can take minutes (one API call per block batch), so the
+    WebUI streams a progress bar from the ``progress`` events instead of
+    waiting on a plain GET.  Event shapes (``backend.export_llm.preprocess``
+    progress callback):
+      ``{"type":"progress","phase":"reflow"|"llm","done":n,"total":m}``
+      ``{"type":"done","fmt":"markdown"|"latex","text":"..."}``
+      ``{"type":"error","message":"..."}``
+    Validation errors (404/400) raise before the stream starts; a failure
+    mid-stream is an ``error`` event, never a broken connection.
+    """
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pages = export_mod.load_job_pages(job)
+    if not pages:
+        raise HTTPException(
+            status_code=404, detail="No OCR pages to export — run OCR first")
+    fmt = {"md": "markdown", "tex": "latex"}.get((ext or "").lower())
+    if fmt is None:
+        raise HTTPException(
+            status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+
+    # Snapshot the inputs for the worker thread (the request handler returns
+    # before the work finishes — nothing in the closure may touch the request).
+    cfg = config.resolve()
+    use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_llm = str(llm).lower() not in ("0", "false", "no")
+    cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
+                  if job.get("hocr_dir") else None)
+    title = Path(job.get("filename") or "document").stem
+    use_raw = str(raw).lower() not in ("0", "false", "no")
+    ext_out = ext.lower()
+
+    async def gen():
+        import queue as _queue
+        import threading
+
+        events: _queue.Queue = _queue.Queue()
+
+        def work() -> None:
+            try:
+                pages2 = export_llm.preprocess(
+                    pages, cfg, fmt=fmt, enable_llm=use_llm,
+                    reflow=use_reflow, cache_path=cache_path,
+                    progress=events.put)
+                text = export_mod.export_document(
+                    fmt, pages2, title=title, use_raw=use_raw)
+                events.put({"_result": text})
+            except BaseException as exc:  # noqa: BLE001 — an error event, not a dropped connection
+                from backend.config import redact_secrets
+                events.put({"_error": redact_secrets(str(exc))})
+
+        threading.Thread(target=work, daemon=True, name="export-llm").start()
+        while True:
+            try:
+                ev = events.get(timeout=15.0)
+            except _queue.Empty:
+                # SSE comment keepalive: proxies/browsers time a silent
+                # stream out long before the LLM batch budget.
+                yield ": keepalive\n\n"
+                continue
+            if "_error" in ev:
+                yield _sse({"type": "error", "message": ev["_error"]})
+                break
+            if "_result" in ev:
+                yield _sse({"type": "done", "fmt": fmt, "ext": ext_out,
+                            "text": ev["_result"]})
+                break
+            yield _sse({"type": "progress", **ev})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/validation/{job_id}")

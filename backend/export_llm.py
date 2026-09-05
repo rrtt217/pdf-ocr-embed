@@ -530,7 +530,8 @@ def resolve_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
 def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                fmt: str = "markdown", *, enable_llm: Optional[bool] = None,
                reflow: Optional[bool] = None, client: Any = None,
-               cache_path: Optional[Path] = None) -> List[dict]:
+               cache_path: Optional[Path] = None,
+               progress: Optional[Any] = None) -> List[dict]:
     """Pre-process page dicts for export (the ONLY entry point callers need).
 
     Deep-copies ``pages`` and applies, in order: the deterministic reflow
@@ -542,6 +543,10 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
     ``client`` replaces the built ``ExportLlmClient`` (tests inject fakes);
     when the LLM is enabled but no API key is configured, the LLM pass is
     skipped with a warning — export never fails because of it.
+
+    ``progress`` (callable) receives ``{"phase": "reflow"|"llm", "done": n,
+    "total": m}`` events — the LLM pass can take minutes, so callers stream a
+    progress bar from them.  Callback failures never break the export.
     """
     settings = resolve_settings(cfg or {})
     if reflow is not None:
@@ -552,6 +557,14 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
         return pages
 
     pages = copy.deepcopy(pages)
+
+    def notify(ev: dict) -> None:
+        if progress is None:
+            return
+        try:
+            progress(ev)
+        except Exception:  # noqa: BLE001 — cosmetic, never breaks the export
+            log.debug("export progress callback failed", exc_info=True)
 
     # P0: deterministic reflow (offline).
     if settings["reflow"]:
@@ -573,6 +586,7 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                     reflow_table_block(block)
             mark_list_items(blocks)
         merge_cross_page(pages)
+        notify({"phase": "reflow", "done": 1, "total": 1})
 
     # P1: LLM block fix-up (opt-in).
     if settings["llm"]:
@@ -585,20 +599,21 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                 llm_client = ExportLlmClient.from_config(cfg or {},
                                                          settings["model"])
         if llm_client is not None:
-            _fix_with_llm(pages, settings, fmt, llm_client, cache_path)
+            _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
+                          progress=notify)
 
     return pages
 
 
 def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
-                  client: Any, cache_path: Optional[Path]) -> int:
+                  client: Any, cache_path: Optional[Path],
+                  progress: Optional[Any] = None) -> int:
     """Run the LLM fix-up over the eligible blocks (in place).  Returns the
     fixed count.  Per-block guards reject bad rewrites; every failure keeps
     the block's pre-LLM content."""
     cache = load_cache(cache_path)
     model = settings["model"]
     batch_size = settings["batch_size"]
-    fixed = 0
 
     eligible: List[dict] = []
     for page in pages:
@@ -609,7 +624,18 @@ def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
                 eligible.append(block)
     if not eligible:
         return 0
+    total = len(eligible)
 
+    def notify(done: int) -> None:
+        if progress is None:
+            return
+        try:
+            progress({"phase": "llm", "done": done, "total": total})
+        except Exception:  # noqa: BLE001 — cosmetic
+            pass
+
+    fixed = 0
+    notify(0)
     for start in range(0, len(eligible), batch_size):
         chunk = eligible[start:start + batch_size]
         pending: List[dict] = []
@@ -625,6 +651,7 @@ def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
             pending.append({"n": n, "kind": kind, "text": source,
                             "_block": block, "_key": key})
         if not pending:
+            notify(fixed)
             continue
         prompt = _user_prompt(pending, fmt)
         max_tokens = max(1024, min(32767, int(
@@ -634,6 +661,7 @@ def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
         if not items:
             log.warning("export LLM batch returned no usable JSON (%s block(s)) "
                         "— kept as-is", len(pending))
+            notify(fixed)
             continue
         by_n: Dict[int, dict] = {}
         for it in items:
@@ -654,6 +682,7 @@ def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
             _apply_llm_text(p["_block"], out, model)
             cache[p["_key"]] = {"text": out}
             fixed += 1
+        notify(fixed)
     save_cache(cache_path, cache)
     return fixed
 
