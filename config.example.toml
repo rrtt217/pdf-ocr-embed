@@ -56,6 +56,15 @@ model = "unlimited-ocr"                      # model / deployment name
 # ocr_batch_timeout_ms = 3000                # window flush timeout (backstop, ms)
 # ocr_batch_per_page_tokens = 2048           # per-page output token budget in a batch
 
+# --- Raw block generation (unlimited engine, opt-in) -------------------------
+# Keep each block's raw (pre-normalization) engine content: the block sidecar
+# gains a "raw" field and the hOCR gains x_kind/x_raw ocr_par title properties
+# (hOCR 1.2 extensions, ignored by ocrmypdf's renderer).  Other-format export
+# (markdown/LaTeX, GET /api/export/...) reads the raw content so the lossy
+# text normalization (math spacing, LaTeX->plain, table HTML->rows) can be
+# skipped.  Default off; the embedded text layer is unaffected.
+# generate_raw = false
+
 # --- Temp-file cleanup (see backend/cleanup.py) ----------------------------
 cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days
 cleanup_interval_hours = 6                   # background cleanup re-run interval

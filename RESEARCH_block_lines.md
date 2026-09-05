@@ -137,3 +137,36 @@ Ranked options:
   acceptable next to multi-minute API calls, ensure not to regress
   expectations on very large blocks (bands capped at `max_lines=6` for the
   text-across-bands path).
+
+## Follow-up (real-scan audit, 2026-09)
+
+Validated the collapsed-paragraph path (`split_block_text_across_bands`)
+against 438 real scanned pages of a 517-page uploaded text-book run (real
+unlimited-model blocks.json + rasterized pages). Findings and fixes:
+
+- **~4660 single-line text blocks got NO split at all.** Gating failure
+  breakdown: 3155 had a single image band (mostly genuinely single-line
+  items), 427 failed `_textlike_bands`, 122 exceeded `max_lines=6` (dense
+  body paragraphs spanning 7–23 printed rows were refused outright), 267 had
+  no ink.
+- **Fragment/speck bands vetoed valid splits.** The model's block bboxes
+  routinely clip a line at the crop edge or catch a 1-10px stray row; such a
+  thin, barely-inked band fails the height-ratio check and rejects the whole
+  block. Added `_clean_bands` as a **rescue only**: when `_textlike_bands`
+  fails, thin low-ink bands are dropped (`h <= 0.35×median` AND ink ≤ 0.3;
+  dense rules are kept so they still reject) and the check is re-run. Bands
+  that already pass are never touched — zero regressions on the 1722 blocks
+  the old code split.
+- **`max_lines=6` cap too low** for dense body text; the cap now scales with
+  text length (`max(6, min(24, len(text)//6))`), capping the huge-block
+  anomaly too (`_MAX_BANDS = 24`).
+- Result on the same real pages: **1715 → 2065** single-line paragraphs split
+  (+350), `not-textlike` rejects 427 → ~204 (all remaining are genuinely
+  single-line items or rules/graphics where a split would be unsafe),
+  `max_lines` refusals ~122 → ~4.
+- New unit tests: edge-fragment drop, interior-speck drop, many-row
+  (`>6`) scaling, short-text cap, dense-rule-inside-text still rejected.
+  Full suite 238 passed.
+- Tables and other newline-bearing blocks are untouched: they go through
+  `split_block_into_lines` (band reconciliation to exact `n_lines`), not the
+  collapsed path.

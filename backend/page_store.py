@@ -20,6 +20,7 @@ work folder on disk.
 from __future__ import annotations
 
 import json
+import base64
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -364,6 +365,19 @@ def _hocr_line_class(kind: str) -> str:
     }.get(kind, "ocr_line")
 
 
+def _raw_prop_value(text: str) -> str:
+    """Encode a block's raw text as an hOCR 1.2 ``ascii-word`` property value.
+
+    Host-side copy of ``ocrmypdf_unlimited.parser._raw_prop_value`` (pinned
+    identical by tests) — the backend never imports plugin internals.
+    base64url (``A-Za-z0-9_=-``) satisfies the hOCR 1.2 §2.4 ``ascii-word``
+    grammar (printable ASCII, no space/semicolon).
+    """
+    if not text:
+        return ""
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+
+
 def blocks_to_hocr(width: int, height: int, blocks: List[dict],
                    dpi: float = 300.0, ppageno: int = 0) -> str:
     """Render normalized block dicts as an hOCR document for ocrmypdf.
@@ -404,8 +418,18 @@ def blocks_to_hocr(width: int, height: int, blocks: List[dict],
         if not par_lines:
             continue
         b = block.get("bbox") or [0, 0, 0, 0]
+        title = f"bbox {b[0]} {b[1]} {b[2]} {b[3]}"
+        # Raw-content blocks (the engine's generate_raw option) carry
+        # engine properties on the ocr_par title (hOCR 1.2 extensions,
+        # invisible to ocrmypdf's renderer) so a regenerated hOCR keeps them.
+        raw_text = str(block.get("raw") or "")
+        if raw_text:
+            title += f"; x_kind {block.get('kind') or 'text'}"
+            raw_value = _raw_prop_value(raw_text)
+            if raw_value:
+                title += f"; x_raw {raw_value}"
         body.append(
-            f' <p class="ocr_par" title="bbox {b[0]} {b[1]} {b[2]} {b[3]}">\n'
+            f' <p class="ocr_par" title="{title}">\n'
             + "\n".join(par_lines)
             + "\n </p>"
         )

@@ -109,6 +109,13 @@ def add_options(parser):
         "--unlimited-rate-limit-rps", dest="unlimited_rate_limit_rps",
         default=None, type=float, metavar="RPS",
         help="Cap API requests per second; 0 (default) disables limiting.")
+    group.add_argument(
+        "--unlimited-generate-raw", dest="unlimited_generate_raw",
+        default=None, action="store_true",
+        help="Keep the engine's raw (pre-normalization) marker content per "
+             "block: the block sidecar gains a 'raw' field and the hOCR "
+             "gains x_kind/x_raw engine properties on each ocr_par title "
+             "(off by default).  The invisible text layer is unaffected.")
 
 
 @hookimpl

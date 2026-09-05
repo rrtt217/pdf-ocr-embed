@@ -234,12 +234,33 @@ uvicorn backend.main:app --port 8000
 ```bash
 python -m backend.cli book.pdf --engine tesseract --pages 1-20 --jobs 2
 python -m backend.cli book.pdf --engine unlimited --pages 1-5 --sidecar-text  # 打印每页文本
+# 纯导出（跳过文字层嵌入）：
+python -m backend.cli book.pdf --export markdown -o book.md
+python -m backend.cli book.pdf --export latex -o book.tex
 ```
 
 参数：`--engine`（默认 unlimited）、`--pages`（1 起；`"1-20"` / `"1,3,5-7"` / `"1-"` / `"-5"`）、
-`--jobs`（worker 数）、`--out`（默认 `output/`）、`--sidecar-text`。
-输出 `<名>_embedded_<id>.pdf`。API key 等配置仍走 `resolve()`（TOML / 环境变量），
-不做任何硬编码。
+`--jobs`（worker 数）、`--out`（默认 `output/`）、`--sidecar-text`、
+`--export markdown|latex`（只跑 OCR 阶段并导出，不嵌文字层）。
+输出 `<名>_embedded_<id>.pdf`（导出模式为 `<名>.md`/`.tex`）。
+API key 等配置仍走 `resolve()`（TOML / 环境变量），不做任何硬编码。
+
+### 其他格式导出（markdown / LaTeX）
+
+`GET /api/export/{job_id}.md|.tex` 把任务的识别页导出为 Markdown 或 LaTeX：
+
+- 标题块按编号深度映射层级（`1.` → `#`/`\section`，`1.2` → `##`/`\subsection`）；
+  表格块渲染为 Markdown 管道表 / LaTeX `tabular`；公式块为 `$$...$$` /
+  `equation*`；图片块为带 caption 的占位；页眉页脚页码自动跳过。
+- **raw 内容（跳过归一化）**：文本归一化（`text_norm`）是为嵌入 PDF 的可搜索
+  文字层设计的，会丢信息（数学空格折叠、LaTeX 转纯文本、表格 HTML 拍平）。
+  开启引擎的 `generate_raw` 选项后（`config.toml` 的 `generate_raw = true` 或
+  环境变量 `OCR_GENERATE_RAW=1`，默认关闭），块 sidecar 会额外携带每块的
+  引擎原文（`raw` 字段），hOCR 在每个 `ocr_par` title 上附带
+  `x_kind`/`x_raw` 引擎属性（hOCR 1.2 扩展机制，OCRmyPDF 渲染器完全忽略，
+  嵌入路径不受影响）。导出时优先用 raw：表格按原始 HTML 结构渲染成真正的
+  表格、公式保留 `\frac{}{}` 等 LaTeX 命令。sidecar 无 raw 时（旧任务、
+  tesseract 派生页、选项关闭）自动回退到归一化文本。
 
 ### API 速览
 
@@ -259,6 +280,8 @@ python -m backend.cli book.pdf --engine unlimited --pages 1-5 --sidecar-text  # 
 | POST | `/api/pages/{job_id}/{i}` | 更新单个可编辑页（写 sidecar + 重生成 hOCR） |
 | POST | `/api/embed/{job_id}` | 合成（可编辑后的）文字 → `<源名>_embedded.pdf`（`optimize`、`output_type`；带 `pages` 时产出仅含所选页的 `<源名>_partial.pdf`） |
 | GET  | `/api/download/{job_id}.pdf` | 下载嵌入结果 |
+| GET  | `/api/export/{job_id}.md` | 导出识别页为 Markdown（`?raw=0` 强制用归一化文本；默认优先用 raw 内容） |
+| GET  | `/api/export/{job_id}.tex` | 导出识别页为 LaTeX（含 ctex/amsmath 最小序言） |
 | GET  | `/api/cleanup` | 临时文件清理概况（未被任务引用的 work/output/uploads 文件数量与大小） |
 | POST | `/api/cleanup/run` | 执行/预览清理（`older_than_hours` 保留时长、`dry_run` 预览、`force` 忽略时限，仍永不删任务在用文件） |
 

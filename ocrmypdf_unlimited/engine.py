@@ -322,6 +322,13 @@ class UnlimitedOcrEngine(OcrEngine):
         cfg = unlimited_settings.effective(options)
         client = UnlimitedOcrClient(config=cfg)
 
+        # generate_raw (default off): keep each block's raw (pre-normalized)
+        # content — the block sidecar gains a 'raw' field and the hOCR gains
+        # x_kind/x_raw properties on each ocr_par title (hOCR 1.2 extensions).
+        # Purely additive metadata for other-format export; the invisible text
+        # layer and the editor are unaffected.
+        save_raw = unlimited_settings.as_bool(cfg.get("generate_raw"))
+
         # Multi-page (batch) mode: group concurrent pages into one request.
         # Skipped for serial runs (jobs=1) and when no ocrmypdf options are
         # available.  _batch_recognize falls back to a per-page request on any
@@ -334,7 +341,8 @@ class UnlimitedOcrEngine(OcrEngine):
         else:
             raw = client.recognize(input_file)
 
-        page = parse_response(raw, width, height, page_index)
+        page = parse_response(raw, width, height, page_index,
+                              save_raw=save_raw)
 
         per_line = _per_line_overrides(input_file, page)
         hocr_text = blocks_to_hocr(width, height, page.blocks, dpi=dpi,
