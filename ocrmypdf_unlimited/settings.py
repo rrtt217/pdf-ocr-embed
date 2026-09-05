@@ -47,6 +47,7 @@ _OPTION_KEYS = {
     "unlimited_retry_base_delay": "retry_base_delay",
     "unlimited_retry_max_delay": "retry_max_delay",
     "unlimited_rate_limit_rps": "rate_limit_rps",
+    "unlimited_generate_raw": "generate_raw",
 }
 
 #: The plugin's own environment surface (independent of any host's config).
@@ -62,6 +63,7 @@ _ENV_ALIASES = {
     "OCR_UNLIMITED_RETRY_BASE_DELAY": "retry_base_delay",
     "OCR_UNLIMITED_RETRY_MAX_DELAY": "retry_max_delay",
     "OCR_UNLIMITED_RATE_LIMIT_RPS": "rate_limit_rps",
+    "OCR_UNLIMITED_GENERATE_RAW": "generate_raw",
 }
 
 
@@ -113,6 +115,19 @@ def from_env() -> Dict[str, Any]:
         if value:
             cfg[key] = value
     return cfg
+
+
+def as_bool(value: Any) -> bool:
+    """Coerce a setting to a boolean (config strings, JSON bools, argparse bools).
+
+    Accepts TOML/JSON booleans, ints, and string forms like "true"/"1"/"yes".
+    Anything unrecognized is falsy.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "y")
 
 
 def effective(options=None) -> Dict[str, Any]:

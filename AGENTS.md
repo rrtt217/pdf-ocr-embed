@@ -100,6 +100,7 @@ backend/
   errors.py               # UnavailableError (aliased to plugin's) + coordinate copy
   ocr_service.py          # job flow on _pdf_to_hocr + _hocr_to_ocr_pdf
   models.py               # editor page JSON (OcrPage/OcrBlock compatible)
+  export.py               # other-format export: markdown + LaTeX (pure builders)
   pdf_processing.py       # page preview rendering (PyMuPDF)
   validation.py           # post-embed coverage report
   batch.py                # ZIP packaging (streamed)

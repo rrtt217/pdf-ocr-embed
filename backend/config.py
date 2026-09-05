@@ -58,6 +58,12 @@ _FILE_KEYS = (
     "ocr_batch_size",            # pages per multi-image request
     "ocr_batch_timeout_ms",      # batch window flush timeout (backstop, ms)
     "ocr_batch_per_page_tokens", # per-page output token budget inside a batch
+    # unlimited engine raw generation (ocrmypdf_unlimited.parser): keep each
+    # block's raw (pre-normalization) content in the block sidecar ('raw'
+    # field) and the hOCR (x_kind/x_raw ocr_par title properties) so
+    # other-format export (markdown/LaTeX) can skip the lossy normalization.
+    # Default off; the embedded text layer is unaffected.
+    "generate_raw",
     # ocrmypdf pipeline knobs (backend.ocr_service builds OcrOptions from these)
     "ocrmypdf_mode",        # force | skip | redo | default (default: force)
     "ocrmypdf_jobs",        # 0 = auto (cpu count)
@@ -85,6 +91,7 @@ _ENV_ALIASES = {
     "OCR_BATCH_SIZE": "ocr_batch_size",
     "OCR_BATCH_TIMEOUT_MS": "ocr_batch_timeout_ms",
     "OCR_BATCH_PER_PAGE_TOKENS": "ocr_batch_per_page_tokens",
+    "OCR_GENERATE_RAW": "generate_raw",
     "OCRMYPDF_MODE": "ocrmypdf_mode",
     "OCRMYPDF_JOBS": "ocrmypdf_jobs",
     "OCRMYPDF_OPTIMIZE": "ocrmypdf_optimize",
@@ -208,6 +215,7 @@ def get_effective_settings() -> Dict[str, Any]:
         "ocr_batch_size": cfg.get("ocr_batch_size", "0"),
         "ocr_batch_timeout_ms": cfg.get("ocr_batch_timeout_ms", "3000"),
         "ocr_batch_per_page_tokens": cfg.get("ocr_batch_per_page_tokens", "2048"),
+        "generate_raw": as_bool(cfg.get("generate_raw", "false")),
     }
 
 
@@ -248,6 +256,9 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("ocr_batch_size", "ocr_batch_timeout_ms", "ocr_batch_per_page_tokens"):
         if settings.get(key) is not None:
             data[key] = str(settings[key]).strip()
+    for key in ("generate_raw",):
+        if settings.get(key) is not None:
+            data[key] = "true" if as_bool(settings[key]) else "false"
 
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)

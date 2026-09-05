@@ -11,6 +11,7 @@ Endpoints:
   POST /api/embed/{job_id}      finalize (possibly edited) pages -> *_embedded.pdf
   GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
+  GET  /api/export/{job_id}.md|.tex  export pages as markdown / LaTeX
 
 The OCR core is OCRmyPDF; the unlimited engine ships as the standalone
 ``ocrmypdf_unlimited`` plugin (``backend/ocrmypad`` is a compat alias).
@@ -29,14 +30,14 @@ from typing import List, Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               StreamingResponse)
+                               Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from backend import batch
 from backend import cleanup as cleanup_mod
-from backend import config, ocr_service, validation
+from backend import config, export as export_mod, ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
 
 setup_logging()
@@ -671,6 +672,52 @@ def download(job_id: str):
         path,
         media_type="application/pdf",
         filename=Path(path).name,
+    )
+
+
+@app.get("/api/export/{job_id}.{ext}")
+def export_document(job_id: str, ext: str, raw: str = "1"):
+    """Export the job's recognized pages as markdown (``.md``) or LaTeX
+    (``.tex``).
+
+    ``raw=1`` (default) uses each block's raw (pre-normalization) content when
+    the sidecar carries it — written by the unlimited engine when its
+    ``generate_raw`` option is on — so the lossy normalization (math spacing,
+    LaTeX -> plain, table HTML -> rows) is skipped and tables render as real
+    markdown tables / LaTeX ``tabular``.  ``raw=0`` always uses the normalized
+    text.  Pages whose sidecar has no raw field fall back to it either way.
+
+    404 when the job or its pages are missing; 400 for an unknown extension.
+    """
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pages = export_mod.load_job_pages(job)
+    if not pages:
+        raise HTTPException(
+            status_code=404, detail="No OCR pages to export — run OCR first")
+    fmt = {"md": "markdown", "tex": "latex"}.get((ext or "").lower())
+    if fmt is None:
+        raise HTTPException(
+            status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+    try:
+        text = export_mod.export_document(
+            fmt, pages, title=Path(job.get("filename") or "document").stem,
+            use_raw=str(raw).lower() not in ("0", "false", "no"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    media = "text/markdown" if fmt == "markdown" else "application/x-tex"
+    stem = (Path(job.get("filename") or "document").stem or "document")
+    # Non-ASCII filenames must use RFC 5987 filename* (a raw CJK header value
+    # breaks the HTTP layer); the ASCII fallback keeps simple names intact.
+    from urllib.parse import quote
+    ascii_stem = stem.encode("ascii", "ignore").decode() or "export"
+    disposition = (f'attachment; filename="{ascii_stem}.{ext.lower()}"; '
+                   f"filename*=UTF-8''{quote(stem)}.{ext.lower()}")
+    return Response(
+        content=text,
+        media_type=f"{media}; charset=utf-8",
+        headers={"Content-Disposition": disposition},
     )
 
 

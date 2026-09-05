@@ -8,11 +8,19 @@ page image width/height, and produces:
 * one hOCR document per page (``blocks_to_hocr``) that ocrmypdf's fpdf2
   renderer turns into the invisible text layer.
 
+When ``save_raw`` is on, each block also keeps the engine's raw
+(pre-normalization) content in ``Block.raw`` — the block sidecar gains a
+``raw`` field and the hOCR gains ``x_kind``/``x_raw`` engine properties on
+each ``ocr_par`` title (the hOCR 1.2 extension mechanism, §2.2.2).  This is
+what other-format export (markdown / LaTeX) reads: the normalized text is
+lossy by design (math spacing, LaTeX -> plain, table HTML -> rows).
+
 All block bboxes are **integers in raw pixel space** (top-left origin) — the
 same invariant the rest of this project has always preserved.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from dataclasses import dataclass, field
@@ -46,6 +54,10 @@ class Block:
     conf: Optional[float] = None
     font_scale: float = 1.0
     lines: List[str] = field(default_factory=list)
+    # The engine's raw (pre-normalization) content, kept only when the
+    # ``generate_raw`` option is on.  Empty string when absent — never
+    # written to the sidecar/hOCR then, so sidecars stay exactly as before.
+    raw: str = ""
 
     def to_dict(self) -> dict:
         d: dict = {"kind": self.kind, "bbox": self.bbox, "text": self.text}
@@ -57,6 +69,8 @@ class Block:
             d["conf"] = self.conf
         if self.font_scale != 1.0:
             d["font_scale"] = self.font_scale
+        if self.raw:
+            d["raw"] = self.raw
         return d
 
     @classmethod
@@ -82,6 +96,7 @@ class Block:
             caption_bbox=caption_bbox,
             conf=conf,
             font_scale=font_scale,
+            raw=str(data.get("raw") or ""),
         )
 
 
@@ -141,8 +156,15 @@ def split_multi_page_stream(raw: str, n_expected: int) -> List[str]:
     return sections + [""] * (n_expected - len(sections))
 
 
-def parse_response(text: str, width: int, height: int, page_index: int) -> Page:
-    """Parse one page's marker stream into a normalized Page."""
+def parse_response(text: str, width: int, height: int, page_index: int,
+                   save_raw: bool = False) -> Page:
+    """Parse one page's marker stream into a normalized Page.
+
+    ``save_raw``: keep each block's raw (pre-normalization) content in
+    ``Block.raw``.  Only blocks whose content normalization actually changed
+    carry it (an unchanged content would be redundant); other-format export
+    reads it in preference to the lossy normalized ``text``.
+    """
     blocks: List[Block] = []
     pending_caption: Optional[Block] = None
 
@@ -170,14 +192,19 @@ def parse_response(text: str, width: int, height: int, page_index: int) -> Page:
                 # bbox as the caption bbox.
                 pending_caption.caption = caption_text
                 pending_caption.caption_bbox = px_bbox
+                if save_raw and content and content != caption_text:
+                    pending_caption.raw = content
                 blocks.append(pending_caption)
                 pending_caption = None
             else:
                 # No preceding <|det|>image: keep the caption in its own
                 # block with text set so embedding writes it into the PDF
                 # text layer.
-                blocks.append(Block(kind="image_caption", bbox=px_bbox,
-                                    text=caption_text))
+                block = Block(kind="image_caption", bbox=px_bbox,
+                              text=caption_text)
+                if save_raw and content and content != caption_text:
+                    block.raw = content
+                blocks.append(block)
             continue
 
         if kind in ("image", "image_ref") and not content:
@@ -185,8 +212,11 @@ def parse_response(text: str, width: int, height: int, page_index: int) -> Page:
             continue
 
         block_text = text_norm.normalize_engine_text(kind, content)
-        blocks.append(Block(kind=kind, bbox=px_bbox, text=block_text,
-                            lines=split_block_lines(block_text)))
+        block = Block(kind=kind, bbox=px_bbox, text=block_text,
+                      lines=split_block_lines(block_text))
+        if save_raw and content and content != block_text:
+            block.raw = content
+        blocks.append(block)
 
     if pending_caption is not None:
         blocks.append(pending_caption)
@@ -234,6 +264,50 @@ def _line_bboxes(block: Block, n_lines: int) -> List[List[int]]:
     return bboxes
 
 
+def _raw_prop_value(text: str) -> str:
+    """Encode a block's raw text as an hOCR 1.2 ``ascii-word`` property value.
+
+    Per the hOCR 1.2 spec (§2.4) a title property value may only contain
+    printable ASCII without whitespace and semicolons, so CJK text, spaces and
+    newlines MUST be encoded: base64url (``A-Za-z0-9_=-``) fits exactly.
+    Empty input encodes to "" (the property is omitted instead).
+    """
+    if not text:
+        return ""
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def raw_prop_value(text: str) -> str:
+    """Public alias of :func:`_raw_prop_value` (shared with the backend's
+    engine-agnostic hOCR emission in ``backend.page_store``)."""
+    return _raw_prop_value(text)
+
+
+def decode_raw_prop(value: str) -> str:
+    """Decode an ``x_raw`` property value back to the block's raw text.
+
+    Tolerates both base64url and plain values (a value that was written
+    percent-encoded or unencoded by another producer decodes best-effort).
+    """
+    if not value:
+        return ""
+    try:
+        return base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
+    except (ValueError, UnicodeError):
+        return value
+
+
+def _block_raw(block) -> str:
+    """A block's raw content, from a Block dataclass or a plain sidecar dict.
+
+    ``blocks_to_hocr`` accepts both (the engine passes Blocks; the backend's
+    sidecar round-trips plain dicts with an optional ``raw`` key).
+    """
+    if isinstance(block, dict):
+        return str(block.get("raw") or "")
+    return getattr(block, "raw", "") or ""
+
+
 def blocks_to_hocr(width: int, height: int, blocks: List[Block],
                    dpi: float = 300.0, ppageno: int = 0,
                    per_line_overrides: Optional[dict] = None) -> str:
@@ -258,9 +332,14 @@ def blocks_to_hocr(width: int, height: int, blocks: List[Block],
       * an ocr_line with no ocrx_word child is DROPPED by the parser, so every
         line carries exactly one word span.
       * pure image blocks (no text, no caption) contribute nothing.
+      * blocks carrying raw content (``Block.raw``) get ``x_kind``/``x_raw``
+        engine properties appended to their ocr_par title (the hOCR 1.2
+        extension mechanism) — ocrmypdf's hocrtransform parser ignores unknown
+        title properties, so the embed render is byte-identical (verified).
     """
     dpi_i = max(1, int(round(dpi)))
     body: List[str] = []
+    has_raw = any(_block_raw(block) for block in blocks)
     for block_index, block in enumerate(blocks):
         override = None
         if per_line_overrides:
@@ -297,13 +376,27 @@ def blocks_to_hocr(width: int, height: int, blocks: List[Block],
         if not par_lines:
             continue
         b = block.bbox
+        title = f"bbox {b[0]} {b[1]} {b[2]} {b[3]}"
+        # Raw-content blocks carry engine properties on the ocr_par title
+        # (hOCR 1.2 §2.2.2: x_-prefixed names are implementation-specific
+        # extensions).  x_kind is needed alongside x_raw: the hOCR line
+        # classes lose the equation/table distinction the normalizer
+        # dispatches on.  ocrmypdf's parser reads only the known title keys
+        # (bbox/scan_res/...), so these are invisible to the embed render.
+        block_raw = _block_raw(block)
+        if block_raw:
+            title += f"; x_kind {block.kind}"
+            raw_value = _raw_prop_value(block_raw)
+            if raw_value:
+                title += f"; x_raw {raw_value}"
         body.append(
-            f' <p class="ocr_par" title="bbox {b[0]} {b[1]} {b[2]} {b[3]}">\n'
+            f' <p class="ocr_par" title="{title}">\n'
             + "\n".join(par_lines)
             + "\n </p>"
         )
 
     body_text = "\n".join(body)
+    capabilities = ("ocrp_x_raw ocrp_x_kind " if has_raw else "")
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"\n'
@@ -312,7 +405,9 @@ def blocks_to_hocr(width: int, height: int, blocks: List[Block],
         "<head>\n"
         "<title>Unlimited-OCR page</title>\n"
         '<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>\n'
-        "<meta name='ocr-system' content='Unlimited-OCR (pdf-ocr-embed ocrmypad plugin)'/>\n"
+        '<meta name="ocr-system" content="Unlimited-OCR (pdf-ocr-embed ocrmypad plugin)"/>\n'
+        # hOCR 1.2 §6.2: custom properties must be declared as capabilities.
+        f'<meta name="ocr-capabilities" content="{capabilities}physical ocrp_x_source"/>\n'
         "</head>\n"
         "<body>\n"
         f"<div class='ocr_page' id='page_{ppageno + 1}' "
