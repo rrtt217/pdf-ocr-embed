@@ -18,6 +18,12 @@
 5. **成本**：块级模式通常只触发全文档 10–20% 的块；整文档重排最贵（约等于重新识别
    一遍的输出量）且幻觉风险最高，只作实验模式。
 
+> **状态（P1/P2 已实现，分支本 worktree）**：`backend/export_llm.py`（P0 确定性
+> reflow + P1 LLM 块修整）、`backend/export.py` 的 `llm > raw > text` 三层
+> `block_source` 与 `_md_table_to_rows`、config 键 + env 别名、`?llm=1`/`?reflow=0`
+> 路由参数、`--export-llm`/`--no-reflow` CLI、`tests/test_export_llm.py`（71 例）。
+> 关键洞见落地：**line-split 对导出是反模式**（见 §1），P0 的第一步就是把它 unwrap 掉。
+
 ---
 
 ## 1. 现状与问题清单
@@ -46,6 +52,13 @@ GET /api/export/{job}.md|.tex?raw=1
 
 注意：**导出路径没有文本层不变式**。`text_norm.py` 的那些「绝不合并相邻词」规则
 是为嵌入文本层设计的；导出文本可以（也应该）做得更激进。
+
+**核心洞见：line-split 对 markdown/LaTeX 是反模式。** sidecar 块里的硬换行结构
+（每行一个 `<br>` 感）是为 PDF 嵌入设计的——fpdf2 渲染器要按行放文本层；
+导出文本里它们是噪声：markdown 渲染器把单个换行当软换行（视觉上粘连），
+段落断行破坏 latex 源可读性，跨页断行把一段劈成两半。所以 P0 的第一步是
+unwrap（CJK 直接拼、拉丁文补空格拼、`词-`+`续`连字符合并），只在
+列表/表格/标题/冒号标签行处停笔（见 §5.2）。
 
 ---
 
@@ -244,15 +257,34 @@ python -m backend.cli in.pdf -o out.md --export markdown --export-llm
 
 ## 9. 分阶段落地
 
-| 阶段 | 内容 | 依赖 |
+| 阶段 | 内容 | 状态 |
 |------|------|------|
-| P1 | `backend/export_llm.py` 的 P0 确定性部分 + `block_source` 三行扩展 + 单测 | 无（离线） |
-| P2 | 块级 LLM：client（httpx + retry，复用 `resolve()`）、guard、缓存、`?llm=1`、`--export-llm`、config 键 | API key |
-| P3 | 图像取证（PyMuPDF 裁块）、整文档模式（实验）、WebUI 开关 | P2 |
+| P1 | `backend/export_llm.py` 的 P0 确定性部分 + `block_source` 三层扩展 + 单测 | ✅ 已实现 |
+| P2 | 块级 LLM：client（httpx + retry，复用 `resolve()`）、guard、缓存、`?llm=1`、`--export-llm`、config 键 | ✅ 已实现（v1 文本模式） |
+| P3 | 图像取证（PyMuPDF 裁块）、整文档模式（实验）、WebUI 开关、图片实体导出（见 §11） | 未开始 |
 
 ## 10. 开放问题
 
 1. 长文档导出走同步请求还是复用 SSE job？（>50 页建议后台 job + 进度）
-2. `llm` 字段要不要持久化进 sidecar（跨会话复用缓存）？—— 涉及编辑器语义，倾向不进。
+2. `llm` 字段要不要持久化进 sidecar（跨会话复用缓存）？—— 涉及编辑器语义，倾向不进
+   （当前实现：只进导出副本，缓存落 `work/<job>/export_llm_cache.json`）。
 3. 整文档模式若只服务于标题层级，可否退化为「只发各页首块 + 目录页」的廉价特例？
 4. 表格图像取证的最小分辨率（页图 300dpi 裁块 vs 重渲染 150dpi 裁块）需实测。
+
+## 11. 位置信息与「重现排版」在导出中的真实角色
+
+实施中验证的两个定位结论（回答「bbox 到底有什么用」「LaTeX 连排版都做不到有什么用」）：
+
+**bbox 在当前 markdown/LaTeX 导出里零使用。** `backend/export.py` 的 builder 只读
+`kind / raw / text / caption / blocks 序`——导出的「位置性」信息是块数组序（引擎在
+OCR 期定好的阅读序），不是坐标。bbox 的消费者在别处：finalize 文本层、WebUI overlay、
+验证报告。bbox 进入导出管线的唯一不可替代用途是**图片实体导出**（按 bbox 裁页图 →
+`![](figures/p3-1.png)` / `\includegraphics`，从注释占位符变实体）与多栏阅读序重排
+（均只读坐标、不写回，列为 P3）。
+
+**LaTeX 导出的价值不在排版保真。** 排版保真是嵌字 PDF（主产出）的本职——原版页面
+像素级保留。LaTeX 导出补的是另一条轴：内容可编辑 / 数学可编译 / 可 diff。
+「重现排版」只有绝对定位（`textpos` 每块一个 `\put`）一条路，是反模式：源码不可读、
+编辑失效、且冗余（要视觉复刻，原版 PDF 就在那里；业界 olmOCR/MinerU/Mathpix 输出的
+都是内容结构，无一复刻版面）。值得追求的是**语义结构保真**（标题层级、表格、公式、
+图片），这正是 P0/P1 修整的对象。

@@ -12,6 +12,7 @@ Endpoints:
   GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
   GET  /api/export/{job_id}.md|.tex  export pages as markdown / LaTeX
+                                     (?reflow=1 re-wrap, ?llm=1 LLM fix-up)
 
 The OCR core is OCRmyPDF; the unlimited engine ships as the standalone
 ``ocrmypdf_unlimited`` plugin (``backend/ocrmypad`` is a compat alias).
@@ -37,7 +38,8 @@ from starlette.background import BackgroundTask
 
 from backend import batch
 from backend import cleanup as cleanup_mod
-from backend import config, export as export_mod, ocr_service, validation
+from backend import config, export as export_mod, export_llm
+from backend import ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
 
 setup_logging()
@@ -676,7 +678,8 @@ def download(job_id: str):
 
 
 @app.get("/api/export/{job_id}.{ext}")
-def export_document(job_id: str, ext: str, raw: str = "1"):
+def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
+                    reflow: str = "1"):
     """Export the job's recognized pages as markdown (``.md``) or LaTeX
     (``.tex``).
 
@@ -686,6 +689,15 @@ def export_document(job_id: str, ext: str, raw: str = "1"):
     LaTeX -> plain, table HTML -> rows) is skipped and tables render as real
     markdown tables / LaTeX ``tabular``.  ``raw=0`` always uses the normalized
     text.  Pages whose sidecar has no raw field fall back to it either way.
+
+    ``reflow=1`` (default) runs the deterministic export pre-processing
+    (backend.export_llm): the sidecars' line-split structure exists for the
+    PDF text layer, so exports unwrap it (hard-wrapped lines join, hyphens
+    merge, ragged tab tables pad, page-boundary paragraphs merge).
+    ``llm=1`` additionally runs the opt-in LLM block fix-up over the hard
+    blocks (tables / equations / low-confidence) under per-block guards; any
+    LLM failure falls back to the reflowed text.  Both passes only touch the
+    export copy — sidecars, hOCR and the embedded text layer are unaffected.
 
     404 when the job or its pages are missing; 400 for an unknown extension.
     """
@@ -700,6 +712,16 @@ def export_document(job_id: str, ext: str, raw: str = "1"):
     if fmt is None:
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+    use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_llm = str(llm).lower() not in ("0", "false", "no")
+    if use_reflow or use_llm:
+        # The passes rewrite a deep copy; the per-job LLM cache lives next to
+        # the hOCR folder (work/<job>/export_llm_cache.json).
+        cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
+                      if job.get("hocr_dir") else None)
+        pages = export_llm.preprocess(
+            pages, config.resolve(), fmt=fmt,
+            enable_llm=use_llm, reflow=use_reflow, cache_path=cache_path)
     try:
         text = export_mod.export_document(
             fmt, pages, title=Path(job.get("filename") or "document").stem,

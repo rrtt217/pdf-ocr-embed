@@ -110,6 +110,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="export the recognized pages instead of embedding "
                              "a text layer: markdown | latex (the sidecars' "
                              "raw content is used when present)")
+    parser.add_argument("--no-reflow", action="store_true",
+                        help="skip the deterministic export reflow (the "
+                             "sidecars' line-split structure is kept)")
+    parser.add_argument("--export-llm", action="store_true",
+                        help="run the LLM block fix-up over the exported "
+                             "hard blocks (tables / equations / low-conf); "
+                             "needs the configured provider api_key")
     args = parser.parse_args(argv)
 
     input_path = Path(args.input)
@@ -187,12 +194,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         if not pages:
             print("error: OCR produced no pages to export", file=sys.stderr)
             return 1
-        export_ext = "md" if args.export.strip().lower() in ("markdown", "md") else "tex"
+        fmt_norm = ("markdown" if args.export.strip().lower()
+                    in ("markdown", "md") else "latex")
+        if not args.no_reflow or args.export_llm:
+            # Deterministic reflow (default on) + opt-in LLM fix-up: both run
+            # on a deep copy; the per-job LLM cache lives in the work folder.
+            from backend import config as config_mod, export_llm
+            pages = export_llm.preprocess(
+                pages, config_mod.resolve(), fmt=fmt_norm,
+                enable_llm=bool(args.export_llm),
+                reflow=not args.no_reflow,
+                cache_path=work_dir / "export_llm_cache.json")
+        export_ext = "md" if fmt_norm == "markdown" else "tex"
         export_path = (Path(args.output) if args.output else
                        out_dir / f"{input_path.stem}.{export_ext}")
         try:
             text = export_mod.export_document(
-                args.export, pages,
+                fmt_norm, pages,
                 title=input_path.stem,
                 use_raw=True)
         except ValueError as exc:
