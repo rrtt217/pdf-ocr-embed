@@ -606,6 +606,173 @@ def assign_heading_levels(pages: List[dict]) -> int:
     return tagged
 
 
+# --- TOC detection (table of contents, first pages) --------------------------------
+
+# A TOC line: title + dot leaders + trailing page number.
+_TOC_LINE_RE = re.compile(
+    r"^(?P<title>.+?)[\s.．·⋅…‥⋯\u2026]{2,}\s*(?P<page>\d{1,4})\s*$")
+_INDENT_RE = re.compile(r"^[\s\u3000]+")
+
+
+def detect_toc_entries(pages: List[dict], max_pages: int = 5) -> List[dict]:
+    """Parse the document's table of contents from the first pages (pure).
+
+    A TOC line is a title followed by dot leaders and a trailing page number
+    (``第一章 绪论........1``).  The entry depth comes from the numbering
+    (``heading_numbering_depth``) when present, else from the leading
+    indentation (~2 spaces per level).  Must run on the ORIGINAL line
+    structure — the reflow pass joins dot-leader lines.
+    """
+    from backend.export import heading_numbering_depth
+
+    entries: List[dict] = []
+    for page in pages[:max(1, max_pages)]:
+        for block in (page.get("blocks") or []):
+            kind = str(block.get("kind") or "text")
+            if kind not in ("text", "heading", "title"):
+                continue
+            lines = [ln for ln in (block.get("lines") or [])
+                     if isinstance(ln, str) and ln.strip()]
+            if not lines:
+                lines = [ln for ln in (block.get("text") or "").split("\n")
+                         if ln.strip()]
+            for raw_ln in lines:
+                for ln in raw_ln.split("\n"):
+                    match = _TOC_LINE_RE.match(ln.strip())
+                    if not match:
+                        continue
+                    title = match.group("title").strip()
+                    if not title:
+                        continue
+                    depth = heading_numbering_depth(title)
+                    if depth is None:
+                        indent = _INDENT_RE.match(ln)
+                        width = len(indent.group(0)) if indent else 0
+                        depth = 1 + width // 2
+                    entries.append({"title": title,
+                                    "level": int(max(1, min(depth, 4)))})
+    return entries
+
+
+# --- LLM outline refinement (P1b, opt-in) --------------------------------------------
+
+_OUTLINE_SYSTEM = (
+    "You refine the heading hierarchy of an OCR-exported document. You "
+    "receive the headings in document order with their current level, plus "
+    "the document's table of contents when one was detected. You return "
+    "strict JSON only.")
+
+
+def _outline_prompt(items: List[dict], toc_entries: List[dict]) -> str:
+    """The outline user prompt: numbered headings (current level + text) and
+    the detected TOC as ground truth."""
+    lines = ["Document headings, in document order (n|current level|text):"]
+    for it in items:
+        lines.append(f"{it['n']}|L{it['level']}|{it['text'][:80]}")
+    if toc_entries:
+        lines += [
+            "",
+            "The document's table of contents (first pages), in order:",
+        ]
+        for entry in toc_entries:
+            lines.append(f"L{entry['level']}|{entry['title'][:80]}")
+    ground_truth = ("the numbering and the table of contents as ground truth"
+                    if toc_entries
+                    else "the numbering and the document flow as ground truth")
+    lines += [
+        "",
+        f"Correct each heading's level (1 = chapter/part, 2 = section, "
+        f"3 = subsection, 4 = minor) using {ground_truth}. A level may only "
+        "deepen by 1 at a time. "
+        "Respond with JSON only: "
+        '{"headings":[{"n":0,"level":1}]}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_outline_response(raw: str) -> Optional[List[dict]]:
+    """Parse the model's outline answer into item dicts (never raises)."""
+    if not raw:
+        return None
+    match = re.search(r"\{.*\}", raw, re.S)
+    if not match:
+        return None
+    try:
+        data = json.loads(match.group(0))
+    except ValueError:
+        return None
+    items = data.get("headings") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    return [it for it in items if isinstance(it, dict)]
+
+
+def _refine_outline(pages: List[dict], settings: Dict[str, Any], client: Any,
+                    toc_entries: List[dict],
+                    progress: Optional[Any] = None) -> int:
+    """LLM outline refinement over the heading blocks (in place).  Returns
+    the applied count.  Per-heading guards (level range, monotonic deepening,
+    first heading) reject bad corrections; every failure keeps the
+    deterministic ``llm_level``."""
+    heads = [block for page in pages
+             for block in (page.get("blocks") or [])
+             if str(block.get("kind") or "text") in ("title", "heading")]
+    if len(heads) < 2:
+        return 0
+    items = [{"n": i, "level": (block.get("llm_level") or 2),
+              "text": (block.get("text") or "").strip()}
+             for i, block in enumerate(heads)]
+    if progress is not None:
+        try:
+            progress({"phase": "outline", "done": 0, "total": 1})
+        except Exception:  # noqa: BLE001 — cosmetic
+            pass
+    prompt = _outline_prompt(items, toc_entries)
+    max_tokens = max(512, min(32767, len(prompt) * 2 + 256))
+    raw = client.chat_json(_OUTLINE_SYSTEM, prompt, max_tokens)
+    parsed = parse_outline_response(raw or "")
+    if not parsed:
+        log.warning("export LLM outline returned no usable JSON — kept the "
+                    "deterministic levels")
+        if progress is not None:
+            try:
+                progress({"phase": "outline", "done": 1, "total": 1})
+            except Exception:  # noqa: BLE001
+                pass
+        return 0
+    by_n: Dict[int, dict] = {}
+    for it in parsed:
+        try:
+            by_n[int(it.get("n"))] = it
+        except (TypeError, ValueError):
+            continue
+    applied = 0
+    prev = 1
+    for i in range(len(heads)):
+        item = by_n.get(i)
+        if not item:
+            continue
+        try:
+            level = int(item.get("level"))
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= level <= 5):
+            continue
+        if i == 0 and level not in (1, 2):
+            continue
+        if i > 0 and level - prev > 1:
+            continue  # the hierarchy cannot deepen by more than one at a time
+        heads[i]["llm_level"] = level
+        prev = level
+        applied += 1
+    if progress is not None:
+        try:
+            progress({"phase": "outline", "done": 1, "total": 1})
+        except Exception:  # noqa: BLE001
+            pass
+    return applied
+
+
 # --- the orchestrator (pages -> pages) ----------------------------------------------
 
 def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
@@ -647,6 +814,10 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
         except Exception:  # noqa: BLE001 — cosmetic, never breaks the export
             log.debug("export progress callback failed", exc_info=True)
 
+    # TOC entries: read from the ORIGINAL line structure (the reflow pass
+    # joins dot-leader lines); needed by the LLM outline refinement.
+    toc_entries = detect_toc_entries(pages) if settings["llm"] else []
+
     # P0: deterministic reflow (offline).  Heading sizing runs FIRST — it
     # reads the original per-line structure (bbox height / line count) that
     # the reflow pass is about to unwrap.
@@ -683,8 +854,14 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                 llm_client = ExportLlmClient.from_config(cfg or {},
                                                          settings["model"])
         if llm_client is not None:
+            if not settings["reflow"]:
+                # Base heading levels: the reflow path already assigned them
+                # pre-unwrap; here the original line structure is intact too.
+                assign_heading_levels(pages)
             _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
                           progress=notify)
+            _refine_outline(pages, settings, llm_client, toc_entries,
+                            progress=notify)
 
     return pages
 

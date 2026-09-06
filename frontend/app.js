@@ -548,13 +548,15 @@ function jobCard(job) {
   // block batch — can take minutes; the reflow phase is instant).
   if (job.export) {
     const wrap = el("div", "export-progress");
-    wrap.appendChild(el("span", "hint", "⬇ " + (job.export.phase === "llm"
-      ? t("job.exportProgress", { done: job.export.done, total: job.export.total })
-      : t("job.exportReflow"))));
+    const phase = job.export.phase;
+    const label = phase === "reflow" ? t("job.exportReflow")
+      : phase === "outline" ? t("job.exportOutline")
+      : t("job.exportProgress", { done: job.export.done, total: job.export.total });
+    wrap.appendChild(el("span", "hint", "⬇ " + label));
     const ebar = el("div", "bar");
     const efill = el("div", "fill");
     const etotal = job.export.total || 0;
-    efill.style.width = job.export.phase === "llm" && etotal
+    efill.style.width = (phase === "llm" || phase === "outline") && etotal
       ? Math.min(100, Math.round((job.export.done / etotal) * 100)) + "%" : "8%";
     ebar.appendChild(efill);
     wrap.appendChild(ebar);

@@ -500,6 +500,172 @@ def test_preprocess_no_reflow_skips_level_assignment():
     assert "llm_level" not in out[0]["blocks"][0]
 
 
+# --- LLM outline refinement (B + TOC context) -------------------------------------
+
+def test_detect_toc_entries_parses_dot_leaders():
+    pages = [_page([_block("第一章 绪论........1\n第二章 基础……15\n普通段落没有页码",
+                           kind="text")])]
+    entries = export_llm.detect_toc_entries(pages)
+    assert [e["title"] for e in entries] == ["第一章 绪论", "第二章 基础"]
+    assert [e["level"] for e in entries] == [1, 1]
+
+
+def test_detect_toc_entries_depth_from_numbering_and_indent():
+    pages = [_page([_block("1.1 二进制....3\n  1.1.1 编码....5\n第一章 概论....1",
+                           kind="text")])]
+    entries = export_llm.detect_toc_entries(pages)
+    assert [e["level"] for e in entries] == [2, 3, 1]
+
+
+def test_detect_toc_entries_indent_depth_when_unnumbered():
+    pages = [_page([_block("背景说明....1\n　　子项说明....2", kind="text")])]
+    entries = export_llm.detect_toc_entries(pages)
+    assert entries[0]["level"] == 1   # no indent
+    assert entries[1]["level"] == 2   # 2 fullwidth spaces → 1 + 2//2 = 2
+
+
+def test_detect_toc_entries_respects_max_pages():
+    toc_page = _page([_block("第一章 绪论....1", kind="text")], page_index=0)
+    plain_page = _page([_block("正文而已", kind="text")], page_index=1)
+    assert len(export_llm.detect_toc_entries([toc_page, plain_page], max_pages=1)) == 1
+
+
+def test_outline_prompt_contains_headings_and_toc():
+    prompt = export_llm._outline_prompt(
+        [{"n": 0, "level": 1, "text": "概述"},
+         {"n": 1, "level": 2, "text": "1.2 方法"}],
+        [{"title": "第一章 绪论", "level": 1}])
+    assert "0|L1|概述" in prompt
+    assert "1|L2|1.2 方法" in prompt
+    assert "table of contents" in prompt
+    assert "L1|第一章 绪论" in prompt
+
+
+def test_outline_prompt_without_toc():
+    prompt = export_llm._outline_prompt([{"n": 0, "level": 2, "text": "x"}], [])
+    assert "table of contents" not in prompt
+
+
+def test_parse_outline_response():
+    raw = '```json\n{"headings":[{"n":0,"level":1},{"n":1,"level":2}]}\n```'
+    assert export_llm.parse_outline_response(raw) == \
+        [{"n": 0, "level": 1}, {"n": 1, "level": 2}]
+    assert export_llm.parse_outline_response("garbage") is None
+    assert export_llm.parse_outline_response('{"headings": "x"}') is None
+
+
+def test_refine_outline_applies_levels():
+    pages = [_page([
+        _block("概述", kind="heading"),
+        _block("1.2 具体方法", kind="heading"),
+    ])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 2
+    fake = _FakeClient('{"headings":[{"n":0,"level":1},{"n":1,"level":2}]}')
+    applied = export_llm._refine_outline(pages, {}, fake, [])
+    assert applied == 2
+    assert pages[0]["blocks"][0]["llm_level"] == 1
+    assert pages[0]["blocks"][1]["llm_level"] == 2
+
+
+def test_refine_outline_guards():
+    pages = [_page([
+        _block("概述", kind="heading"),
+        _block("细节", kind="heading"),
+        _block("更多", kind="heading"),
+    ])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 1
+    # n=1 jumps 1 → 3 (rejected), n=2 out of range (rejected)
+    fake = _FakeClient('{"headings":[{"n":0,"level":1},{"n":1,"level":3},'
+                       '{"n":2,"level":9}]}')
+    applied = export_llm._refine_outline(pages, {}, fake, [])
+    assert applied == 1
+    blocks = pages[0]["blocks"]
+    assert blocks[0]["llm_level"] == 1
+    assert blocks[1]["llm_level"] == 1  # jump rejected, deterministic level kept
+    assert blocks[2]["llm_level"] == 1  # out of range rejected
+
+
+def test_refine_outline_garbage_falls_back():
+    pages = [_page([_block("概述", kind="heading"),
+                    _block("1.2 方法", kind="heading")])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 2
+    fake = _FakeClient("no json")
+    applied = export_llm._refine_outline(pages, {}, fake, [])
+    assert applied == 0
+    assert all(b["llm_level"] == 2 for b in pages[0]["blocks"])
+
+
+class _MultiClient:
+    """Dispatches on the system prompt (block fix-up vs outline)."""
+
+    def __init__(self, by_marker):
+        self.by_marker = by_marker
+        self.calls = []
+
+    def chat_json(self, system, user, max_tokens):
+        self.calls.append({"system": system, "user": user})
+        for marker, resp in self.by_marker.items():
+            if marker in system:
+                return resp
+        return None
+
+
+def test_preprocess_llm_runs_blocks_then_outline():
+    pages = [_page([
+        _block("概述与设计背景", kind="heading", conf=0.4),
+        _block("1.2 具体方法", kind="heading"),
+    ])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 1
+    fake = _MultiClient({
+        "repair OCR-export text blocks": _llm_json(
+            {"n": 0, "ok": True, "text": "概述与设计背景（校对）"}),
+        "heading hierarchy": '{"headings":[{"n":0,"level":1},{"n":1,"level":2}]}',
+    })
+    out = export_llm.preprocess(pages, {}, fmt="markdown", enable_llm=True,
+                                client=fake)
+    assert len(fake.calls) == 2
+    # block fix-up landed in the llm tag (only the low-conf block is offered)
+    assert out[0]["blocks"][0]["llm"]["text"] == "概述与设计背景（校对）"
+    # outline refinement overwrote llm_level
+    assert out[0]["blocks"][0]["llm_level"] == 1
+    assert out[0]["blocks"][1]["llm_level"] == 2
+
+
+def test_preprocess_llm_no_reflow_still_assigns_base_levels():
+    pages = [_page([
+        _block("引言", kind="heading", bbox=[100, 300, 900, 330]),
+        _block("正文", kind="text", bbox=[100, 400, 900, 430]),
+    ])]
+    fake = _MultiClient({})
+    out = export_llm.preprocess(pages, {}, fmt="markdown", reflow=False,
+                                enable_llm=True, client=fake)
+    assert out[0]["blocks"][0]["llm_level"] == 1  # first heading = title
+
+
+def test_preprocess_llm_outline_with_toc_context():
+    toc_page = _page([_block("第一章 绪论........1\n第二章 方法........9",
+                             kind="text")], page_index=0)
+    body_page = _page([
+        _block("第一章 绪论", kind="heading", bbox=[100, 60, 900, 120]),
+        _block("正文", kind="text", bbox=[100, 200, 900, 230]),
+        _block("第二章 方法", kind="heading", bbox=[100, 300, 900, 360]),
+    ], page_index=1)
+    fake = _MultiClient({"heading hierarchy":
+                         '{"headings":[{"n":0,"level":1},{"n":1,"level":1}]}'})
+    pages = [toc_page, body_page]
+    out = export_llm.preprocess(pages, {}, fmt="markdown", enable_llm=True,
+                                client=fake)
+    outline_call = fake.calls[-1]
+    assert "table of contents" in outline_call["user"]
+    assert "第一章 绪论" in outline_call["user"]
+    assert out[1]["blocks"][0]["llm_level"] == 1
+    assert out[1]["blocks"][2]["llm_level"] == 1
+
+
 # --- progress callback -----------------------------------------------------------------
 
 def test_preprocess_progress_events_reflow_and_llm():
