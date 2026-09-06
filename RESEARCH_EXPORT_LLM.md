@@ -271,6 +271,11 @@ python -m backend.cli in.pdf -o out.md --export markdown --export-llm
 2. `llm` 字段要不要持久化进 sidecar（跨会话复用缓存）？—— 涉及编辑器语义，倾向不进
    （当前实现：只进导出副本，缓存落 `work/<job>/export_llm_cache.json`）。
 3. 整文档模式若只服务于标题层级，可否退化为「只发各页首块 + 目录页」的廉价特例？
+   —— **已落地确定性版本**：`assign_heading_levels`（P0.5）用文档级信号定级——
+   扩展编号（`第一章`/`一、`/`（一）`/`Appendix A`/Roman）优先，无编号标题按
+   字号分带（bbox 行高 vs 正文行高中位数，~15% 聚类），首个标题为文档标题。
+   builder 经 `block_heading_level` 读 `llm_level`，缺失退回单块启发式。
+   LLM 大纲特例（只发标题清单，guard 后精修相对深度）仍未做，作可选增强。
 4. 表格图像取证的最小分辨率（页图 300dpi 裁块 vs 重渲染 150dpi 裁块）需实测。
 
 ## 11. 位置信息与「重现排版」在导出中的真实角色

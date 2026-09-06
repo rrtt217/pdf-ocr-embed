@@ -380,6 +380,126 @@ def test_llm_tag_does_not_leak_into_hocr():
     assert "内容" in hocr
 
 
+# --- document-level heading sizing (P0.5) --------------------------------------------
+
+def test_heading_numbering_depth_forms():
+    from backend.export import heading_numbering_depth
+    assert heading_numbering_depth("1. 数字逻辑概论") == 1
+    assert heading_numbering_depth("1.2 二进制") == 2
+    assert heading_numbering_depth("1.2.3 编码") == 3
+    assert heading_numbering_depth("第一章 绪论") == 1
+    assert heading_numbering_depth("第二节 细则") == 2
+    assert heading_numbering_depth("一、总则") == 1
+    assert heading_numbering_depth("（一）细则") == 2
+    assert heading_numbering_depth("Part II Implementation") == 1
+    assert heading_numbering_depth("Appendix A") == 1
+    assert heading_numbering_depth("I. 前言") == 1
+    assert heading_numbering_depth("无编号标题") is None
+    assert heading_numbering_depth("") is None
+
+
+def test_heading_level_extended_forms():
+    assert export.heading_level("第一章 绪论") == 1
+    assert export.heading_level("（一）细则") == 2
+    assert export.heading_level("无编号标题") == 2  # fallback preserved
+
+
+def test_block_heading_level_prefers_llm_level():
+    assert export.block_heading_level({"llm_level": 3}, "1. x") == 3
+    assert export.block_heading_level({}, "1.2 x") == 2
+    assert export.block_heading_level({"llm_level": 9}, "x") == 2  # out of range: ignored
+    assert export.block_heading_level({"llm_level": "2"}, "x") == 2  # not int: fallback
+
+
+def test_heading_branches_use_llm_level():
+    block = {"kind": "heading", "text": "概述", "llm_level": 3}
+    assert export.block_to_markdown(block).startswith("### 概述")
+    assert "\\subsubsection{概述}" in export.block_to_latex(block)
+
+
+def test_assign_heading_levels_by_size():
+    pages = [_page([
+        _block("数字逻辑概论", kind="title", bbox=[100, 60, 900, 120]),   # 60px
+        _block("正文一行", kind="text", bbox=[100, 200, 900, 230]),        # 30px
+        _block("编码方法", kind="heading", bbox=[100, 300, 900, 350]),     # 50px
+        _block("布尔代数", kind="heading", bbox=[100, 400, 900, 430]),     # 30px
+    ])]
+    assert export_llm.assign_heading_levels(pages) == 3
+    blocks = pages[0]["blocks"]
+    assert blocks[0]["llm_level"] == 1
+    assert blocks[2]["llm_level"] == 2
+    assert blocks[3]["llm_level"] == 3  # body-sized heading: one level deeper
+
+
+def test_assign_numbering_wins_over_size():
+    pages = [_page([
+        _block("概述", kind="heading", bbox=[100, 60, 900, 120]),          # 60px big
+        _block("1.2 具体方法", kind="heading", bbox=[100, 300, 900, 330]),  # 30px small
+        _block("正文", kind="text", bbox=[100, 400, 900, 430]),
+    ])]
+    export_llm.assign_heading_levels(pages)
+    blocks = pages[0]["blocks"]
+    assert blocks[0]["llm_level"] == 1  # unnumbered → size
+    assert blocks[1]["llm_level"] == 2  # numbered → numbering, despite the small size
+
+
+def test_assign_first_heading_is_title():
+    pages = [_page([
+        _block("引言", kind="heading", bbox=[100, 300, 900, 330]),
+        _block("正文", kind="text", bbox=[100, 400, 900, 430]),
+    ])]
+    export_llm.assign_heading_levels(pages)
+    assert pages[0]["blocks"][0]["llm_level"] == 1
+
+
+def test_assign_numbered_first_heading_keeps_depth():
+    pages = [_page([
+        _block("1.1 背景", kind="heading", bbox=[100, 300, 900, 330]),
+    ])]
+    export_llm.assign_heading_levels(pages)
+    assert pages[0]["blocks"][0]["llm_level"] == 2
+
+
+def test_assign_no_headings_noop():
+    pages = [_page([_block("正文而已", kind="text")])]
+    assert export_llm.assign_heading_levels(pages) == 0
+    assert "llm_level" not in pages[0]["blocks"][0]
+
+
+def test_assign_uses_per_line_height_before_reflow():
+    # a 2-line heading (60px bbox) and a 1-line heading (30px) have the SAME
+    # per-line size → same level; computing after the reflow (lines joined)
+    # would wrongly put the second heading a level deeper
+    pages = [_page([
+        _block("概\n述", kind="heading", bbox=[100, 60, 900, 120],
+               lines=["概", "述"]),
+        _block("布尔代数", kind="heading", bbox=[100, 300, 900, 330]),
+        _block("正文", kind="text", bbox=[100, 400, 900, 430]),
+    ])]
+    out = export_llm.preprocess(pages, {}, fmt="markdown")  # reflow on
+    blocks = out[0]["blocks"]
+    assert blocks[0]["llm_level"] == 1
+    assert blocks[1]["llm_level"] == 1
+
+
+def test_preprocess_assigns_levels_end_to_end():
+    pages = [_page([
+        _block("数字逻辑概论", kind="title", bbox=[100, 60, 900, 120]),
+        _block("正文一行", kind="text", bbox=[100, 200, 900, 230]),
+        _block("编码方法", kind="heading", bbox=[100, 300, 900, 350]),
+    ])]
+    out = export_llm.preprocess(pages, {}, fmt="markdown")
+    md = export.pages_to_markdown(out)
+    assert md.startswith("# 数字逻辑概论")
+    assert "\n## 编码方法" in md
+
+
+def test_preprocess_no_reflow_skips_level_assignment():
+    pages = [_page([_block("引言", kind="heading", bbox=[100, 300, 900, 330])])]
+    out = export_llm.preprocess(pages, {}, reflow=False, enable_llm=False)
+    assert "llm_level" not in out[0]["blocks"][0]
+
+
 # --- progress callback -----------------------------------------------------------------
 
 def test_preprocess_progress_events_reflow_and_llm():
