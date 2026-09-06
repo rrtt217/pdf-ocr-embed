@@ -827,7 +827,12 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
         threading.Thread(target=work, daemon=True, name="export-llm").start()
         while True:
             try:
-                ev = events.get(timeout=15.0)
+                # asyncio.to_thread: the blocking queue.get must NOT run on
+                # the event loop — it would stall every other request and
+                # SSE stream (including the OCR progress streams) for up to
+                # the timeout, freezing the whole WebUI while the export
+                # LLM steps run.
+                ev = await asyncio.to_thread(events.get, True, 15.0)
             except _queue.Empty:
                 # SSE comment keepalive: proxies/browsers time a silent
                 # stream out long before the LLM batch budget.

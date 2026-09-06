@@ -884,3 +884,107 @@ def test_export_stream_error_event_not_broken_connection(tmp_path, monkeypatch):
     # must NOT carry one
     events, _ = _read_sse(body)
     assert all(ev["type"] != "error" for ev in events)
+
+
+def test_export_stream_does_not_block_event_loop(tmp_path, monkeypatch):
+    """The stream's queue wait must run OFF the event loop.
+
+    Regression: ``events.get(timeout=...)`` used to run directly inside the
+    async generator, blocking the (single, production) event loop for up to
+    the keepalive timeout on every iteration — every other request and SSE
+    stream stalled while the export LLM steps ran, freezing the WebUI.
+
+    The probe is fired from a daemon thread at a fixed WALL time and injected
+    into the stream's loop via ``run_coroutine_threadsafe``: loop-based
+    timers (asyncio.sleep / wait_for) are defeated by the very bug this test
+    pins — they cannot fire while the loop is blocked, so a probe scheduled
+    that way would silently run AFTER the unblock and measure nothing.
+    """
+    import asyncio
+    import threading
+    import time
+
+    import httpx
+
+    from backend import ocr_service
+    from backend import export_llm as export_llm_mod
+    from backend import config as config_mod
+    from backend.main import app
+
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    blocks = [
+        {"kind": "heading", "bbox": [0, 0, 100, 20], "text": "第一章 绪论",
+         "lines": ["第一章 绪论"]},
+        {"kind": "heading", "bbox": [0, 30, 100, 50], "text": "第二章 方法",
+         "lines": ["第二章 方法"]},
+    ]
+    _seed_job(tmp_path, blocks=blocks)
+
+    release = threading.Event()
+
+    class _SlowClient:
+        """Blocks the worker thread (not the loop) until released."""
+
+        @classmethod
+        def from_config(cls, cfg, model):
+            return cls()
+
+        def chat_json(self, system, user, max_tokens):
+            release.wait(timeout=30)
+            return '{"headings":[{"n":0,"level":1},{"n":1,"level":1}]}'
+
+    monkeypatch.setattr(export_llm_mod, "ExportLlmClient", _SlowClient)
+    monkeypatch.setattr(config_mod, "resolve",
+                        lambda: {"api_key": "test-key",
+                                 "export_llm_outline": "true",
+                                 "export_llm_blocks": "false"})
+
+    async def scenario():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://test") as client:
+            loop = asyncio.get_running_loop()
+
+            async def stream_task():
+                async with client.stream(
+                        "GET", "/api/export/stream/export-1.md?llm_outline=1") as r:
+                    return "".join([chunk async for chunk in r.aiter_text()])
+
+            task = asyncio.create_task(stream_task())
+            # let the stream open and the worker block inside chat_json
+            await asyncio.sleep(0.5)
+
+            result: dict = {}
+
+            def probe():
+                time.sleep(0.3)  # wall time: unaffected by a blocked loop
+                fut = asyncio.run_coroutine_threadsafe(
+                    client.get("/api/health"), loop)
+                t0 = time.time()
+                try:
+                    resp = fut.result(timeout=25)
+                    result["dt"] = time.time() - t0
+                    result["status"] = resp.status_code
+                except Exception as exc:  # noqa: BLE001
+                    result["error"] = str(exc)
+
+            th = threading.Thread(target=probe, daemon=True)
+            th.start()
+            await asyncio.sleep(2.0)  # wall-time window for the probe
+            release.set()
+            body = await asyncio.wait_for(task, timeout=30)
+            th.join(timeout=5)
+            return result, body
+
+    try:
+        result, body = asyncio.run(scenario())
+    finally:
+        release.set()
+        ocr_service._JOBS.pop("export-1", None)
+    assert result.get("status") == 200, result
+    # the loop stayed free while the outline LLM call was in flight
+    assert result.get("dt", 99) < 2.0, \
+        f"/api/health took {result.get('dt'):.1f}s during an open export stream"
+    events, _ = _read_sse(body)
+    assert events[-1]["type"] == "done"
