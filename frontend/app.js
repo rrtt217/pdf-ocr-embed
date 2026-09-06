@@ -1062,12 +1062,22 @@ function renderTabs() {
   const sel = state.sel;
   if (!sel) return;
   sel.pages.forEach((pg, i) => {
-    const tab = el("button", "page-tab" + (i === sel.pageIndex ? " active" : ""), String(i + 1));
+    // Label the tab with the REAL PDF page number (page_index), not the
+    // position in this list.  The server only sends pages that have a result,
+    // so with missing pages (failed OCR, not-yet-done in a running job) the
+    // two diverge, and position labels (1,2,3,…) mislabel e.g. pages 1,3,5.
+    // Position `i` still drives navigation/selection; only the shown number is
+    // the actual page.
+    const pageNo = (pg.page_index ?? 0) + 1;
+    const tab = el("button", "page-tab" + (i === sel.pageIndex ? " active" : ""), String(pageNo));
     const low = pageLowConfCount(pg);
     if (low) {
       tab.appendChild(el("span", "tab-badge", String(low)));
-      tab.title = t("editor.confPageBadge", { n: low, p: state.confThreshold });
     }
+    const tip = t("editor.pdfPage", { n: pageNo });
+    tab.title = low
+      ? tip + " · " + t("editor.confPageBadge", { n: low, p: state.confThreshold })
+      : tip;
     tab.onclick = () => { sel.pageIndex = i; renderTabs(); renderPage(); };
     wrap.appendChild(tab);
   });
