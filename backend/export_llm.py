@@ -9,11 +9,13 @@ Two passes over the page dicts, BEFORE the pure builders run:
   hyphens merge), list lines are marked so they are never joined, ragged
   tab-text tables are padded (single-column ones downgrade to text), and
   page-boundary paragraphs are merged.  Pure functions, no network.
-* **P1 LLM block fix-up (default OFF — ``?llm=1`` / ``--export-llm``)** — the
-  marked hard blocks (tables / equations / low-confidence / cross-page merges)
-  are sent to an OpenAI-compatible endpoint in numbered ``<<<BLOCK n>>>``
-  batches and must answer strict JSON.  Per-block guards (length band, token
-  diff) reject hallucinations; any failure falls back to the P0 result, so
+* **P1 LLM post-processing (default OFF — export options)** — two independent
+  steps: the block fix-up (``?llm_blocks=1`` — tables / equations /
+  low-confidence blocks sent in numbered ``<<<BLOCK n>>>`` batches) and the
+  outline refinement (``?llm_outline=1`` — all headings plus the detected
+  table of contents, correcting the hierarchy).  The legacy ``?llm=1``
+  enables both.  Both must answer strict JSON; per-block / per-heading
+  guards reject hallucinations; any failure falls back to the P0 result, so
   export NEVER fails because of the LLM.
 
 The pass is a pages->pages transform: ``preprocess`` deep-copies and rewrites
@@ -24,7 +26,8 @@ hOCR and the embedded text layer are never touched, and
 ``page_store.blocks_to_hocr`` ignores unknown fields (pinned by tests).
 
 Config keys (backend/config.py ``resolve()``; env aliases ``OCR_EXPORT_*``):
-``export_reflow`` (default on), ``export_llm`` (default off),
+``export_reflow`` (default on), ``export_llm_blocks`` / ``export_llm_outline``
+(default off; the legacy ``export_llm`` master defaults both),
 ``export_llm_model`` (falls back to ``model``), ``export_llm_threshold``,
 ``export_llm_batch``, ``export_llm_timeout_s``.  The provider fields
 (api_key/base_url) are shared with the OCR engine; this module never imports
@@ -505,7 +508,13 @@ def block_source_text(block: dict) -> str:
 
 
 def resolve_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """The effective export pre-processing settings from a resolved config."""
+    """The effective export pre-processing settings from a resolved config.
+
+    The two LLM post-processing steps are independent: ``export_llm_blocks``
+    (block fix-up) and ``export_llm_outline`` (heading refinement).  The
+    legacy ``export_llm`` master (default for both) applies only where a
+    granular key is absent.
+    """
     cfg = cfg or {}
     model = (str(cfg.get("export_llm_model") or "").strip()
              or str(cfg.get("model") or "").strip())
@@ -517,9 +526,11 @@ def resolve_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
         batch_size = max(1, int(cfg.get("export_llm_batch") or 8))
     except (TypeError, ValueError):
         batch_size = 8
+    master = as_bool(cfg.get("export_llm", "false"))
     return {
         "reflow": as_bool(cfg.get("export_reflow", "true")),
-        "llm": as_bool(cfg.get("export_llm", "false")),
+        "blocks": as_bool(cfg.get("export_llm_blocks", str(master))),
+        "outline": as_bool(cfg.get("export_llm_outline", str(master))),
         "model": model,
         "threshold": threshold,
         "batch_size": batch_size,
@@ -777,31 +788,44 @@ def _refine_outline(pages: List[dict], settings: Dict[str, Any], client: Any,
 
 def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                fmt: str = "markdown", *, enable_llm: Optional[bool] = None,
+               enable_blocks: Optional[bool] = None,
+               enable_outline: Optional[bool] = None,
                reflow: Optional[bool] = None, client: Any = None,
                cache_path: Optional[Path] = None,
                progress: Optional[Any] = None) -> List[dict]:
     """Pre-process page dicts for export (the ONLY entry point callers need).
 
     Deep-copies ``pages`` and applies, in order: the deterministic reflow
-    (default on), the cross-page paragraph merge, then the opt-in LLM block
-    fix-up.  Returns the new list; the input is never mutated.  With both
-    passes off the original list is returned unchanged.
+    (default on), the cross-page paragraph merge, then the two opt-in LLM
+    post-processing steps — the block fix-up (``enable_blocks``) and the
+    heading/outline refinement (``enable_outline``) — which are independent
+    of each other.  Returns the new list; the input is never mutated.  With
+    every pass off the original list is returned unchanged.
 
-    ``enable_llm``/``reflow`` override the config when not ``None``.
+    ``enable_llm`` is the legacy master switch (both LLM steps); the granular
+    flags win when given.  ``reflow`` overrides the config when not ``None``.
     ``client`` replaces the built ``ExportLlmClient`` (tests inject fakes);
-    when the LLM is enabled but no API key is configured, the LLM pass is
+    when an LLM step is enabled but no API key is configured, that step is
     skipped with a warning — export never fails because of it.
 
-    ``progress`` (callable) receives ``{"phase": "reflow"|"llm", "done": n,
-    "total": m}`` events — the LLM pass can take minutes, so callers stream a
-    progress bar from them.  Callback failures never break the export.
+    ``progress`` (callable) receives ``{"phase": "reflow"|"llm"|"outline",
+    "done": n, "total": m}`` events — the LLM steps can take minutes, so
+    callers stream a progress bar from them.  Callback failures never break
+    the export.
     """
     settings = resolve_settings(cfg or {})
     if reflow is not None:
         settings["reflow"] = bool(reflow)
     if enable_llm is not None:
-        settings["llm"] = bool(enable_llm)
-    if not settings["reflow"] and not settings["llm"]:
+        # legacy master switch: both LLM steps
+        settings["blocks"] = bool(enable_llm)
+        settings["outline"] = bool(enable_llm)
+    if enable_blocks is not None:
+        settings["blocks"] = bool(enable_blocks)
+    if enable_outline is not None:
+        settings["outline"] = bool(enable_outline)
+    if not settings["reflow"] and not settings["blocks"] \
+            and not settings["outline"]:
         return pages
 
     pages = copy.deepcopy(pages)
@@ -816,7 +840,7 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
 
     # TOC entries: read from the ORIGINAL line structure (the reflow pass
     # joins dot-leader lines); needed by the LLM outline refinement.
-    toc_entries = detect_toc_entries(pages) if settings["llm"] else []
+    toc_entries = detect_toc_entries(pages) if settings["outline"] else []
 
     # P0: deterministic reflow (offline).  Heading sizing runs FIRST — it
     # reads the original per-line structure (bbox height / line count) that
@@ -843,8 +867,9 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
         merge_cross_page(pages)
         notify({"phase": "reflow", "done": 1, "total": 1})
 
-    # P1: LLM block fix-up (opt-in).
-    if settings["llm"]:
+    # P1a: LLM block fix-up / P1b: LLM outline refinement — two independent
+    # post-processing steps sharing one client.
+    if settings["blocks"] or settings["outline"]:
         llm_client = client
         if llm_client is None:
             if not (cfg or {}).get("api_key"):
@@ -854,14 +879,16 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                 llm_client = ExportLlmClient.from_config(cfg or {},
                                                          settings["model"])
         if llm_client is not None:
-            if not settings["reflow"]:
+            if settings["outline"] and not settings["reflow"]:
                 # Base heading levels: the reflow path already assigned them
                 # pre-unwrap; here the original line structure is intact too.
                 assign_heading_levels(pages)
-            _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
-                          progress=notify)
-            _refine_outline(pages, settings, llm_client, toc_entries,
-                            progress=notify)
+            if settings["blocks"]:
+                _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
+                              progress=notify)
+            if settings["outline"]:
+                _refine_outline(pages, settings, llm_client, toc_entries,
+                                progress=notify)
 
     return pages
 

@@ -76,14 +76,17 @@ model = "unlimited-ocr"                      # model / deployment name
 # passes only touch the export copy — sidecars, hOCR and the embedded text
 # layer are unaffected.
 # export_reflow = true                       # deterministic reflow (default on)
-# export_llm = false                         # LLM block fix-up (default off; ?llm=1 / --export-llm)
+# export_llm = false                         # legacy master: defaults both LLM steps
+# export_llm_blocks = false                  # LLM block fix-up (tables / equations / low-conf)
+# export_llm_outline = false                 # LLM heading refinement (uses the TOC)
 # export_llm_model = ""                      # falls back to `model`
 # export_llm_threshold = 0.85                # low-confidence trigger threshold
 # export_llm_batch = 8                       # blocks per LLM request
 # export_llm_timeout_s = 120                 # HTTP read timeout per request
 #
-# Env overrides: OCR_EXPORT_REFLOW / OCR_EXPORT_LLM / OCR_EXPORT_LLM_MODEL /
-# OCR_EXPORT_LLM_THRESHOLD / OCR_EXPORT_LLM_BATCH / OCR_EXPORT_LLM_TIMEOUT_S.
+# Env overrides: OCR_EXPORT_REFLOW / OCR_EXPORT_LLM / OCR_EXPORT_LLM_BLOCKS /
+# OCR_EXPORT_LLM_OUTLINE / OCR_EXPORT_LLM_MODEL / OCR_EXPORT_LLM_THRESHOLD /
+# OCR_EXPORT_LLM_BATCH / OCR_EXPORT_LLM_TIMEOUT_S.
 
 # --- Temp-file cleanup (see backend/cleanup.py) ----------------------------
 cleanup_max_age_hours = 168                  # delete unreferenced files after 7 days

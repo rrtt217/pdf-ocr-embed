@@ -216,11 +216,18 @@ env 别名进 `_ENV_ALIASES`：`OCR_EXPORT_LLM`、`OCR_EXPORT_LLM_MODEL`、…
 ### 5.6 API / CLI 面
 
 ```
-GET /api/export/{job}.md?llm=1        # query 参数，覆盖配置开关
-python -m backend.cli in.pdf -o out.md --export markdown --export-llm
+GET /api/export/{job}.md?llm_blocks=1        # 块修整（独立步骤）
+GET /api/export/{job}.md?llm_outline=1       # 章节精修（独立步骤，含目录）
+GET /api/export/{job}.md?llm=1               # legacy master：两者
+GET /api/export/stream/{job}.{ext}?...       # SSE：progress 事件 + done 携带全文
+python -m backend.cli in.pdf -o out.md --export markdown \
+    [--export-llm-blocks | --export-llm-outline | --export-llm]
 ```
 
-不改 `/api/health`、不动 WebUI（P2 再加导出面板开关）。
+配置：`export_llm_blocks` / `export_llm_outline`（独立键），`export_llm` 为
+legacy master（缺省两者）。WebUI：导出不是单独按钮——Markdown/LaTeX 链接 +
+「导出选项」（⚙ 下拉：LLM 修复块 / LLM 修正章节两个勾选）；勾选后点击格式
+链接走 SSE 流并显示独立进度条，未勾选则是即时直下。
 
 ---
 

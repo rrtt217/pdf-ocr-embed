@@ -66,16 +66,21 @@ _FILE_KEYS = (
     "generate_raw",
     # export pre-processing (backend/export_llm): deterministic reflow before
     # markdown/LaTeX rendering (line-split unwrap — the sidecars' line
-    # structure exists for the PDF text layer, not for exports) plus an
-    # opt-in LLM block fix-up over the hard blocks (tables / equations /
-    # low-confidence).  Defaults: reflow on, LLM off.  The LLM shares the OCR
-    # provider fields (api_key/base_url) and never affects the text layer.
-    "export_reflow",         # boolean, default on
-    "export_llm",            # boolean, default off (opt-in: ?llm=1 / --export-llm)
-    "export_llm_model",      # falls back to `model` when absent
-    "export_llm_threshold",  # low-confidence trigger threshold, default 0.85
-    "export_llm_batch",      # blocks per LLM request, default 8
-    "export_llm_timeout_s",  # HTTP read timeout per request, default 120
+    # structure exists for the PDF text layer, not for exports) plus TWO
+    # independent opt-in LLM post-processing steps: the block fix-up over the
+    # hard blocks (tables / equations / low-confidence) and the heading /
+    # outline refinement (uses the detected table of contents).  Defaults:
+    # reflow on, both LLM steps off (the legacy `export_llm` master defaults
+    # both).  The LLM shares the OCR provider fields (api_key/base_url) and
+    # never affects the text layer.
+    "export_reflow",          # boolean, default on
+    "export_llm",             # legacy master: defaults both steps below
+    "export_llm_blocks",      # boolean, default off (opt-in: ?llm_blocks=1 / --export-llm-blocks)
+    "export_llm_outline",     # boolean, default off (opt-in: ?llm_outline=1 / --export-llm-outline)
+    "export_llm_model",       # falls back to `model` when absent
+    "export_llm_threshold",   # low-confidence trigger threshold, default 0.85
+    "export_llm_batch",       # blocks per LLM request, default 8
+    "export_llm_timeout_s",   # HTTP read timeout per request, default 120
     # ocrmypdf pipeline knobs (backend.ocr_service builds OcrOptions from these)
     "ocrmypdf_mode",        # force | skip | redo | default (default: force)
     "ocrmypdf_jobs",        # 0 = auto (cpu count)
@@ -106,6 +111,8 @@ _ENV_ALIASES = {
     "OCR_GENERATE_RAW": "generate_raw",
     "OCR_EXPORT_REFLOW": "export_reflow",
     "OCR_EXPORT_LLM": "export_llm",
+    "OCR_EXPORT_LLM_BLOCKS": "export_llm_blocks",
+    "OCR_EXPORT_LLM_OUTLINE": "export_llm_outline",
     "OCR_EXPORT_LLM_MODEL": "export_llm_model",
     "OCR_EXPORT_LLM_THRESHOLD": "export_llm_threshold",
     "OCR_EXPORT_LLM_BATCH": "export_llm_batch",
@@ -236,6 +243,10 @@ def get_effective_settings() -> Dict[str, Any]:
         "generate_raw": as_bool(cfg.get("generate_raw", "false")),
         "export_reflow": as_bool(cfg.get("export_reflow", "true")),
         "export_llm": as_bool(cfg.get("export_llm", "false")),
+        "export_llm_blocks": as_bool(cfg.get("export_llm_blocks",
+                                             cfg.get("export_llm", "false"))),
+        "export_llm_outline": as_bool(cfg.get("export_llm_outline",
+                                              cfg.get("export_llm", "false"))),
     }
 
 
@@ -279,7 +290,8 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("generate_raw",):
         if settings.get(key) is not None:
             data[key] = "true" if as_bool(settings[key]) else "false"
-    for key in ("export_reflow", "export_llm"):
+    for key in ("export_reflow", "export_llm", "export_llm_blocks",
+                "export_llm_outline"):
         if settings.get(key) is not None:
             data[key] = "true" if as_bool(settings[key]) else "false"
     for key in ("export_llm_model", "export_llm_threshold",
