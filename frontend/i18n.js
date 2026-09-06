@@ -111,6 +111,16 @@ const I18N_DICT = {
     "job.partialFailed": "Partial failed: {msg}",
     "job.noPages": "No completed pages",
 
+    // --- settings: export group ---
+    "settings.exportTitle": "Raw generation & export (markdown / LaTeX)",
+    "settings.generateRaw": "Keep raw engine content (better table/equation export)",
+    "settings.exportReflow": "Reflow exports (unwrap line-splits)",
+    "settings.exportLlm": "LLM fix-up on export (default; per-request override)",
+    "settings.exportLlmModel": "Export LLM model (empty = OCR model)",
+    "settings.exportLlmThreshold": "LLM low-conf threshold",
+    "settings.exportLlmBatch": "LLM blocks per request",
+    "settings.exportLlmTimeout": "LLM request timeout (s)",
+
     // --- workspace / editor ---
     "workspace.editing": "Editing: {name}",
     "workspace.prev": "Previous page (←)",
@@ -375,6 +385,16 @@ const I18N_DICT = {
     "job.runningNoReOcr": "该任务仍在运行中，重跑页面前请先停止或等待其完成。",
     "job.partialFailed": "获取部分结果失败：{msg}",
     "job.noPages": "没有已完成的页面",
+
+    // --- settings: export group ---
+    "settings.exportTitle": "Raw 生成与导出（markdown / LaTeX）",
+    "settings.generateRaw": "保留引擎原始内容（表格/公式导出更好）",
+    "settings.exportReflow": "导出时重排（解开行内换行）",
+    "settings.exportLlm": "导出时 LLM 校对（默认；可按请求覆盖）",
+    "settings.exportLlmModel": "导出 LLM 模型（留空 = OCR 模型）",
+    "settings.exportLlmThreshold": "LLM 低置信触发阈值",
+    "settings.exportLlmBatch": "每次 LLM 请求的块数",
+    "settings.exportLlmTimeout": "LLM 请求超时（秒）",
 
     // --- workspace / editor ---
     "workspace.editing": "正在编辑：{name}",

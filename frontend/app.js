@@ -1828,7 +1828,19 @@ const PIPELINE_IDS = {
 const PIPELINE_CHECKBOX_IDS = {
   "ocrmypdf_deskew": "set-ocrmypdf-deskew",
   "ocrmypdf_clean": "set-ocrmypdf-clean",
+  "generate_raw": "set-generate-raw",
+  "export_reflow": "set-export-reflow",
+  "export_llm": "set-export-llm",
 };
+// Free-form export knobs: [config key, element id, kind].  Numbers load as
+// strings and are only sent back when non-empty (an empty field keeps the
+// server default).
+const EXPORT_INPUT_IDS = [
+  ["export_llm_model", "set-export-llm-model", "text"],
+  ["export_llm_threshold", "set-export-llm-threshold", "number"],
+  ["export_llm_batch", "set-export-llm-batch", "number"],
+  ["export_llm_timeout_s", "set-export-llm-timeout", "number"],
+];
 
 async function openSettings() {
   $("#settings-modal").classList.remove("hidden");
@@ -1846,6 +1858,10 @@ async function openSettings() {
     Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
       const elm = $(PIPELINE_CHECKBOX_IDS[key]);
       if (elm) elm.checked = !!s[key];
+    });
+    EXPORT_INPUT_IDS.forEach(([key, id]) => {
+      const elm = $(id);
+      if (elm) elm.value = s[key] !== undefined && s[key] !== null ? String(s[key]) : "";
     });
   } catch (e) {
     $("#settings-status").textContent = t("settings.loadFailed", { msg: e.message });
@@ -1866,6 +1882,10 @@ async function saveSettings() {
   Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
     const elm = $(PIPELINE_CHECKBOX_IDS[key]);
     if (elm) payload[key] = elm.checked;
+  });
+  EXPORT_INPUT_IDS.forEach(([key, id]) => {
+    const elm = $(id);
+    if (elm && elm.value.trim()) payload[key] = elm.value.trim();
   });
   try {
     await api("/api/settings", {
