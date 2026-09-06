@@ -635,6 +635,97 @@ def test_preprocess_llm_runs_blocks_then_outline():
     assert out[0]["blocks"][1]["llm_level"] == 2
 
 
+def test_preprocess_blocks_only_skips_outline():
+    pages = [_page([
+        _block("概述与设计背景", kind="heading", conf=0.4),
+        _block("1.2 具体方法", kind="heading"),
+    ])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 1
+    fake = _MultiClient({
+        "repair OCR-export text blocks": _llm_json(
+            {"n": 0, "ok": True, "text": "概述与设计背景（校对）"}),
+    })
+    out = export_llm.preprocess(pages, {}, fmt="markdown",
+                                enable_blocks=True, client=fake)
+    assert len(fake.calls) == 1  # only the block fix-up ran
+    assert "repair" in fake.calls[0]["system"]
+    assert out[0]["blocks"][0]["llm"]["text"] == "概述与设计背景（校对）"
+    # outline skipped: the deterministic sizing stands (1.2 → level 2 by
+    # numbering), no LLM refinement on top
+    assert out[0]["blocks"][1]["llm_level"] == 2
+
+
+def test_preprocess_outline_only_skips_blocks():
+    pages = [_page([
+        _block("概述与设计背景", kind="heading", conf=0.4),
+        _block("1.2 具体方法", kind="heading"),
+    ])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 1
+    fake = _MultiClient({
+        "heading hierarchy": '{"headings":[{"n":0,"level":1},{"n":1,"level":2}]}',
+    })
+    out = export_llm.preprocess(pages, {}, fmt="markdown",
+                                enable_outline=True, client=fake)
+    assert len(fake.calls) == 1  # only the outline ran
+    assert "hierarchy" in fake.calls[0]["system"]
+    # no llm tag (block fix-up skipped), levels refined
+    assert "llm" not in out[0]["blocks"][0]
+    assert out[0]["blocks"][0]["llm_level"] == 1
+    assert out[0]["blocks"][1]["llm_level"] == 2
+
+
+def test_preprocess_outline_only_no_reflow_assigns_base_levels():
+    pages = [_page([
+        _block("引言", kind="heading", bbox=[100, 300, 900, 330]),
+        _block("正文", kind="text", bbox=[100, 400, 900, 430]),
+    ])]
+    fake = _MultiClient({})
+    out = export_llm.preprocess(pages, {}, fmt="markdown", reflow=False,
+                                enable_outline=True, client=fake)
+    assert out[0]["blocks"][0]["llm_level"] == 1  # base levels before outline
+
+
+def test_resolve_settings_granular_keys():
+    # granular keys win over the legacy master
+    s = export_llm.resolve_settings({"export_llm": "true",
+                                     "export_llm_blocks": "false"})
+    assert s["blocks"] is False and s["outline"] is True
+    # legacy master defaults both when granular keys are absent
+    s2 = export_llm.resolve_settings({"export_llm": "true"})
+    assert s2["blocks"] is True and s2["outline"] is True
+    # everything off by default
+    s3 = export_llm.resolve_settings({})
+    assert s3["blocks"] is False and s3["outline"] is False
+
+
+def test_export_route_llm_flags_granular(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    blocks = [
+        {"kind": "text", "bbox": [0, 0, 100, 20],
+         "text": "数字逻辑概\n论是基础课。", "lines": []},
+    ]
+    _seed_job(tmp_path, blocks=blocks)
+    try:
+        with TestClient(app) as tc:
+            # llm_blocks=1 alone: reflow ran, no crash, no outline client call
+            r = tc.get("/api/export/export-1.md?llm_blocks=1")
+            assert r.status_code == 200
+            # explicit off overrides the legacy master
+            r2 = tc.get("/api/export/export-1.md?llm=1&llm_blocks=0&llm_outline=0")
+            assert r2.status_code == 200
+            # plain export (no LLM) still works
+            r3 = tc.get("/api/export/export-1.md")
+            assert r3.status_code == 200
+    finally:
+        ocr_service._JOBS.pop("export-1", None)
+
+
 def test_preprocess_llm_no_reflow_still_assigns_base_levels():
     pages = [_page([
         _block("引言", kind="heading", bbox=[100, 300, 900, 330]),

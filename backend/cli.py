@@ -114,9 +114,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="skip the deterministic export reflow (the "
                              "sidecars' line-split structure is kept)")
     parser.add_argument("--export-llm", action="store_true",
-                        help="run the LLM block fix-up over the exported "
-                             "hard blocks (tables / equations / low-conf); "
-                             "needs the configured provider api_key")
+                        help="run BOTH export LLM post-processing steps "
+                             "(block fix-up + heading refinement); needs the "
+                             "configured provider api_key")
+    parser.add_argument("--export-llm-blocks", action="store_true",
+                        help="run the LLM block fix-up only (tables / "
+                             "equations / low-conf)")
+    parser.add_argument("--export-llm-outline", action="store_true",
+                        help="run the LLM heading/outline refinement only "
+                             "(uses the detected table of contents)")
     args = parser.parse_args(argv)
 
     input_path = Path(args.input)
@@ -196,13 +202,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 1
         fmt_norm = ("markdown" if args.export.strip().lower()
                     in ("markdown", "md") else "latex")
-        if not args.no_reflow or args.export_llm:
-            # Deterministic reflow (default on) + opt-in LLM fix-up: both run
-            # on a deep copy; the per-job LLM cache lives in the work folder.
+        use_llm_blocks = args.export_llm_blocks or args.export_llm
+        use_llm_outline = args.export_llm_outline or args.export_llm
+        if not args.no_reflow or use_llm_blocks or use_llm_outline:
+            # Deterministic reflow (default on) + the two opt-in LLM steps:
+            # both run on a deep copy; the per-job LLM cache lives in the
+            # work folder.
             from backend import config as config_mod, export_llm
             pages = export_llm.preprocess(
                 pages, config_mod.resolve(), fmt=fmt_norm,
-                enable_llm=bool(args.export_llm),
+                enable_blocks=bool(use_llm_blocks),
+                enable_outline=bool(use_llm_outline),
                 reflow=not args.no_reflow,
                 cache_path=work_dir / "export_llm_cache.json")
         export_ext = "md" if fmt_norm == "markdown" else "tex"

@@ -678,8 +678,18 @@ def download(job_id: str):
     )
 
 
+def _llm_flag(value: Optional[str], default: bool) -> bool:
+    """Parse a tri-state LLM query flag: absent (None) falls back to the
+    legacy master default; otherwise "0"/"false"/"no" is off."""
+    if value is None:
+        return default
+    return str(value).lower() not in ("0", "false", "no")
+
+
 @app.get("/api/export/{job_id}.{ext}")
 def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
+                    llm_blocks: Optional[str] = None,
+                    llm_outline: Optional[str] = None,
                     reflow: str = "1"):
     """Export the job's recognized pages as markdown (``.md``) or LaTeX
     (``.tex``).
@@ -695,10 +705,14 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
     (backend.export_llm): the sidecars' line-split structure exists for the
     PDF text layer, so exports unwrap it (hard-wrapped lines join, hyphens
     merge, ragged tab tables pad, page-boundary paragraphs merge).
-    ``llm=1`` additionally runs the opt-in LLM block fix-up over the hard
-    blocks (tables / equations / low-confidence) under per-block guards; any
-    LLM failure falls back to the reflowed text.  Both passes only touch the
-    export copy — sidecars, hOCR and the embedded text layer are unaffected.
+
+    The LLM post-processing steps are export options, independent of each
+    other: ``llm_blocks=1`` runs the block fix-up (tables / equations /
+    low-confidence), ``llm_outline=1`` the heading refinement (all headings
+    plus the detected table of contents).  ``llm=1`` is the legacy master
+    switch enabling both.  Any LLM failure falls back to the reflowed text;
+    the passes only touch the export copy — sidecars, hOCR and the embedded
+    text layer are unaffected.
 
     404 when the job or its pages are missing; 400 for an unknown extension.
     """
@@ -714,15 +728,18 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
     use_reflow = str(reflow).lower() not in ("0", "false", "no")
-    use_llm = str(llm).lower() not in ("0", "false", "no")
-    if use_reflow or use_llm:
+    master = str(llm).lower() not in ("0", "false", "no")
+    use_blocks = _llm_flag(llm_blocks, master)
+    use_outline = _llm_flag(llm_outline, master)
+    if use_reflow or use_blocks or use_outline:
         # The passes rewrite a deep copy; the per-job LLM cache lives next to
         # the hOCR folder (work/<job>/export_llm_cache.json).
         cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
                       if job.get("hocr_dir") else None)
         pages = export_llm.preprocess(
             pages, config.resolve(), fmt=fmt,
-            enable_llm=use_llm, reflow=use_reflow, cache_path=cache_path)
+            enable_blocks=use_blocks, enable_outline=use_outline,
+            reflow=use_reflow, cache_path=cache_path)
     try:
         text = export_mod.export_document(
             fmt, pages, title=Path(job.get("filename") or "document").stem,
@@ -746,15 +763,18 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
 
 @app.get("/api/export/stream/{job_id}.{ext}")
 def export_document_stream(job_id: str, ext: str, raw: str = "1",
-                           llm: str = "0", reflow: str = "1"):
+                           llm: str = "0", llm_blocks: Optional[str] = None,
+                           llm_outline: Optional[str] = None,
+                           reflow: str = "1"):
     """SSE export: progress events while the pre-processing runs, then one
     ``done`` event carrying the full document text.
 
-    The LLM fix-up can take minutes (one API call per block batch), so the
-    WebUI streams a progress bar from the ``progress`` events instead of
-    waiting on a plain GET.  Event shapes (``backend.export_llm.preprocess``
-    progress callback):
-      ``{"type":"progress","phase":"reflow"|"llm","done":n,"total":m}``
+    The LLM post-processing steps (``llm_blocks=1`` block fix-up,
+    ``llm_outline=1`` heading refinement, legacy ``llm=1`` both) can take
+    minutes (one API call per block batch), so the WebUI streams a progress
+    bar from the ``progress`` events instead of waiting on a plain GET.
+    Event shapes (``backend.export_llm.preprocess`` progress callback):
+      ``{"type":"progress","phase":"reflow"|"llm"|"outline","done":n,"total":m}``
       ``{"type":"done","fmt":"markdown"|"latex","text":"..."}``
       ``{"type":"error","message":"..."}``
     Validation errors (404/400) raise before the stream starts; a failure
@@ -776,7 +796,9 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
     # before the work finishes — nothing in the closure may touch the request).
     cfg = config.resolve()
     use_reflow = str(reflow).lower() not in ("0", "false", "no")
-    use_llm = str(llm).lower() not in ("0", "false", "no")
+    master = str(llm).lower() not in ("0", "false", "no")
+    use_blocks = _llm_flag(llm_blocks, master)
+    use_outline = _llm_flag(llm_outline, master)
     cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
                   if job.get("hocr_dir") else None)
     title = Path(job.get("filename") or "document").stem
@@ -792,9 +814,9 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
         def work() -> None:
             try:
                 pages2 = export_llm.preprocess(
-                    pages, cfg, fmt=fmt, enable_llm=use_llm,
-                    reflow=use_reflow, cache_path=cache_path,
-                    progress=events.put)
+                    pages, cfg, fmt=fmt, enable_blocks=use_blocks,
+                    enable_outline=use_outline, reflow=use_reflow,
+                    cache_path=cache_path, progress=events.put)
                 text = export_mod.export_document(
                     fmt, pages2, title=title, use_raw=use_raw)
                 events.put({"_result": text})

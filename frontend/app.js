@@ -62,6 +62,7 @@ const state = {
   logTimer: null,
   confFilter: false,   // show only low-confidence blocks in the editor
   confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
+  exportLlm: { blocks: false, outline: false },  // export LLM post-processing options
 };
 
 /* ---------- helpers ---------- */
@@ -618,23 +619,40 @@ function jobCard(job) {
     a.download = "";
     actions.appendChild(a);
   }
-  // Other-format export: markdown / LaTeX direct links (instant — reflow
-  // only) and the LLM fix-up via its SSE stream (progress, can take minutes).
+  // Other-format export: markdown / LaTeX links carrying the LLM options.
+  // Without the LLM options the link is a plain instant download (reflow
+  // only); with one checked the click routes through the SSE stream and the
+  // job card shows the export progress bar.
   if (job.current > 0 && !job.exporting) {
+    const opts = el("details", "export-opts");
+    opts.appendChild(el("summary", null, t("job.exportOptions")));
+    opts.appendChild(_exportOptCheckbox("export-opt-blocks", "job.exportLlmBlocks",
+                                        "blocks"));
+    opts.appendChild(_exportOptCheckbox("export-opt-outline", "job.exportLlmOutline",
+                                        "outline"));
+    actions.appendChild(opts);
     const md = el("a", "download-link small", t("job.exportMd"));
     md.href = `/api/export/${job.id}.md`;
     md.download = "";
     md.title = t("job.exportMdTitle");
+    md.addEventListener("click", (ev) => {
+      if (state.exportLlm.blocks || state.exportLlm.outline) {
+        ev.preventDefault();
+        exportWithLlm(job.id, "md");
+      }
+    });
     actions.appendChild(md);
     const tex = el("a", "download-link small", t("job.exportTex"));
     tex.href = `/api/export/${job.id}.tex`;
     tex.download = "";
     tex.title = t("job.exportTexTitle");
+    tex.addEventListener("click", (ev) => {
+      if (state.exportLlm.blocks || state.exportLlm.outline) {
+        ev.preventDefault();
+        exportWithLlm(job.id, "tex");
+      }
+    });
     actions.appendChild(tex);
-    const llm = el("button", "small", t("job.exportLlm"));
-    llm.title = t("job.exportLlmTitle");
-    llm.onclick = () => exportWithLlm(job.id);
-    actions.appendChild(llm);
   }
   card.appendChild(actions);
   return card;
@@ -654,15 +672,34 @@ function connectStream(jobId) {
   es.onerror = () => {};
 }
 
-/* ---------- export (markdown / LaTeX, opt-in LLM fix-up) ---------- */
+/* ---------- export (markdown / LaTeX, opt-in LLM post-processing) ---------- */
 
-function exportWithLlm(jobId) {
+function _exportOptCheckbox(id, i18nKey, key) {
+  const label = el("label", "inline-check");
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.id = id;
+  cb.checked = !!state.exportLlm[key];
+  cb.onchange = () => { state.exportLlm[key] = cb.checked; };
+  label.appendChild(cb);
+  const span = document.createElement("span");
+  span.setAttribute("data-i18n", i18nKey);
+  span.textContent = t(i18nKey);
+  label.appendChild(span);
+  return label;
+}
+
+function exportWithLlm(jobId, ext) {
   const job = jobById(jobId);
   if (!job || job.exporting) return;
+  const params = [];
+  if (state.exportLlm.blocks) params.push("llm_blocks=1");
+  if (state.exportLlm.outline) params.push("llm_outline=1");
+  if (!params.length) return;  // nothing selected: plain link handles it
   job.exporting = true;
   job.export = { phase: "reflow", done: 0, total: 0 };
   renderJobs();
-  const es = new EventSource(`/api/export/stream/${jobId}.md?llm=1`);
+  const es = new EventSource(`/api/export/stream/${jobId}.${ext}?${params.join("&")}`);
   es.onmessage = (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
@@ -674,8 +711,9 @@ function exportWithLlm(jobId) {
       job.exporting = false;
       job.export = null;
       renderJobs();
-      downloadText(`${(job.filename || jobId).replace(/\.pdf$/i, "")}.md`,
-                   msg.text, "text/markdown");
+      downloadText(`${(job.filename || jobId).replace(/\.pdf$/i, "")}.${ext}`,
+                   msg.text,
+                   ext === "tex" ? "application/x-tex" : "text/markdown");
       toast(t("job.exportDone"), "success");
     } else if (msg.type === "error") {
       es.close();
