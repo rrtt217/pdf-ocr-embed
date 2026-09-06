@@ -544,6 +544,23 @@ function jobCard(job) {
   bar.appendChild(fill);
   card.appendChild(bar);
 
+  // Export progress: the LLM fix-up streams its own bar (one API call per
+  // block batch — can take minutes; the reflow phase is instant).
+  if (job.export) {
+    const wrap = el("div", "export-progress");
+    wrap.appendChild(el("span", "hint", "⬇ " + (job.export.phase === "llm"
+      ? t("job.exportProgress", { done: job.export.done, total: job.export.total })
+      : t("job.exportReflow"))));
+    const ebar = el("div", "bar");
+    const efill = el("div", "fill");
+    const etotal = job.export.total || 0;
+    efill.style.width = job.export.phase === "llm" && etotal
+      ? Math.min(100, Math.round((job.export.done / etotal) * 100)) + "%" : "8%";
+    ebar.appendChild(efill);
+    wrap.appendChild(ebar);
+    card.appendChild(wrap);
+  }
+
   if (job.error) card.appendChild(el("div", "job-err", "✗ " + job.error));
 
   const actions = el("div", "job-actions");
@@ -599,6 +616,24 @@ function jobCard(job) {
     a.download = "";
     actions.appendChild(a);
   }
+  // Other-format export: markdown / LaTeX direct links (instant — reflow
+  // only) and the LLM fix-up via its SSE stream (progress, can take minutes).
+  if (job.current > 0 && !job.exporting) {
+    const md = el("a", "download-link small", t("job.exportMd"));
+    md.href = `/api/export/${job.id}.md`;
+    md.download = "";
+    md.title = t("job.exportMdTitle");
+    actions.appendChild(md);
+    const tex = el("a", "download-link small", t("job.exportTex"));
+    tex.href = `/api/export/${job.id}.tex`;
+    tex.download = "";
+    tex.title = t("job.exportTexTitle");
+    actions.appendChild(tex);
+    const llm = el("button", "small", t("job.exportLlm"));
+    llm.title = t("job.exportLlmTitle");
+    llm.onclick = () => exportWithLlm(job.id);
+    actions.appendChild(llm);
+  }
   card.appendChild(actions);
   return card;
 }
@@ -615,6 +650,62 @@ function connectStream(jobId) {
   // On connection trouble the browser auto-reconnects; the server re-synthesizes
   // terminal events, so a reconnect always catches the job up. Do nothing here.
   es.onerror = () => {};
+}
+
+/* ---------- export (markdown / LaTeX, opt-in LLM fix-up) ---------- */
+
+function exportWithLlm(jobId) {
+  const job = jobById(jobId);
+  if (!job || job.exporting) return;
+  job.exporting = true;
+  job.export = { phase: "reflow", done: 0, total: 0 };
+  renderJobs();
+  const es = new EventSource(`/api/export/stream/${jobId}.md?llm=1`);
+  es.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.type === "progress") {
+      job.export = { phase: msg.phase, done: msg.done || 0, total: msg.total || 0 };
+      renderJobs();
+    } else if (msg.type === "done") {
+      es.close();
+      job.exporting = false;
+      job.export = null;
+      renderJobs();
+      downloadText(`${(job.filename || jobId).replace(/\.pdf$/i, "")}.md`,
+                   msg.text, "text/markdown");
+      toast(t("job.exportDone"), "success");
+    } else if (msg.type === "error") {
+      es.close();
+      job.exporting = false;
+      job.export = null;
+      renderJobs();
+      toast(t("job.exportFailed", { msg: msg.message }), "error");
+    }
+  };
+  // The stream ends after done/error (handled above); an unexpected
+  // connection drop must NOT auto-reconnect into a fresh export run.
+  es.onerror = () => {
+    es.close();
+    if (job.exporting) {
+      job.exporting = false;
+      job.export = null;
+      renderJobs();
+      toast(t("job.exportFailed", { msg: "connection lost" }), "error");
+    }
+  };
+}
+
+function downloadText(filename, text, media) {
+  const blob = new Blob([text], { type: `${media};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 function applyJobEvent(jobId, msg) {
@@ -1737,7 +1828,19 @@ const PIPELINE_IDS = {
 const PIPELINE_CHECKBOX_IDS = {
   "ocrmypdf_deskew": "set-ocrmypdf-deskew",
   "ocrmypdf_clean": "set-ocrmypdf-clean",
+  "generate_raw": "set-generate-raw",
+  "export_reflow": "set-export-reflow",
+  "export_llm": "set-export-llm",
 };
+// Free-form export knobs: [config key, element id, kind].  Numbers load as
+// strings and are only sent back when non-empty (an empty field keeps the
+// server default).
+const EXPORT_INPUT_IDS = [
+  ["export_llm_model", "set-export-llm-model", "text"],
+  ["export_llm_threshold", "set-export-llm-threshold", "number"],
+  ["export_llm_batch", "set-export-llm-batch", "number"],
+  ["export_llm_timeout_s", "set-export-llm-timeout", "number"],
+];
 
 async function openSettings() {
   $("#settings-modal").classList.remove("hidden");
@@ -1755,6 +1858,10 @@ async function openSettings() {
     Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
       const elm = $(PIPELINE_CHECKBOX_IDS[key]);
       if (elm) elm.checked = !!s[key];
+    });
+    EXPORT_INPUT_IDS.forEach(([key, id]) => {
+      const elm = $(id);
+      if (elm) elm.value = s[key] !== undefined && s[key] !== null ? String(s[key]) : "";
     });
   } catch (e) {
     $("#settings-status").textContent = t("settings.loadFailed", { msg: e.message });
@@ -1775,6 +1882,10 @@ async function saveSettings() {
   Object.keys(PIPELINE_CHECKBOX_IDS).forEach((key) => {
     const elm = $(PIPELINE_CHECKBOX_IDS[key]);
     if (elm) payload[key] = elm.checked;
+  });
+  EXPORT_INPUT_IDS.forEach(([key, id]) => {
+    const elm = $(id);
+    if (elm && elm.value.trim()) payload[key] = elm.value.trim();
   });
   try {
     await api("/api/settings", {

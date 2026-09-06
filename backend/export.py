@@ -15,6 +15,12 @@ real markdown table / LaTeX ``tabular``; the raw LaTeX of an equation block
 keeps ``\\frac{..}{..}`` and friends.  Blocks without ``raw`` (tesseract-derived
 sidecars, old sidecars, option off) fall back to the normalized text.
 
+LLM fix-up: blocks whose page copy carries an ``llm`` field (tagged by
+``backend.export_llm.preprocess`` BEFORE the builders run — a pages->pages
+transform) are used first of all: ``block_source`` prefers ``llm > raw >
+text``, and a table's ``llm`` markdown pipe table is parsed by
+``_md_table_to_rows``.  The builders themselves stay untouched.
+
 All functions here are pure (string in, string out) so the suite can pin the
 formats; only the loaders touch the filesystem.
 """
@@ -36,13 +42,18 @@ _HEADING_KINDS = {"title", "heading"}
 # --- block text access --------------------------------------------------------
 
 def block_source(block: dict, use_raw: bool = True) -> str:
-    """The text to export for one block: raw when present, else normalized.
+    """The text to export for one block: LLM fix-up when present, else raw,
+    else normalized.
 
-    ``raw`` is the engine's pre-normalization content (the ``generate_raw``
-    option writes it); it is what other-format export wants — the normalized
-    ``text`` is lossy (math spacing, LaTeX -> plain, table HTML -> rows).
+    ``llm`` is the export pre-processing rewrite (backend.export_llm tags it
+    on a deep copy of the pages); ``raw`` is the engine's pre-normalization
+    content (the ``generate_raw`` option writes it); the normalized ``text``
+    is the lossy fallback (math spacing, LaTeX -> plain, table HTML -> rows).
     """
     if use_raw:
+        llm = ((block.get("llm") or {}).get("text") or "").strip()
+        if llm:
+            return llm
         raw = (block.get("raw") or "").strip()
         if raw:
             return raw
@@ -137,10 +148,38 @@ def _md_escape_cell(cell: str) -> str:
     return cell.replace("|", "\\|").replace("\n", " ")
 
 
+def _md_table_to_rows(text: str) -> List[List[str]]:
+    """Parse a markdown pipe table into cell rows (never raises).
+
+    The export LLM fix-up writes tables as pipe tables into the block's
+    ``llm`` field; this reads them back.  The ``---`` separator row is
+    dropped; ``\\|`` unescapes to ``|``.
+    """
+    rows: List[List[str]] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|") or not stripped.endswith("|"):
+            if rows:
+                break  # table ended
+            continue
+        cells = re.split(r"(?<!\\)\|", stripped[1:-1])
+        row = [c.replace("\\|", "|").strip() for c in cells]
+        if row and set("".join(row)) <= set("-: "):
+            continue  # the --- separator row
+        rows.append(row)
+    return rows
+
+
 def _table_rows(block: dict, use_raw: bool) -> List[List[str]]:
-    """Cell rows for a table block: the raw HTML when present (keeps the real
-    structure), else the normalized tab-separated text."""
+    """Cell rows for a table block: the LLM-rebuilt pipe table when present
+    (best structure), else the raw HTML (keeps the real structure), else the
+    normalized tab-separated text."""
     if use_raw:
+        llm = ((block.get("llm") or {}).get("text") or "").strip()
+        if llm and "|" in llm:
+            rows = _md_table_to_rows(llm)
+            if rows:
+                return rows
         raw = (block.get("raw") or "").strip()
         if "<t" in raw.lower() or "<tr" in raw.lower():
             rows = _html_table_to_rows(raw)

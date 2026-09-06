@@ -12,6 +12,8 @@ Endpoints:
   GET  /api/validation/{job_id} compare embedded text with OCR source (report)
   GET  /api/download/{job_id}.pdf   download embedded result
   GET  /api/export/{job_id}.md|.tex  export pages as markdown / LaTeX
+                                     (?reflow=1 re-wrap, ?llm=1 LLM fix-up)
+  GET  /api/export/stream/{job_id}.{ext}  SSE export: progress + done(text)
 
 The OCR core is OCRmyPDF; the unlimited engine ships as the standalone
 ``ocrmypdf_unlimited`` plugin (``backend/ocrmypad`` is a compat alias).
@@ -37,7 +39,8 @@ from starlette.background import BackgroundTask
 
 from backend import batch
 from backend import cleanup as cleanup_mod
-from backend import config, export as export_mod, ocr_service, validation
+from backend import config, export as export_mod, export_llm
+from backend import ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
 
 setup_logging()
@@ -676,7 +679,8 @@ def download(job_id: str):
 
 
 @app.get("/api/export/{job_id}.{ext}")
-def export_document(job_id: str, ext: str, raw: str = "1"):
+def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
+                    reflow: str = "1"):
     """Export the job's recognized pages as markdown (``.md``) or LaTeX
     (``.tex``).
 
@@ -686,6 +690,15 @@ def export_document(job_id: str, ext: str, raw: str = "1"):
     LaTeX -> plain, table HTML -> rows) is skipped and tables render as real
     markdown tables / LaTeX ``tabular``.  ``raw=0`` always uses the normalized
     text.  Pages whose sidecar has no raw field fall back to it either way.
+
+    ``reflow=1`` (default) runs the deterministic export pre-processing
+    (backend.export_llm): the sidecars' line-split structure exists for the
+    PDF text layer, so exports unwrap it (hard-wrapped lines join, hyphens
+    merge, ragged tab tables pad, page-boundary paragraphs merge).
+    ``llm=1`` additionally runs the opt-in LLM block fix-up over the hard
+    blocks (tables / equations / low-confidence) under per-block guards; any
+    LLM failure falls back to the reflowed text.  Both passes only touch the
+    export copy — sidecars, hOCR and the embedded text layer are unaffected.
 
     404 when the job or its pages are missing; 400 for an unknown extension.
     """
@@ -700,6 +713,16 @@ def export_document(job_id: str, ext: str, raw: str = "1"):
     if fmt is None:
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+    use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_llm = str(llm).lower() not in ("0", "false", "no")
+    if use_reflow or use_llm:
+        # The passes rewrite a deep copy; the per-job LLM cache lives next to
+        # the hOCR folder (work/<job>/export_llm_cache.json).
+        cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
+                      if job.get("hocr_dir") else None)
+        pages = export_llm.preprocess(
+            pages, config.resolve(), fmt=fmt,
+            enable_llm=use_llm, reflow=use_reflow, cache_path=cache_path)
     try:
         text = export_mod.export_document(
             fmt, pages, title=Path(job.get("filename") or "document").stem,
@@ -719,6 +742,85 @@ def export_document(job_id: str, ext: str, raw: str = "1"):
         media_type=f"{media}; charset=utf-8",
         headers={"Content-Disposition": disposition},
     )
+
+
+@app.get("/api/export/stream/{job_id}.{ext}")
+def export_document_stream(job_id: str, ext: str, raw: str = "1",
+                           llm: str = "0", reflow: str = "1"):
+    """SSE export: progress events while the pre-processing runs, then one
+    ``done`` event carrying the full document text.
+
+    The LLM fix-up can take minutes (one API call per block batch), so the
+    WebUI streams a progress bar from the ``progress`` events instead of
+    waiting on a plain GET.  Event shapes (``backend.export_llm.preprocess``
+    progress callback):
+      ``{"type":"progress","phase":"reflow"|"llm","done":n,"total":m}``
+      ``{"type":"done","fmt":"markdown"|"latex","text":"..."}``
+      ``{"type":"error","message":"..."}``
+    Validation errors (404/400) raise before the stream starts; a failure
+    mid-stream is an ``error`` event, never a broken connection.
+    """
+    job = ocr_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    pages = export_mod.load_job_pages(job)
+    if not pages:
+        raise HTTPException(
+            status_code=404, detail="No OCR pages to export — run OCR first")
+    fmt = {"md": "markdown", "tex": "latex"}.get((ext or "").lower())
+    if fmt is None:
+        raise HTTPException(
+            status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+
+    # Snapshot the inputs for the worker thread (the request handler returns
+    # before the work finishes — nothing in the closure may touch the request).
+    cfg = config.resolve()
+    use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_llm = str(llm).lower() not in ("0", "false", "no")
+    cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
+                  if job.get("hocr_dir") else None)
+    title = Path(job.get("filename") or "document").stem
+    use_raw = str(raw).lower() not in ("0", "false", "no")
+    ext_out = ext.lower()
+
+    async def gen():
+        import queue as _queue
+        import threading
+
+        events: _queue.Queue = _queue.Queue()
+
+        def work() -> None:
+            try:
+                pages2 = export_llm.preprocess(
+                    pages, cfg, fmt=fmt, enable_llm=use_llm,
+                    reflow=use_reflow, cache_path=cache_path,
+                    progress=events.put)
+                text = export_mod.export_document(
+                    fmt, pages2, title=title, use_raw=use_raw)
+                events.put({"_result": text})
+            except BaseException as exc:  # noqa: BLE001 — an error event, not a dropped connection
+                from backend.config import redact_secrets
+                events.put({"_error": redact_secrets(str(exc))})
+
+        threading.Thread(target=work, daemon=True, name="export-llm").start()
+        while True:
+            try:
+                ev = events.get(timeout=15.0)
+            except _queue.Empty:
+                # SSE comment keepalive: proxies/browsers time a silent
+                # stream out long before the LLM batch budget.
+                yield ": keepalive\n\n"
+                continue
+            if "_error" in ev:
+                yield _sse({"type": "error", "message": ev["_error"]})
+                break
+            if "_result" in ev:
+                yield _sse({"type": "done", "fmt": fmt, "ext": ext_out,
+                            "text": ev["_result"]})
+                break
+            yield _sse({"type": "progress", **ev})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/validation/{job_id}")

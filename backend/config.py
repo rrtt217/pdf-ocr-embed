@@ -64,6 +64,18 @@ _FILE_KEYS = (
     # other-format export (markdown/LaTeX) can skip the lossy normalization.
     # Default off; the embedded text layer is unaffected.
     "generate_raw",
+    # export pre-processing (backend/export_llm): deterministic reflow before
+    # markdown/LaTeX rendering (line-split unwrap — the sidecars' line
+    # structure exists for the PDF text layer, not for exports) plus an
+    # opt-in LLM block fix-up over the hard blocks (tables / equations /
+    # low-confidence).  Defaults: reflow on, LLM off.  The LLM shares the OCR
+    # provider fields (api_key/base_url) and never affects the text layer.
+    "export_reflow",         # boolean, default on
+    "export_llm",            # boolean, default off (opt-in: ?llm=1 / --export-llm)
+    "export_llm_model",      # falls back to `model` when absent
+    "export_llm_threshold",  # low-confidence trigger threshold, default 0.85
+    "export_llm_batch",      # blocks per LLM request, default 8
+    "export_llm_timeout_s",  # HTTP read timeout per request, default 120
     # ocrmypdf pipeline knobs (backend.ocr_service builds OcrOptions from these)
     "ocrmypdf_mode",        # force | skip | redo | default (default: force)
     "ocrmypdf_jobs",        # 0 = auto (cpu count)
@@ -92,6 +104,12 @@ _ENV_ALIASES = {
     "OCR_BATCH_TIMEOUT_MS": "ocr_batch_timeout_ms",
     "OCR_BATCH_PER_PAGE_TOKENS": "ocr_batch_per_page_tokens",
     "OCR_GENERATE_RAW": "generate_raw",
+    "OCR_EXPORT_REFLOW": "export_reflow",
+    "OCR_EXPORT_LLM": "export_llm",
+    "OCR_EXPORT_LLM_MODEL": "export_llm_model",
+    "OCR_EXPORT_LLM_THRESHOLD": "export_llm_threshold",
+    "OCR_EXPORT_LLM_BATCH": "export_llm_batch",
+    "OCR_EXPORT_LLM_TIMEOUT_S": "export_llm_timeout_s",
     "OCRMYPDF_MODE": "ocrmypdf_mode",
     "OCRMYPDF_JOBS": "ocrmypdf_jobs",
     "OCRMYPDF_OPTIMIZE": "ocrmypdf_optimize",
@@ -216,6 +234,8 @@ def get_effective_settings() -> Dict[str, Any]:
         "ocr_batch_timeout_ms": cfg.get("ocr_batch_timeout_ms", "3000"),
         "ocr_batch_per_page_tokens": cfg.get("ocr_batch_per_page_tokens", "2048"),
         "generate_raw": as_bool(cfg.get("generate_raw", "false")),
+        "export_reflow": as_bool(cfg.get("export_reflow", "true")),
+        "export_llm": as_bool(cfg.get("export_llm", "false")),
     }
 
 
@@ -259,6 +279,13 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("generate_raw",):
         if settings.get(key) is not None:
             data[key] = "true" if as_bool(settings[key]) else "false"
+    for key in ("export_reflow", "export_llm"):
+        if settings.get(key) is not None:
+            data[key] = "true" if as_bool(settings[key]) else "false"
+    for key in ("export_llm_model", "export_llm_threshold",
+                "export_llm_batch", "export_llm_timeout_s"):
+        if settings.get(key) is not None:
+            data[key] = str(settings[key]).strip()
 
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)
