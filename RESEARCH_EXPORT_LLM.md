@@ -271,11 +271,18 @@ python -m backend.cli in.pdf -o out.md --export markdown --export-llm
 2. `llm` 字段要不要持久化进 sidecar（跨会话复用缓存）？—— 涉及编辑器语义，倾向不进
    （当前实现：只进导出副本，缓存落 `work/<job>/export_llm_cache.json`）。
 3. 整文档模式若只服务于标题层级，可否退化为「只发各页首块 + 目录页」的廉价特例？
-   —— **已落地确定性版本**：`assign_heading_levels`（P0.5）用文档级信号定级——
-   扩展编号（`第一章`/`一、`/`（一）`/`Appendix A`/Roman）优先，无编号标题按
-   字号分带（bbox 行高 vs 正文行高中位数，~15% 聚类），首个标题为文档标题。
-   builder 经 `block_heading_level` 读 `llm_level`，缺失退回单块启发式。
-   LLM 大纲特例（只发标题清单，guard 后精修相对深度）仍未做，作可选增强。
+   —— **已全部落地**：
+   * **确定性版本（P0.5）**：`assign_heading_levels` 用文档级信号定级——
+     扩展编号（`第一章`/`一、`/`（一）`/`Appendix A`/Roman）优先，无编号标题按
+     字号分带（bbox 行高 vs 正文行高中位数，~15% 聚类），首个标题为文档标题。
+     builder 经 `block_heading_level` 读 `llm_level`。
+   * **LLM 大纲精修（P1b，`?llm=1` 时默认）**：`_refine_outline` 在块修整后跑——
+     发全部标题（序号|当前层级|文本）+ **检测到的目录**（`detect_toc_entries`
+     从前几页解析点线引导符行，编号定深度、无编号按缩进；必须在 reflow 前检测，
+     因为 reflow 会 join 点线行）作为语义 ground truth，要回
+     `{"headings":[{"n","level"}]}`；逐项 guard：level ∈ 1..5、首个 ∈ {1,2}、
+     层级不得一次加深 >1，不合格项回退确定性层级。语义错乱（目录说第 2 章在第
+     3 章之前、无编号但语义上是章级）由此修正。
 4. 表格图像取证的最小分辨率（页图 300dpi 裁块 vs 重渲染 150dpi 裁块）需实测。
 
 ## 11. 位置信息与「重现排版」在导出中的真实角色
