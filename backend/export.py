@@ -75,19 +75,67 @@ def _is_content(block: dict) -> bool:
 
 _NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)[.、]?\s*")
 
+_CJK_NUM = "一二三四五六七八九十百"
+
+
+def heading_numbering_depth(text: str) -> Optional[int]:
+    """The heading depth from its leading numbering pattern (pure).
+
+    Recognizes arabic dotted numbers (``1.`` -> 1, ``1.2`` -> 2, ``1.2.3``
+    -> 3), CJK chapter/section forms (``第一章`` -> 1, ``第二节`` -> 2,
+    ``一、`` -> 1, ``（一）`` -> 2) and latin forms (``Part II`` /
+    ``Chapter 3`` / ``Appendix A`` -> 1, roman ``I.`` -> 1).  ``None`` when
+    the text carries no recognized numbering — the caller falls back to its
+    own heuristic (``heading_level`` uses 2).
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    match = _NUM_RE.match(t)
+    if match:
+        return min(match.group(1).count(".") + 1, 4)
+    if re.match(rf"^第[{_CJK_NUM}0-9]+[章篇部]", t):
+        return 1
+    if re.match(rf"^第[{_CJK_NUM}0-9]+[节讲]", t):
+        return 2
+    if re.match(rf"^[{_CJK_NUM}]+[、.．]", t):
+        return 1
+    if re.match(rf"^[（(][{_CJK_NUM}]+[)）]", t):
+        return 2
+    if re.match(r"^(?:part|chapter|appendix)\s+\S+", t, re.I):
+        return 1
+    if re.match(r"^[IVXLCDM]+[.、)]\s*", t):
+        return 1
+    return None
+
 
 def heading_level(text: str) -> int:
     """Heading level (1-4) from a leading numbering pattern (pure heuristic).
 
     ``"1. 标题"`` -> 1 (section), ``"1.2 标题"`` -> 2 (subsection),
-    ``"1.2.3 标题"`` -> 3 (subsubsection).  Unnumbered titles get 2 — they are
-    usually sub-headings under the document title.
+    ``"1.2.3 标题"`` -> 3 (subsubsection); extended forms (``第一章`` -> 1,
+    ``一、`` -> 1, ``（一）`` -> 2, ``Appendix A`` -> 1) go through
+    ``heading_numbering_depth``.  Unnumbered titles get 2 — they are usually
+    sub-headings under the document title (the document-level sizing in
+    ``backend.export_llm.assign_heading_levels`` fixes this when it runs).
     """
-    match = _NUM_RE.match(text.strip())
-    if match:
-        depth = match.group(1).count(".") + 1
-        return min(depth, 4)
+    depth = heading_numbering_depth(text)
+    if depth is not None:
+        return depth
     return 2
+
+
+def block_heading_level(block: dict, text: str) -> int:
+    """The export level for one heading block (pure).
+
+    The export pre-processing assignment (``llm_level``, set by
+    ``backend.export_llm.assign_heading_levels`` from the document-wide font
+    sizes) wins; the per-block numbering heuristic is the fallback.
+    """
+    lvl = block.get("llm_level")
+    if isinstance(lvl, int) and 1 <= lvl <= 6:
+        return lvl
+    return heading_level(text)
 
 
 # --- markdown rendering ---------------------------------------------------------
@@ -218,7 +266,7 @@ def block_to_markdown(block: dict, use_raw: bool = True,
 
     if kind in _HEADING_KINDS:
         text = raw or (block.get("text") or "")
-        return "#" * heading_level(text) + " " + text.strip()
+        return "#" * block_heading_level(block, text) + " " + text.strip()
 
     if kind in ("image", "image_ref"):
         text = raw or caption
@@ -339,7 +387,7 @@ def block_to_latex(block: dict, use_raw: bool = True,
 
     if kind in _HEADING_KINDS:
         text = raw or (block.get("text") or "")
-        level = heading_level(text)
+        level = block_heading_level(block, text)
         command = {1: "section", 2: "subsection",
                    3: "subsubsection"}.get(level, "subsubsection")
         return f"\\{command}{{{latex_escape(text.strip())}}}"

@@ -37,6 +37,7 @@ import hashlib
 import json
 import logging
 import re
+import statistics
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -525,6 +526,86 @@ def resolve_settings(cfg: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --- document-level heading sizing (P0.5) -----------------------------------------
+
+def _line_height(block: dict) -> float:
+    """One rendered line's height for a block: bbox height / line count."""
+    bbox = block.get("bbox") or [0, 0, 0, 0]
+    height = max(0, float(bbox[3]) - float(bbox[1]))
+    lines = [ln for ln in (block.get("lines") or [])
+             if isinstance(ln, str) and ln.strip()]
+    if not lines:
+        lines = [ln for ln in (block.get("text") or "").split("\n") if ln.strip()]
+    return height / max(1, len(lines))
+
+
+def assign_heading_levels(pages: List[dict]) -> int:
+    """Document-level heading sizing (pure): tag heading blocks with
+    ``llm_level`` (1..4).  Returns the tagged count.
+
+    Heading level is a DOCUMENT property — the per-block numbering heuristic
+    cannot see it.  Signals, in order:
+
+    * **numbering** (``heading_numbering_depth``: ``1.2`` / ``第一章`` /
+      ``一、`` / ``（一）`` / ``Appendix A``) wins when present;
+    * **font size** (bbox height per line vs the body's median line height,
+      clustered into size bands) fixes UNNUMBERED headings — the biggest
+      heading size is level 1, each ~15% smaller cluster one level deeper;
+    * the first heading is the document title (level 1).
+
+    Blocks without a heading kind (tesseract-derived sidecars carry
+    ``kind="text"`` everywhere) are left untouched — the builders fall back
+    to the per-block heuristic.
+    """
+    from backend.export import heading_numbering_depth
+
+    heads: List[dict] = []
+    body_heights: List[float] = []
+    for page in pages:
+        for block in (page.get("blocks") or []):
+            kind = str(block.get("kind") or "text")
+            if kind in ("title", "heading"):
+                heads.append(block)
+            elif kind == "text" and (block.get("text") or "").strip():
+                body_heights.append(_line_height(block))
+    if not heads:
+        return 0
+
+    body = statistics.median(body_heights) if body_heights else 0.0
+    if body <= 0:
+        body = statistics.median([_line_height(h) for h in heads])
+
+    # Size bands: distinct heading line heights, biggest first; a cluster is
+    # a group of heights within ~15% of the band's top.
+    heights = sorted({_line_height(h) for h in heads}, reverse=True)
+    bands: List[float] = []
+    for value in heights:
+        if not bands or value < bands[-1] * 0.85:
+            bands.append(value)
+
+    def size_level(block: dict) -> int:
+        if not bands or body <= 0:
+            return 1
+        height = _line_height(block)
+        for i, top in enumerate(bands):
+            if height >= top * 0.85:
+                return min(i + 1, 4)
+        return min(len(bands), 4)
+
+    tagged = 0
+    for i, block in enumerate(heads):
+        depth = heading_numbering_depth(block.get("text") or "")
+        if depth is not None:
+            level = depth
+        else:
+            level = size_level(block)
+        if i == 0 and depth in (None, 1):
+            level = 1  # the document title
+        block["llm_level"] = int(max(1, min(level, 4)))
+        tagged += 1
+    return tagged
+
+
 # --- the orchestrator (pages -> pages) ----------------------------------------------
 
 def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
@@ -566,8 +647,11 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
         except Exception:  # noqa: BLE001 — cosmetic, never breaks the export
             log.debug("export progress callback failed", exc_info=True)
 
-    # P0: deterministic reflow (offline).
+    # P0: deterministic reflow (offline).  Heading sizing runs FIRST — it
+    # reads the original per-line structure (bbox height / line count) that
+    # the reflow pass is about to unwrap.
     if settings["reflow"]:
+        assign_heading_levels(pages)
         for page in pages:
             blocks = page.get("blocks") or []
             for block in blocks:
