@@ -247,6 +247,12 @@ def get_effective_settings() -> Dict[str, Any]:
                                              cfg.get("export_llm", "false"))),
         "export_llm_outline": as_bool(cfg.get("export_llm_outline",
                                               cfg.get("export_llm", "false"))),
+        # Free-form export LLM knobs (the WebUI settings modal reloads them;
+        # empty model = fall back to the OCR model).
+        "export_llm_model": cfg.get("export_llm_model", ""),
+        "export_llm_threshold": cfg.get("export_llm_threshold", "0.85"),
+        "export_llm_batch": cfg.get("export_llm_batch", "8"),
+        "export_llm_timeout_s": cfg.get("export_llm_timeout_s", "120"),
     }
 
 

@@ -89,6 +89,41 @@ def test_markdown_image_placeholder_uses_caption():
     assert md.startswith("> [图]") and "图 1.11 模拟量" in md and "page 11" in md
 
 
+def test_markdown_image_resolver_renders_real_image():
+    """An image_resolver turn the placeholder into a real markdown image."""
+    block = {"kind": "image", "text": "", "caption": "图 1", "bbox": [0, 0, 1, 1]}
+    resolver = lambda b, pi, bi: f"images/page-{(pi or 0) + 1:03d}-img-{bi}.png"
+    md = block_to_markdown(block, page_index=0, block_index=1,
+                           image_resolver=resolver)
+    assert md == "![图 1](images/page-001-img-1.png)"
+
+
+def test_markdown_image_resolver_failure_falls_back_to_placeholder():
+    block = {"kind": "image", "text": "", "caption": "图 1", "bbox": [0, 0, 1, 1]}
+    def broken(block, page_index, block_index):
+        raise RuntimeError("boom")
+    md = block_to_markdown(block, page_index=0, block_index=0,
+                           image_resolver=broken)
+    assert md.startswith("> [图]")
+
+
+def test_markdown_image_resolver_none_link_falls_back():
+    block = {"kind": "image", "text": "", "caption": "图 1", "bbox": [0, 0, 1, 1]}
+    md = block_to_markdown(block, page_index=0, block_index=0,
+                           image_resolver=lambda b, pi, bi: None)
+    assert md.startswith("> [图]")
+
+
+def test_pages_to_markdown_passes_block_index_to_resolver():
+    seen = []
+    pages = [{"page_index": 2, "width": 1, "height": 1, "blocks": [
+        {"kind": "text", "text": "a", "bbox": [0, 0, 1, 1]},
+        {"kind": "image", "text": "", "caption": "c", "bbox": [0, 0, 1, 1]},
+    ]}]
+    pages_to_markdown(pages, image_resolver=lambda b, pi, bi: seen.append((pi, bi)))
+    assert (2, 1) in seen
+
+
 def test_markdown_furniture_blocks_are_skipped():
     pages = [{"page_index": 0, "width": 100, "height": 100, "blocks": [
         {"kind": "page_number", "text": "12", "bbox": [0, 0, 1, 1]},

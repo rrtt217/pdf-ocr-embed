@@ -40,6 +40,7 @@ from starlette.background import BackgroundTask
 from backend import batch
 from backend import cleanup as cleanup_mod
 from backend import config, export as export_mod, export_llm
+from backend import image_export
 from backend import ocr_service, validation
 from backend.logging_config import recent_logs, setup_logging
 
@@ -112,6 +113,16 @@ class SettingsModel(BaseModel):
     ocrmypdf_deskew: Optional[bool] = None
     ocrmypdf_clean: Optional[bool] = None
     ocrmypdf_rotate_pages: Optional[bool] = None
+    # Raw generation + export pre-processing knobs (backend/export_llm).  The
+    # WebUI sends all of these; without them pydantic silently drops the JSON
+    # fields and a save never reaches ocr_config.toml.
+    generate_raw: Optional[bool] = None
+    export_reflow: Optional[bool] = None
+    export_llm: Optional[bool] = None
+    export_llm_model: Optional[str] = None
+    export_llm_threshold: Optional[str] = None
+    export_llm_batch: Optional[str] = None
+    export_llm_timeout_s: Optional[str] = None
 
 
 class EmbedModel(BaseModel):
@@ -213,7 +224,13 @@ def save_settings(payload: SettingsModel) -> dict:
         value = getattr(payload, key, None)
         if value is not None:
             data[key] = value
-    for key in ("ocrmypdf_deskew", "ocrmypdf_clean", "ocrmypdf_rotate_pages"):
+    for key in ("ocrmypdf_deskew", "ocrmypdf_clean", "ocrmypdf_rotate_pages",
+                "generate_raw", "export_reflow", "export_llm"):
+        value = getattr(payload, key, None)
+        if value is not None:
+            data[key] = value
+    for key in ("export_llm_model", "export_llm_threshold",
+                "export_llm_batch", "export_llm_timeout_s"):
         value = getattr(payload, key, None)
         if value is not None:
             data[key] = value
@@ -690,7 +707,8 @@ def _llm_flag(value: Optional[str], default: bool) -> bool:
 def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
                     llm_blocks: Optional[str] = None,
                     llm_outline: Optional[str] = None,
-                    reflow: str = "1"):
+                    reflow: str = "1",
+                    images: str = "none"):
     """Export the job's recognized pages as markdown (``.md``) or LaTeX
     (``.tex``).
 
@@ -714,6 +732,14 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
     the passes only touch the export copy — sidecars, hOCR and the embedded
     text layer are unaffected.
 
+    ``images`` (markdown only) embeds the image blocks' real figure crops
+    (backend.image_export renders them from the source PDF by the block
+    bboxes): ``zip`` packages ``<stem>.md`` + an ``images/`` folder (relative
+    links, renders everywhere including GitHub) as one archive; ``base64``
+    inlines ``data:image/png;base64,…`` URIs for a single self-contained file.
+    ``none`` (default) keeps the captioned placeholders.  A job without a
+    readable source PDF falls back to placeholders; LaTeX ignores the option.
+
     404 when the job or its pages are missing; 400 for an unknown extension.
     """
     job = ocr_service.get_job(job_id)
@@ -727,6 +753,11 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
     if fmt is None:
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+    image_mode = (images or "none").strip().lower()
+    if image_mode not in ("none", "zip", "base64"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown images mode: {images} (none | zip | base64)")
     use_reflow = str(reflow).lower() not in ("0", "false", "no")
     master = str(llm).lower() not in ("0", "false", "no")
     use_blocks = _llm_flag(llm_blocks, master)
@@ -740,18 +771,51 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
             pages, config.resolve(), fmt=fmt,
             enable_blocks=use_blocks, enable_outline=use_outline,
             reflow=use_reflow, cache_path=cache_path)
+    # Image embedding (markdown only): extract the figure crops once, then
+    # resolve them during rendering.  Any failure (unreadable source PDF, no
+    # usable bboxes) falls back to the captioned placeholders — a broken
+    # image pipeline never fails the export.
+    image_map = None
+    if fmt == "markdown" and image_mode != "none":
+        try:
+            image_map = image_export.extract_images(job, pages)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("export: image extraction failed (%s); "
+                        "falling back to placeholders", exc)
+    resolver = (image_export.make_resolver(image_mode, image_map)
+                if image_map else None)
+
     try:
         text = export_mod.export_document(
             fmt, pages, title=Path(job.get("filename") or "document").stem,
-            use_raw=str(raw).lower() not in ("0", "false", "no"))
+            use_raw=str(raw).lower() not in ("0", "false", "no"),
+            image_resolver=resolver)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-    media = "text/markdown" if fmt == "markdown" else "application/x-tex"
     stem = (Path(job.get("filename") or "document").stem or "document")
     # Non-ASCII filenames must use RFC 5987 filename* (a raw CJK header value
     # breaks the HTTP layer); the ASCII fallback keeps simple names intact.
     from urllib.parse import quote
     ascii_stem = stem.encode("ascii", "ignore").decode() or "export"
+
+    # ZIP mode: <stem>.md + an images/ folder (relative links) as one archive.
+    if fmt == "markdown" and image_mode == "zip" and image_map:
+        fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            image_export.build_markdown_zip(
+                tmp_path, text, f"{ascii_stem or 'export'}.md", image_map)
+        except Exception:  # noqa: BLE001
+            os.unlink(tmp_path)
+            raise
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=image_export.default_zip_name(stem),
+            background=BackgroundTask(os.unlink, tmp_path),
+        )
+
+    media = "text/markdown" if fmt == "markdown" else "application/x-tex"
     disposition = (f'attachment; filename="{ascii_stem}.{ext.lower()}"; '
                    f"filename*=UTF-8''{quote(stem)}.{ext.lower()}")
     return Response(
@@ -765,7 +829,8 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
 def export_document_stream(job_id: str, ext: str, raw: str = "1",
                            llm: str = "0", llm_blocks: Optional[str] = None,
                            llm_outline: Optional[str] = None,
-                           reflow: str = "1"):
+                           reflow: str = "1",
+                           images: str = "none"):
     """SSE export: progress events while the pre-processing runs, then one
     ``done`` event carrying the full document text.
 
@@ -773,6 +838,11 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
     ``llm_outline=1`` heading refinement, legacy ``llm=1`` both) can take
     minutes (one API call per block batch), so the WebUI streams a progress
     bar from the ``progress`` events instead of waiting on a plain GET.
+
+    ``images`` (markdown only) embeds the image crops into the done event's
+    text: ``base64`` inlines ``data:image/png;base64,…`` URIs (backend
+    .image_export).  ``zip`` is NOT accepted here — a done event carries text
+    only, so the WebUI downloads a ZIP export through the plain GET instead.
     Event shapes (``backend.export_llm.preprocess`` progress callback):
       ``{"type":"progress","phase":"reflow"|"llm"|"outline","done":n,"total":m}``
       ``{"type":"done","fmt":"markdown"|"latex","text":"..."}``
@@ -791,6 +861,18 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
     if fmt is None:
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
+
+    # base64 embeds into the done event's text; zip cannot (text only) and
+    # falls back to placeholders (the WebUI never sends zip over SSE).
+    image_mode = (images or "none").strip().lower()
+    resolver = None
+    if fmt == "markdown" and image_mode == "base64":
+        try:
+            image_map = image_export.extract_images(job, pages)
+            resolver = image_export.make_resolver("base64", image_map)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("export stream: image extraction failed (%s); "
+                        "falling back to placeholders", exc)
 
     # Snapshot the inputs for the worker thread (the request handler returns
     # before the work finishes — nothing in the closure may touch the request).
@@ -818,7 +900,8 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
                     enable_outline=use_outline, reflow=use_reflow,
                     cache_path=cache_path, progress=events.put)
                 text = export_mod.export_document(
-                    fmt, pages2, title=title, use_raw=use_raw)
+                    fmt, pages2, title=title, use_raw=use_raw,
+                    image_resolver=resolver)
                 events.put({"_result": text})
             except BaseException as exc:  # noqa: BLE001 — an error event, not a dropped connection
                 from backend.config import redact_secrets

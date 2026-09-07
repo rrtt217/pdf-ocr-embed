@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import html as _html
 import re
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 # Block kinds that are page furniture, not content: skipped in exports
 # (a page number or running header is noise in a markdown/LaTeX document).
@@ -62,12 +62,19 @@ def block_source(block: dict, use_raw: bool = True) -> str:
 
 def _is_content(block: dict) -> bool:
     """True when a block carries exportable content (not furniture, not a
-    pure image placeholder without a caption)."""
+    pure image placeholder without a caption).
+
+    An image block with a bbox is content even without a caption: it is
+    potentially extractable (backend.image_export crops it from the source
+    PDF).  Without an image resolver such a block still renders empty in
+    markdown, so plain exports are unchanged.
+    """
     kind = str(block.get("kind") or "text")
     if kind in _FURNITURE_KINDS:
         return False
     if kind == "image":
-        return bool(block_source(block) or (block.get("caption") or "").strip())
+        return bool(block_source(block) or (block.get("caption") or "").strip()
+                    or block.get("bbox"))
     return True
 
 
@@ -237,12 +244,16 @@ def _table_rows(block: dict, use_raw: bool) -> List[List[str]]:
 
 
 def block_to_markdown(block: dict, use_raw: bool = True,
-                      page_index: Optional[int] = None) -> str:
+                      page_index: Optional[int] = None,
+                      block_index: Optional[int] = None,
+                      image_resolver: Optional[Callable] = None) -> str:
     """Render one block as markdown (pure).
 
     Tables become pipe tables, equations display math, headings ``##`` (level
-    from the leading numbering), images a captioned placeholder; everything
-    else a paragraph.
+    from the leading numbering), images a captioned placeholder — or, when
+    ``image_resolver`` returns a link for the block, a real ``![alt](url)``
+    image (backend.image_export: relative path in ZIP mode, data URI in
+    base64 mode); everything else a paragraph.
     """
     kind = str(block.get("kind") or "text")
     raw = block_source(block, use_raw=use_raw)
@@ -269,7 +280,16 @@ def block_to_markdown(block: dict, use_raw: bool = True,
         return "#" * block_heading_level(block, text) + " " + text.strip()
 
     if kind in ("image", "image_ref"):
+        url = None
+        if image_resolver is not None:
+            try:
+                url = image_resolver(block, page_index, block_index)
+            except Exception:  # noqa: BLE001 - a resolver failure is a placeholder
+                url = None
         text = raw or caption
+        if url:
+            alt = (caption or raw or "image").strip()
+            return f"![{alt}]({url})"
         if not text:
             return ""
         label = f" (page {page_index + 1})" if page_index is not None else ""
@@ -281,12 +301,15 @@ def block_to_markdown(block: dict, use_raw: bool = True,
 
 def pages_to_markdown(pages: List[dict], use_raw: bool = True,
                       title: Optional[str] = None,
-                      page_markers: bool = False) -> str:
+                      page_markers: bool = False,
+                      image_resolver: Optional[Callable] = None) -> str:
     """Render a whole document (list of page dicts) as markdown.
 
     ``title`` becomes the ``#`` H1; ``page_markers`` inserts an HTML comment
     page marker between pages (off by default — comments are noise in rendered
-    markdown).
+    markdown).  ``image_resolver`` (optional) maps image blocks to the link
+    the markdown carries — see ``backend.image_export.make_resolver``; blocks
+    it resolves render as real ``![alt](url)`` images.
     """
     parts: List[str] = []
     if title:
@@ -294,12 +317,14 @@ def pages_to_markdown(pages: List[dict], use_raw: bool = True,
     for page in pages:
         blocks = page.get("blocks") or []
         page_parts = []
-        for block in blocks:
+        for block_index, block in enumerate(blocks):
             if not _is_content(block):
                 continue
             md = block_to_markdown(
                 block, use_raw=use_raw,
-                page_index=page.get("page_index"))
+                page_index=page.get("page_index"),
+                block_index=block_index,
+                image_resolver=image_resolver)
             if md.strip():
                 page_parts.append(md)
         if page_parts and page_markers:
@@ -447,14 +472,18 @@ def load_job_pages(job: dict) -> List[dict]:
 
 
 def export_document(fmt: str, pages: List[dict], title: Optional[str] = None,
-                    use_raw: bool = True) -> str:
+                    use_raw: bool = True,
+                    image_resolver: Optional[Callable] = None) -> str:
     """Render a list of page dicts as ``fmt`` (``markdown`` | ``latex``).
 
-    Raises ``ValueError`` for an unknown format so callers map it to a 400.
+    ``image_resolver`` (optional) applies to markdown only — LaTeX keeps its
+    captioned figure placeholders.  Raises ``ValueError`` for an unknown
+    format so callers map it to a 400.
     """
     fmt = (fmt or "").strip().lower()
     if fmt in ("markdown", "md"):
-        return pages_to_markdown(pages, use_raw=use_raw, title=title)
+        return pages_to_markdown(pages, use_raw=use_raw, title=title,
+                                 image_resolver=image_resolver)
     if fmt in ("latex", "tex"):
         return pages_to_latex(pages, use_raw=use_raw, title=title)
     raise ValueError(f"unknown export format: {fmt!r} (markdown | latex)")

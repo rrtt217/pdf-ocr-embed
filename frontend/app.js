@@ -63,6 +63,7 @@ const state = {
   confFilter: false,   // show only low-confidence blocks in the editor
   confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
   exportLlm: { blocks: false, outline: false },  // export LLM post-processing options
+  exportImages: "none",  // markdown image embedding: none | zip | base64
 };
 
 /* ---------- helpers ---------- */
@@ -630,13 +631,30 @@ function jobCard(job) {
                                         "blocks"));
     opts.appendChild(_exportOptCheckbox("export-opt-outline", "job.exportLlmOutline",
                                         "outline"));
+    opts.appendChild(_exportImagesSelect());
     actions.appendChild(opts);
+    const imagesQ = (state.exportImages && state.exportImages !== "none")
+      ? `?images=${state.exportImages}` : "";
     const md = el("a", "download-link small", t("job.exportMd"));
-    md.href = `/api/export/${job.id}.md`;
+    md.href = `/api/export/${job.id}.md${imagesQ}`;
     md.download = "";
     md.title = t("job.exportMdTitle");
     md.addEventListener("click", (ev) => {
-      if (state.exportLlm.blocks || state.exportLlm.outline) {
+      const llm = state.exportLlm.blocks || state.exportLlm.outline;
+      if (llm && state.exportImages === "zip") {
+        // ZIP delivery needs a real HTTP download (an SSE done event carries
+        // text only); the LLM passes are cached server-side, so the plain
+        // GET reuses them instead of re-billing the engine.
+        ev.preventDefault();
+        const p = new URLSearchParams();
+        if (state.exportLlm.blocks) p.set("llm_blocks", "1");
+        if (state.exportLlm.outline) p.set("llm_outline", "1");
+        p.set("images", "zip");
+        const a = document.createElement("a");
+        a.href = `/api/export/${job.id}.md?${p}`;
+        a.download = "";
+        a.click();
+      } else if (llm) {
         ev.preventDefault();
         exportWithLlm(job.id, "md");
       }
@@ -689,12 +707,35 @@ function _exportOptCheckbox(id, i18nKey, key) {
   return label;
 }
 
+// Image embedding select (markdown only): none | zip | base64.
+function _exportImagesSelect() {
+  const sel = el("select", "export-images-sel");
+  sel.title = t("job.exportImagesTitle");
+  [["none", "job.exportImagesNone"],
+   ["zip", "job.exportImagesZip"],
+   ["base64", "job.exportImagesBase64"]].forEach(([value, key]) => {
+    const o = document.createElement("option");
+    o.value = value;
+    o.textContent = t(key);
+    if (state.exportImages === value) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.onchange = () => { state.exportImages = sel.value; };
+  return sel;
+}
+
 function exportWithLlm(jobId, ext) {
   const job = jobById(jobId);
   if (!job || job.exporting) return;
   const params = [];
   if (state.exportLlm.blocks) params.push("llm_blocks=1");
   if (state.exportLlm.outline) params.push("llm_outline=1");
+  // SSE done events carry TEXT only: base64 embeds into that text (the
+  // stream route resolves the crops); ZIP needs a real HTTP download and is
+  // handled by the plain link in the click handler instead.
+  if (ext === "md" && state.exportImages === "base64") {
+    params.push("images=base64");
+  }
   if (!params.length) return;  // nothing selected: plain link handles it
   job.exporting = true;
   job.export = { phase: "reflow", done: 0, total: 0 };

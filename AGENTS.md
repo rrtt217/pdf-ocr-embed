@@ -104,6 +104,7 @@ backend/
   pdf_processing.py       # page preview rendering (PyMuPDF)
   validation.py           # post-embed coverage report
   batch.py                # ZIP packaging (streamed)
+  image_export.py         # markdown image embedding: crop image blocks -> zip/base64
   cleanup.py              # temp-file cleanup
   cli.py                  # headless CLI (python -m backend.cli)
 frontend/                 # index.html / style.css / app.js / i18n.js (no build)
