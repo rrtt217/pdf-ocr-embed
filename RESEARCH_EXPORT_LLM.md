@@ -25,6 +25,19 @@
 > 15s keepalive）、`--export-llm`/`--no-reflow` CLI、WebUI 导出按钮 + 独立导出进度条、
 > `tests/test_export_llm.py`（80 例）。
 > 关键洞见落地：**line-split 对导出是反模式**（见 §1），P0 的第一步就是把它 unwrap 掉。
+>
+> **后续加固（使 LLM 章节/块修整在实际模型上稳定）**：
+> - 大纲精修改为**先行于块修整**（章节是 1–2 个小请求，不能让位给上百个块请求）；
+>   标题过多时按 ≤60 个/请求分段，单调加深守卫跨块保持，坏块只回退该块。
+> - 响应 JSON 容错提取（围栏 / 散文 / 思考块 / 尾随文字）；坏 JSON 自动重试一次。
+> - 兼容思考型模型：`content` 缺失时回退 `reasoning_content`；`finish_reason=length`
+>   截断时加大预算重试；默认 `export_llm_timeout_s` 120 → 240。
+> - **结构化输出**：实测服务器 `qwen3.8-chat` 支持 `response_format: {"type": "json_object"}`
+>   （json_object 2–3s / json_schema 13–31s 均有效；无约束基准偶发 150s+ 超时）。
+>   `ExportLlmClient.chat_json` 默认开启 json 模式，网关 400/422 拒收时自动降级重试。
+> - 目录检测窗口 5 → 30 页（真实书籍的目录常在 5+ 页之后），命中后连续 2 页无目录即停。
+> - 图片导出走 SSE 流并报告「提取图片 / 打包」阶段进度；`split=1` 按章节拆分 md 打包 ZIP，
+>   多文件结果经一次性下载链接 `/api/export/download/<token>` 交付。
 
 ---
 

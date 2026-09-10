@@ -333,6 +333,57 @@ def pages_to_markdown(pages: List[dict], use_raw: bool = True,
     return "\n\n".join(parts).strip() + "\n"
 
 
+# --- chapter splitting ------------------------------------------------------------
+
+def split_pages_by_chapter(pages: List[dict]) -> List[dict]:
+    """Split whole pages into chapter chunks (pure).
+
+    A chapter begins at the first page whose leading block is a level-1
+    heading (``llm_level``/numbering — see ``block_heading_level``).  Whole
+    pages are kept (page_index and block indices stay intact, so image
+    resolvers keep working); pages before the first level-1 heading form the
+    front-matter chunk.  Returns ``[{"title", "pages"}, ...]`` — the caller
+    renders each chunk with ``pages_to_markdown``.
+    """
+    chunks: List[dict] = []
+    cur_title: Optional[str] = None
+    cur_pages: List[dict] = []
+    for page in pages:
+        title = None
+        for block in page.get("blocks") or []:
+            kind = str(block.get("kind") or "text")
+            if kind not in _HEADING_KINDS:
+                continue
+            text = block_source(block)
+            if block_heading_level(block, text) == 1:
+                title = text.strip() or (block.get("text") or "").strip()
+                break
+        if title is not None:
+            if cur_pages:
+                chunks.append({"title": cur_title, "pages": cur_pages})
+            cur_title = title
+            cur_pages = [page]
+        else:
+            cur_pages.append(page)
+    if cur_pages:
+        chunks.append({"title": cur_title, "pages": cur_pages})
+    return chunks
+
+
+def chapter_filename(index: int, title: Optional[str]) -> str:
+    """A stable per-chapter markdown filename (pure).
+
+    ``index`` is the 0-based chunk position: ``01_第1章 插值.md``,
+    ``02_...``.  Path-unsafe characters are stripped; a missing title (the
+    front-matter chunk) names itself ``01_front-matter.md``.
+    """
+    base = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", " ", title or "").strip()
+    base = re.sub(r"\s+", " ", base).strip()[:60]
+    if not base:
+        base = "front-matter" if index == 0 else f"chapter-{index + 1}"
+    return f"{index + 1:02d}_{base}.md"
+
+
 # --- latex rendering -------------------------------------------------------------
 
 _LATEX_SPECIALS = {

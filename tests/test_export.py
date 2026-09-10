@@ -11,11 +11,13 @@ from backend.export import (
     block_to_latex,
     block_to_markdown,
     block_source,
+    chapter_filename,
     export_document,
     heading_level,
     latex_escape,
     pages_to_latex,
     pages_to_markdown,
+    split_pages_by_chapter,
 )
 
 
@@ -222,3 +224,79 @@ def test_raw_prop_roundtrip_cjk_and_newlines():
     assert decode_raw_prop(encoded) == raw
     # plain (unencoded) values decode best-effort to themselves
     assert decode_raw_prop("plain value") == "plain value"
+
+
+# --- chapter splitting -------------------------------------------------------------
+
+def _page(blocks, page_index=0):
+    return {"page_index": page_index, "width": 1000, "height": 1400,
+            "blocks": blocks}
+
+
+def _block(text, kind="text", **extra):
+    b = {"kind": kind, "bbox": [0, 0, 100, 20], "text": text,
+         "lines": [text]}
+    b.update(extra)
+    return b
+
+
+def test_split_pages_by_chapter_basic():
+    pages = [
+        _page([_block("第三版前言", kind="heading", bbox=[100, 60, 900, 120],
+                      llm_level=1)],          # the first heading is the title
+              page_index=0),
+        _page([_block("前言正文", kind="text")], page_index=1),
+        _page([_block("第一章 插值", kind="heading", bbox=[100, 60, 900, 120])],
+              page_index=2),
+        _page([_block("1.1 线性插值", kind="heading",
+                      bbox=[100, 120, 900, 160]), _block("正文", kind="text")],
+              page_index=3),
+        _page([_block("第二章 拟合", kind="heading", bbox=[100, 60, 900, 120])],
+              page_index=4),
+    ]
+    chunks = split_pages_by_chapter(pages)
+    assert [c["title"] for c in chunks] == \
+        ["第三版前言", "第一章 插值", "第二章 拟合"]
+    # whole pages (and their block indices) are preserved per chunk
+    assert len(chunks[1]["pages"]) == 2
+    assert chunks[1]["pages"][0]["page_index"] == 2
+    assert chunks[2]["pages"][0]["page_index"] == 4
+    # rendering a chapter chunk drops nothing
+    md = pages_to_markdown(chunks[1]["pages"])
+    assert "# 第一章 插值" in md
+    assert "1.1 线性插值" in md
+
+
+def test_split_pages_by_chapter_front_matter_named():
+    pages = [
+        _page([_block("封面", kind="text")], page_index=0),
+        _page([_block("第一章 插值", kind="heading", bbox=[100, 60, 900, 120])],
+              page_index=1),
+    ]
+    chunks = split_pages_by_chapter(pages)
+    assert chunks[0]["title"] is None       # front matter
+    assert len(chunks[0]["pages"]) == 1
+
+
+def test_chapter_filename():
+    assert chapter_filename(0, None) == "01_front-matter.md"
+    assert chapter_filename(1, "第1章 插值") == "02_第1章 插值.md"
+    assert chapter_filename(2, 'a/b*c:d? "e"') == "03_a b c d e.md"
+    assert chapter_filename(3, "") == "04_chapter-4.md"
+
+
+def test_export_document_split_renders_each_chapter():
+    pages = [
+        _page([_block("第三版前言", kind="heading", bbox=[100, 60, 900, 120],
+                      llm_level=1)],          # the first heading is the title
+              page_index=0),
+        _page([_block("前言正文", kind="text")], page_index=1),
+        _page([_block("第一章 插值", kind="heading", bbox=[100, 60, 900, 120])],
+              page_index=2),
+        _page([_block("本章正文", kind="text")], page_index=3),
+    ]
+    from backend.export import split_pages_by_chapter
+    chunks = split_pages_by_chapter(pages)
+    texts = [export_document("markdown", c["pages"]) for c in chunks]
+    assert "前言正文" in texts[0]
+    assert "# 第一章 插值" in texts[1]

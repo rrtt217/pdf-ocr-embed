@@ -248,11 +248,12 @@ def get_effective_settings() -> Dict[str, Any]:
         "export_llm_outline": as_bool(cfg.get("export_llm_outline",
                                               cfg.get("export_llm", "false"))),
         # Free-form export LLM knobs (the WebUI settings modal reloads them;
-        # empty model = fall back to the OCR model).
+        # empty model = fall back to the OCR model).  The timeout default
+        # allows thinking models, which take ~1-2 min even on small requests.
         "export_llm_model": cfg.get("export_llm_model", ""),
         "export_llm_threshold": cfg.get("export_llm_threshold", "0.85"),
         "export_llm_batch": cfg.get("export_llm_batch", "8"),
-        "export_llm_timeout_s": cfg.get("export_llm_timeout_s", "120"),
+        "export_llm_timeout_s": cfg.get("export_llm_timeout_s", "240"),
     }
 
 

@@ -83,13 +83,18 @@ def data_uri(png_path: Path) -> str:
     return f"data:image/png;base64,{data}"
 
 
-def make_resolver(mode: str, image_map: Dict[Tuple[int, int], Path]
+def make_resolver(mode: str, image_map: Dict[Tuple[int, int], Path],
+                  url_prefix: str = ""
                   ) -> Callable[[dict, Optional[int], Optional[int]], Optional[str]]:
     """Build the ``image_resolver`` the markdown builder receives (pure).
 
     The resolver maps ``(page_index, block_index)`` to the link markdown
     carries: a relative ``images/…`` path in ZIP mode, a data URI in base64
     mode.  ``None`` (no such crop) falls back to the captioned placeholder.
+
+    ``url_prefix`` prepends to the ZIP link — ``""`` for a zip whose ``.md``
+    sits at the archive root, ``"../"`` for split chapter files that live
+    under a ``chapters/`` folder.  base64 mode ignores it.
     """
     if mode == "base64":
         def resolver(block: dict, page_index: Optional[int],
@@ -103,7 +108,7 @@ def make_resolver(mode: str, image_map: Dict[Tuple[int, int], Path]
         def resolver(block: dict, page_index: Optional[int],
                      block_index: Optional[int]) -> Optional[str]:
             path = image_map.get((page_index, block_index))
-            return relative_url(path.name) if path else None
+            return f"{url_prefix}images/{path.name}" if path else None
     return resolver
 
 
@@ -126,6 +131,29 @@ def build_markdown_zip(zip_path: str, md_text: str, md_name: str,
     return written
 
 
+def build_chapters_zip(zip_path: str, chapters: List[Dict[str, str]],
+                       image_map: Dict[Tuple[int, int], Path]) -> int:
+    """Write per-chapter markdown under ``chapters/`` + the shared
+    ``images/`` folder into one archive (split export).
+
+    ``chapters`` is a list of ``{"name", "text"}`` (names from
+    ``backend.export.chapter_filename``); the chapter markdown references
+    ``../images/…`` (the resolver prefix), which resolves once extracted.
+    Returns the member count.
+    """
+    written = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for ch in chapters:
+            zf.writestr(f"chapters/{ch['name']}", ch["text"])
+            written += 1
+        for (_pi, _bi), path in sorted(image_map.items()):
+            if not path.exists():
+                continue
+            zf.write(path, f"images/{path.name}")
+            written += 1
+    return written
+
+
 def default_zip_name(stem: str) -> str:
     """Archive name for a ZIP export: ``<stem>_markdown.zip``."""
     return f"{stem or 'export'}_markdown.zip"
@@ -133,7 +161,9 @@ def default_zip_name(stem: str) -> str:
 
 # --- filesystem extraction ---------------------------------------------------------
 
-def extract_images(job: dict, pages: List[dict]) -> Dict[Tuple[int, int], Path]:
+def extract_images(job: dict, pages: List[dict],
+                   progress: Optional[Callable] = None
+                   ) -> Dict[Tuple[int, int], Path]:
     """Crop every image block of ``pages`` from the job's source PDF.
 
     Returns ``{(page_index, block_index): png_path}``.  Blocks without a
@@ -141,6 +171,11 @@ def extract_images(job: dict, pages: List[dict]) -> Dict[Tuple[int, int], Path]:
     warning (the markdown falls back to placeholders for it) — a broken crop
     never fails the export.  Raises only when the job has no readable source
     PDF at all.
+
+    ``progress`` (optional callable) receives
+    ``{"phase": "images", "done": p, "total": n}`` events as each page is
+    processed, so a multi-page extraction can drive a progress bar; callback
+    failures are cosmetic and never break the extraction.
     """
     pdf_path = str(job.get("pdf_path") or "")
     if not pdf_path or not Path(pdf_path).exists():
@@ -156,7 +191,13 @@ def extract_images(job: dict, pages: List[dict]) -> Dict[Tuple[int, int], Path]:
     image_map: Dict[Tuple[int, int], Path] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
     with fitz.open(pdf_path) as doc:
-        for page in pages:
+        for pidx, page in enumerate(pages):
+            if progress is not None:
+                try:
+                    progress({"phase": "images", "done": pidx + 1,
+                              "total": len(pages)})
+                except Exception:  # noqa: BLE001 — cosmetic
+                    pass
             # Both page-dict shapes: the flat form the page store returns
             # ({page_index, width, height, blocks}) and the raw sidecar form
             # (the same fields nested under "page").

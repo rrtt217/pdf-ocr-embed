@@ -115,3 +115,34 @@ def test_build_markdown_zip_skips_missing_crops(tmp_path):
     assert n == 1  # only the .md
     with zipfile.ZipFile(zip_path) as zf:
         assert zf.namelist() == ["doc.md"]
+
+
+# --- split chapters archive + resolver prefix --------------------------------------
+
+def test_make_resolver_zip_prefix_for_split(tmp_path):
+    crop = tmp_path / "page-001-img-0.png"
+    crop.write_bytes(b"png-bytes")
+    resolver = make_resolver("zip", {(0, 0): crop}, url_prefix="../")
+    assert resolver({}, 0, 0) == "../images/page-001-img-0.png"
+    # base64 mode ignores the prefix
+    resolver2 = make_resolver("base64", {(0, 0): crop}, url_prefix="../")
+    assert resolver2({}, 0, 0).startswith("data:image/png;base64,")
+
+
+def test_build_chapters_zip_layout(tmp_path):
+    from backend.image_export import build_chapters_zip
+
+    crop = tmp_path / "page-001-img-1.png"
+    crop.write_bytes(b"png-bytes")
+    chapters = [{"name": "01_front-matter.md", "text": "# 前言"},
+                {"name": "02_第1章 插值.md", "text": "# 第1章 插值\n\n![](../images/page-001-img-1.png)"}]
+    zip_path = tmp_path / "doc_markdown.zip"
+    n = build_chapters_zip(str(zip_path), chapters, {(0, 1): crop})
+    assert n == 3
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+        assert "chapters/01_front-matter.md" in names
+        assert "chapters/02_第1章 插值.md" in names
+        assert "images/page-001-img-1.png" in names
+        body = zf.read("chapters/02_第1章 插值.md")
+        assert body.startswith("# 第1章 插值".encode())

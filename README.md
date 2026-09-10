@@ -261,6 +261,34 @@ API key 等配置仍走 `resolve()`（TOML / 环境变量），不做任何硬�
   嵌入路径不受影响）。导出时优先用 raw：表格按原始 HTML 结构渲染成真正的
   表格、公式保留 `\frac{}{}` 等 LaTeX 命令。sidecar 无 raw 时（旧任务、
   tesseract 派生页、选项关闭）自动回退到归一化文本。
+- **导出选项（WebUI 的「导出选项」或查询参数）**：
+  - `reflow=1`（默认）：确定性重排 —— 打开 sidecar 的行换行结构
+    （专为 PDF 文字层设计）、合并断字与跨页段落、补齐 ragged 表格。
+  - `llm_outline=1`：LLM 修正章节层级（带目录上下文）。支持思考型模型：
+    响应用容错 JSON 提取（围栏 / 散文 / 思考块）、坏 JSON 自动重试一次、
+    截断时加大预算重试、标题过多时按块（≤60 个/请求）分段并在块间保持
+    层级单调约束，任一块失败只回退该块。
+  - `llm_blocks=1`：LLM 修整难块（表格 / 公式 / 低置信）。
+  - `images=none|zip|base64`（仅 md）：把图片块按 bbox 裁图嵌入 —
+    `zip` 打包 `<源名>.md` + `images/` 文件夹，`base64` 内联为单文件。
+  - `split=1`（仅 md）：按章节拆分 —— 每个一级标题页起一章，逐章输出
+    一个 markdown 文件，打包为 ZIP（可用 `images=zip` 让各章引用共享
+    `images/`，或 `images=base64` 得到自包含的章节文件）。
+  - WebUI 勾选任一选项后点击下载会走 SSE 流（`/api/export/stream/...`），
+    实时显示「重排 → 提取图片 → LLM 章节 → LLM 块 → 打包」进度条，
+    多文件结果（zip / 分章节）通过一次性下载链接交付
+    （`/api/export/download/<token>`）；未勾选则为即时直下。LLM 结果按任务
+    缓存（`work/<job>/export_llm_cache.json`），重复导出不重复计费。
+  - **思考型模型兼容性**：导出 LLM 与 `export_llm_model` 配置的模型兼容
+    （含支持思考的模型）—— 答案从 `message.content` 读取，必要时回退
+    `reasoning_content`；默认请求超时按思考模型提至 240s
+    （`export_llm_timeout_s` 可调）。注意思考模型单请求可能耗时 1–2 分钟、
+    且每个任务的大量难块会让 `llm_blocks=1` 消耗较多调用与时间。
+  - **结构化输出**：LLM 请求默认带 `response_format: {"type": "json_object"}`
+    （OpenAI 兼容的 JSON 模式）。已实测服务器上的 `qwen3.8-chat` 支持：开启后
+    章节 / 块修整响应稳定且时延从 1–2 分钟降到约 2–10 秒。网关若不支持该字段
+    （400/422），客户端自动去掉它并按普通模式重试一次，任何端点都能用。
+
 
 ### API 速览
 

@@ -64,6 +64,7 @@ const state = {
   confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
   exportLlm: { blocks: false, outline: false },  // export LLM post-processing options
   exportImages: "none",  // markdown image embedding: none | zip | base64
+  exportSplit: false,    // markdown: one file per chapter, packed as a ZIP
 };
 
 /* ---------- helpers ---------- */
@@ -546,19 +547,23 @@ function jobCard(job) {
   bar.appendChild(fill);
   card.appendChild(bar);
 
-  // Export progress: the LLM fix-up streams its own bar (one API call per
-  // block batch — can take minutes; the reflow phase is instant).
+  // Export progress: the LLM fix-up / figure extraction / chapter split
+  // stream their own progress through the SSE export route (the phases can
+  // take minutes; reflow is instant).
   if (job.export) {
     const wrap = el("div", "export-progress");
     const phase = job.export.phase;
     const label = phase === "reflow" ? t("job.exportReflow")
+      : phase === "images" ? t("job.exportPhaseImages")
+      : phase === "zip" ? t("job.exportPhaseZip")
       : phase === "outline" ? t("job.exportOutline")
       : t("job.exportProgress", { done: job.export.done, total: job.export.total });
     wrap.appendChild(el("span", "hint", "⬇ " + label));
     const ebar = el("div", "bar");
     const efill = el("div", "fill");
     const etotal = job.export.total || 0;
-    efill.style.width = (phase === "llm" || phase === "outline") && etotal
+    efill.style.width = (phase === "llm" || phase === "outline"
+                         || phase === "images") && etotal
       ? Math.min(100, Math.round((job.export.done / etotal) * 100)) + "%" : "8%";
     ebar.appendChild(efill);
     wrap.appendChild(ebar);
@@ -621,9 +626,10 @@ function jobCard(job) {
     actions.appendChild(a);
   }
   // Other-format export: markdown / LaTeX links carrying the LLM options.
-  // Without the LLM options the link is a plain instant download (reflow
-  // only); with one checked the click routes through the SSE stream and the
-  // job card shows the export progress bar.
+  // Without any option the link is a plain instant download (reflow only);
+  // with an option checked the click routes through the SSE stream, which
+  // streams a progress bar (LLM passes, figure extraction, chapter split)
+  // and the job card shows it.
   if (job.current > 0 && !job.exporting) {
     const opts = el("details", "export-opts");
     opts.appendChild(el("summary", null, t("job.exportOptions")));
@@ -632,6 +638,7 @@ function jobCard(job) {
     opts.appendChild(_exportOptCheckbox("export-opt-outline", "job.exportLlmOutline",
                                         "outline"));
     opts.appendChild(_exportImagesSelect());
+    opts.appendChild(_exportSplitCheckbox("export-opt-split", "job.exportSplit"));
     actions.appendChild(opts);
     const imagesQ = (state.exportImages && state.exportImages !== "none")
       ? `?images=${state.exportImages}` : "";
@@ -640,21 +647,12 @@ function jobCard(job) {
     md.download = "";
     md.title = t("job.exportMdTitle");
     md.addEventListener("click", (ev) => {
-      const llm = state.exportLlm.blocks || state.exportLlm.outline;
-      if (llm && state.exportImages === "zip") {
-        // ZIP delivery needs a real HTTP download (an SSE done event carries
-        // text only); the LLM passes are cached server-side, so the plain
-        // GET reuses them instead of re-billing the engine.
-        ev.preventDefault();
-        const p = new URLSearchParams();
-        if (state.exportLlm.blocks) p.set("llm_blocks", "1");
-        if (state.exportLlm.outline) p.set("llm_outline", "1");
-        p.set("images", "zip");
-        const a = document.createElement("a");
-        a.href = `/api/export/${job.id}.md?${p}`;
-        a.download = "";
-        a.click();
-      } else if (llm) {
+      const useStream = state.exportLlm.blocks || state.exportLlm.outline
+        || state.exportSplit || state.exportImages !== "none";
+      if (useStream) {
+        // Anything beyond a plain reflow needs the server to do real work
+        // (LLM passes, figure crops, chapter split): stream it so the user
+        // sees progress instead of a silent wait.
         ev.preventDefault();
         exportWithLlm(job.id, "md");
       }
@@ -692,19 +690,31 @@ function connectStream(jobId) {
 
 /* ---------- export (markdown / LaTeX, opt-in LLM post-processing) ---------- */
 
-function _exportOptCheckbox(id, i18nKey, key) {
+function _exportCheckbox(id, i18nKey, isOn, onChange) {
   const label = el("label", "inline-check");
   const cb = document.createElement("input");
   cb.type = "checkbox";
   cb.id = id;
-  cb.checked = !!state.exportLlm[key];
-  cb.onchange = () => { state.exportLlm[key] = cb.checked; };
+  cb.checked = !!isOn();
+  cb.onchange = () => onChange(cb.checked);
   label.appendChild(cb);
   const span = document.createElement("span");
   span.setAttribute("data-i18n", i18nKey);
   span.textContent = t(i18nKey);
   label.appendChild(span);
   return label;
+}
+
+function _exportOptCheckbox(id, i18nKey, key) {
+  return _exportCheckbox(id, i18nKey,
+                         () => state.exportLlm[key],
+                         (v) => { state.exportLlm[key] = v; });
+}
+
+function _exportSplitCheckbox(id, i18nKey) {
+  return _exportCheckbox(id, i18nKey,
+                         () => state.exportSplit,
+                         (v) => { state.exportSplit = v; });
 }
 
 // Image embedding select (markdown only): none | zip | base64.
@@ -730,11 +740,11 @@ function exportWithLlm(jobId, ext) {
   const params = [];
   if (state.exportLlm.blocks) params.push("llm_blocks=1");
   if (state.exportLlm.outline) params.push("llm_outline=1");
-  // SSE done events carry TEXT only: base64 embeds into that text (the
-  // stream route resolves the crops); ZIP needs a real HTTP download and is
-  // handled by the plain link in the click handler instead.
-  if (ext === "md" && state.exportImages === "base64") {
-    params.push("images=base64");
+  if (ext === "md" && state.exportImages && state.exportImages !== "none") {
+    params.push("images=" + state.exportImages);
+  }
+  if (ext === "md" && state.exportSplit) {
+    params.push("split=1");
   }
   if (!params.length) return;  // nothing selected: plain link handles it
   job.exporting = true;
@@ -752,9 +762,20 @@ function exportWithLlm(jobId, ext) {
       job.exporting = false;
       job.export = null;
       renderJobs();
-      downloadText(`${(job.filename || jobId).replace(/\.pdf$/i, "")}.${ext}`,
-                   msg.text,
-                   ext === "tex" ? "application/x-tex" : "text/markdown");
+      if (msg.zip_url) {
+        // Multi-file exports (zip / split) are served through a single-use
+        // download link instead of inline text.
+        const a = document.createElement("a");
+        a.href = msg.zip_url;
+        a.download = "";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } else {
+        downloadText(`${(job.filename || jobId).replace(/\.pdf$/i, "")}.${ext}`,
+                     msg.text,
+                     ext === "tex" ? "application/x-tex" : "text/markdown");
+      }
       toast(t("job.exportDone"), "success");
     } else if (msg.type === "error") {
       es.close();

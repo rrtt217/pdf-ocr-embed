@@ -24,10 +24,12 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -703,12 +705,56 @@ def _llm_flag(value: Optional[str], default: bool) -> bool:
     return str(value).lower() not in ("0", "false", "no")
 
 
+# ZIP exports built by the SSE stream: token -> (path, filename, created).
+# The done event carries a single-use download URL; the file is deleted when
+# served (and stale entries are evicted on register).
+_zip_tokens: Dict[str, Tuple[str, str, float]] = {}
+_ZIP_TOKEN_TTL = 60 * 60
+
+
+def _register_zip(path: str, filename: Optional[str] = None) -> str:
+    """Register a freshly built export ZIP and return its download token."""
+    now = time.time()
+    for token, (_p, _f, ts) in list(_zip_tokens.items()):
+        if now - ts > _ZIP_TOKEN_TTL:
+            _zip_tokens.pop(token, None)
+            try:
+                os.unlink(_p)
+            except OSError:
+                pass
+    token = secrets.token_urlsafe(16)
+    _zip_tokens[token] = (path, filename or os.path.basename(path), now)
+    return token
+
+
+@app.get("/api/export/download/{token}")
+def export_download(token: str):
+    """Serve a just-built export ZIP once (single-use token from the SSE
+    ``done`` event)."""
+    entry = _zip_tokens.pop(token, None)
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Export download expired — re-run the export")
+    path, filename, _ts = entry
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=404,
+            detail="Export file was cleaned up — re-run the export")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=filename,
+        background=BackgroundTask(os.unlink, path),
+    )
+
+
 @app.get("/api/export/{job_id}.{ext}")
 def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
                     llm_blocks: Optional[str] = None,
                     llm_outline: Optional[str] = None,
                     reflow: str = "1",
-                    images: str = "none"):
+                    images: str = "none", split: str = "0"):
     """Export the job's recognized pages as markdown (``.md``) or LaTeX
     (``.tex``).
 
@@ -740,6 +786,13 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
     ``none`` (default) keeps the captioned placeholders.  A job without a
     readable source PDF falls back to placeholders; LaTeX ignores the option.
 
+    ``split=1`` (markdown only) delivers the document as one markdown file
+    per chapter, packed as a ZIP.  A chapter is every page from its first
+    level-1 heading on; the pages before it form the front-matter chunk.
+    The ``images`` option still applies (``zip`` — a shared ``images/``
+    folder the chapter files reference as ``../images/…``; ``base64`` —
+    self-contained chapter files; ``none`` — placeholders).
+
     404 when the job or its pages are missing; 400 for an unknown extension.
     """
     job = ocr_service.get_job(job_id)
@@ -759,6 +812,8 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
             status_code=400,
             detail=f"unknown images mode: {images} (none | zip | base64)")
     use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_split = (str(split).lower() not in ("0", "false", "no")
+                 and fmt == "markdown")
     master = str(llm).lower() not in ("0", "false", "no")
     use_blocks = _llm_flag(llm_blocks, master)
     use_outline = _llm_flag(llm_outline, master)
@@ -782,21 +837,54 @@ def export_document(job_id: str, ext: str, raw: str = "1", llm: str = "0",
         except Exception as exc:  # noqa: BLE001
             log.warning("export: image extraction failed (%s); "
                         "falling back to placeholders", exc)
-    resolver = (image_export.make_resolver(image_mode, image_map)
-                if image_map else None)
-
-    try:
-        text = export_mod.export_document(
-            fmt, pages, title=Path(job.get("filename") or "document").stem,
-            use_raw=str(raw).lower() not in ("0", "false", "no"),
-            image_resolver=resolver)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
     stem = (Path(job.get("filename") or "document").stem or "document")
     # Non-ASCII filenames must use RFC 5987 filename* (a raw CJK header value
     # breaks the HTTP layer); the ASCII fallback keeps simple names intact.
     from urllib.parse import quote
     ascii_stem = stem.encode("ascii", "ignore").decode() or "export"
+
+    # Split mode (markdown only): one file per chapter, packed as a ZIP.
+    if use_split:
+        resolver = None
+        if image_map:
+            mode = "base64" if image_mode == "base64" else "zip"
+            resolver = image_export.make_resolver(
+                mode, image_map, url_prefix="../" if mode == "zip" else "")
+        chapters = []
+        for i, chunk in enumerate(export_mod.split_pages_by_chapter(pages)):
+            try:
+                chunk_text = export_mod.export_document(
+                    fmt, chunk["pages"], use_raw=str(raw).lower()
+                    not in ("0", "false", "no"),
+                    image_resolver=resolver)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            chapters.append({
+                "name": export_mod.chapter_filename(i, chunk["title"]),
+                "text": chunk_text})
+        fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            image_export.build_chapters_zip(tmp_path, chapters, image_map or {})
+        except Exception:  # noqa: BLE001
+            os.unlink(tmp_path)
+            raise
+        return FileResponse(
+            tmp_path,
+            media_type="application/zip",
+            filename=image_export.default_zip_name(stem),
+            background=BackgroundTask(os.unlink, tmp_path),
+        )
+
+    resolver = (image_export.make_resolver(image_mode, image_map)
+                if image_map else None)
+    try:
+        text = export_mod.export_document(
+            fmt, pages, title=stem,
+            use_raw=str(raw).lower() not in ("0", "false", "no"),
+            image_resolver=resolver)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # ZIP mode: <stem>.md + an images/ folder (relative links) as one archive.
     if fmt == "markdown" and image_mode == "zip" and image_map:
@@ -830,22 +918,31 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
                            llm: str = "0", llm_blocks: Optional[str] = None,
                            llm_outline: Optional[str] = None,
                            reflow: str = "1",
-                           images: str = "none"):
-    """SSE export: progress events while the pre-processing runs, then one
-    ``done`` event carrying the full document text.
+                           images: str = "none", split: str = "0"):
+    """SSE export: progress events while the work runs, then one ``done``
+    event carrying the full document text (or a single-use ZIP download link).
 
     The LLM post-processing steps (``llm_blocks=1`` block fix-up,
     ``llm_outline=1`` heading refinement, legacy ``llm=1`` both) can take
     minutes (one API call per block batch), so the WebUI streams a progress
-    bar from the ``progress`` events instead of waiting on a plain GET.
+    bar from the ``progress`` events instead of waiting on a plain GET.  The
+    figure extraction (``images``) and the chapter split also stream their
+    progress here.
 
-    ``images`` (markdown only) embeds the image crops into the done event's
-    text: ``base64`` inlines ``data:image/png;base64,…`` URIs (backend
-    .image_export).  ``zip`` is NOT accepted here — a done event carries text
-    only, so the WebUI downloads a ZIP export through the plain GET instead.
-    Event shapes (``backend.export_llm.preprocess`` progress callback):
-      ``{"type":"progress","phase":"reflow"|"llm"|"outline","done":n,"total":m}``
+    ``images`` (markdown only) embeds the image blocks' real figure crops
+    (backend.image_export): ``base64`` inlines ``data:image/png;base64,…``
+    URIs into the done event's text; ``zip`` (the whole document) and
+    ``split=1`` (one markdown file per chapter, packed as a ZIP — same
+    layout as the plain GET) deliver MULTIPLE files, so the done event
+    carries a single-use ``zip_url`` (``/api/export/download/<token>``) the
+    WebUI downloads.  ``split`` only applies to markdown.
+
+    Progress phases: ``reflow`` (instant), ``images`` (figure extraction),
+    ``outline`` (LLM chapters), ``llm`` (block fix-up).
+    Event shapes:
+      ``{"type":"progress","phase":"reflow"|"images"|"llm"|"outline","done":n,"total":m}``
       ``{"type":"done","fmt":"markdown"|"latex","text":"..."}``
+      ``{"type":"done","fmt":"markdown","zip_url":"/api/export/download/<token>"}``
       ``{"type":"error","message":"..."}``
     Validation errors (404/400) raise before the stream starts; a failure
     mid-stream is an ``error`` event, never a broken connection.
@@ -861,29 +958,25 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
     if fmt is None:
         raise HTTPException(
             status_code=400, detail=f"unknown export format: {ext} (.md | .tex)")
-
-    # base64 embeds into the done event's text; zip cannot (text only) and
-    # falls back to placeholders (the WebUI never sends zip over SSE).
     image_mode = (images or "none").strip().lower()
-    resolver = None
-    if fmt == "markdown" and image_mode == "base64":
-        try:
-            image_map = image_export.extract_images(job, pages)
-            resolver = image_export.make_resolver("base64", image_map)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("export stream: image extraction failed (%s); "
-                        "falling back to placeholders", exc)
+    if image_mode not in ("none", "zip", "base64"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown images mode: {images} (none | zip | base64)")
 
     # Snapshot the inputs for the worker thread (the request handler returns
     # before the work finishes — nothing in the closure may touch the request).
     cfg = config.resolve()
     use_reflow = str(reflow).lower() not in ("0", "false", "no")
+    use_split = (str(split).lower() not in ("0", "false", "no")
+                 and fmt == "markdown")
     master = str(llm).lower() not in ("0", "false", "no")
     use_blocks = _llm_flag(llm_blocks, master)
     use_outline = _llm_flag(llm_outline, master)
     cache_path = (Path(job["hocr_dir"]).parent / "export_llm_cache.json"
                   if job.get("hocr_dir") else None)
     title = Path(job.get("filename") or "document").stem
+    ascii_stem = title.encode("ascii", "ignore").decode() or "export"
     use_raw = str(raw).lower() not in ("0", "false", "no")
     ext_out = ext.lower()
 
@@ -893,16 +986,81 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
 
         events: _queue.Queue = _queue.Queue()
 
+        # Job-derived download name (the temp file itself carries a random
+        # name; the download route uses this for its Content-Disposition).
+        default_name = f"{ascii_stem}_markdown.zip"
+
+        def build_zip(zip_path: str, build: Callable[[str], int]) -> None:
+            """Build the archive, then hand its token to the caller; the
+            temp file is cleaned up by the download route."""
+            try:
+                build(zip_path)
+            except BaseException:
+                try:
+                    os.unlink(zip_path)
+                except OSError:
+                    pass
+                raise
+            events.put({"_result": {
+                "zip_url": f"/api/export/download/"
+                           f"{_register_zip(zip_path, default_name)}"}})
+
         def work() -> None:
             try:
+                base = pages
+                # 1) figure extraction (markdown only) with per-page progress.
+                image_map = None
+                resolver = None
+                if fmt == "markdown" and image_mode != "none":
+                    try:
+                        image_map = image_export.extract_images(
+                            job, base, progress=events.put)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("export stream: image extraction failed "
+                                    "(%s); falling back to placeholders", exc)
+                    if image_map:
+                        mode = "base64" if image_mode == "base64" else "zip"
+                        prefix = "../" if (mode == "zip" and use_split) else ""
+                        resolver = image_export.make_resolver(
+                            mode, image_map, url_prefix=prefix)
+                # 2) export pre-processing (reflow + optional LLM steps).
                 pages2 = export_llm.preprocess(
-                    pages, cfg, fmt=fmt, enable_blocks=use_blocks,
+                    base, cfg, fmt=fmt, enable_blocks=use_blocks,
                     enable_outline=use_outline, reflow=use_reflow,
                     cache_path=cache_path, progress=events.put)
-                text = export_mod.export_document(
-                    fmt, pages2, title=title, use_raw=use_raw,
-                    image_resolver=resolver)
-                events.put({"_result": text})
+                # 3) render — split mode produces one file per chapter.
+                if use_split:
+                    chapters = []
+                    for i, chunk in enumerate(
+                            export_mod.split_pages_by_chapter(pages2)):
+                        chapters.append({
+                            "name": export_mod.chapter_filename(
+                                i, chunk["title"]),
+                            "text": export_mod.export_document(
+                                fmt, chunk["pages"], use_raw=use_raw,
+                                image_resolver=resolver)})
+                    fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+                    os.close(fd)
+                    build_zip(
+                        tmp_path,
+                        lambda p: image_export.build_chapters_zip(
+                            p, chapters, image_map or {}))
+                elif (fmt == "markdown" and image_mode == "zip"
+                        and image_map):
+                    text = export_mod.export_document(
+                        fmt, pages2, title=title, use_raw=use_raw,
+                        image_resolver=resolver)
+                    fd, tmp_path = tempfile.mkstemp(suffix=".zip")
+                    os.close(fd)
+                    build_zip(
+                        tmp_path,
+                        lambda p: image_export.build_markdown_zip(
+                            p, text, f"{ascii_stem}.md", image_map))
+                else:
+                    text = export_mod.export_document(
+                        fmt, pages2, title=title, use_raw=use_raw,
+                        image_resolver=resolver)
+                    events.put({"_result": {"text": text}})
             except BaseException as exc:  # noqa: BLE001 — an error event, not a dropped connection
                 from backend.config import redact_secrets
                 events.put({"_error": redact_secrets(str(exc))})
@@ -925,8 +1083,13 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
                 yield _sse({"type": "error", "message": ev["_error"]})
                 break
             if "_result" in ev:
-                yield _sse({"type": "done", "fmt": fmt, "ext": ext_out,
-                            "text": ev["_result"]})
+                res = ev["_result"]
+                if "zip_url" in res:
+                    yield _sse({"type": "done", "fmt": fmt, "ext": ext_out,
+                                "zip_url": res["zip_url"]})
+                else:
+                    yield _sse({"type": "done", "fmt": fmt, "ext": ext_out,
+                                "text": res["text"]})
                 break
             yield _sse({"type": "progress", **ev})
 

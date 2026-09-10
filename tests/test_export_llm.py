@@ -988,3 +988,399 @@ def test_export_stream_does_not_block_event_loop(tmp_path, monkeypatch):
         f"/api/health took {result.get('dt'):.1f}s during an open export stream"
     events, _ = _read_sse(body)
     assert events[-1]["type"] == "done"
+
+
+# --- robust JSON extraction -------------------------------------------------------
+
+def test_extract_json_object_variants():
+    assert export_llm._extract_json_object("not json at all") is None
+    assert export_llm._extract_json_object("") is None
+    assert export_llm._extract_json_object("   ") is None
+
+
+def test_extract_json_object_fences_leading_whitespace():
+    raws = [
+        '```json\n{"headings":[{"n":0,"level":1}]}\n```',
+        '\n\n{"headings":[{"n":0,"level":1}]}\n',
+        'Here is the answer: {"headings":[{"n":0,"level":1}]}',
+        '{"headings":[{"n":0,"level":1}]} hope this helps',
+        ' thinkingLet me check the hierarchy carefully.\n'
+        '{"headings":[{"n":0,"level":1}]}',
+        '<|think|>zzz<|/think|> {"headings":[{"n":0,"level":1}]}',
+    ]
+    for raw in raws:
+        data = export_llm._extract_json_object(raw)
+        assert data is not None, raw
+        assert data["headings"] == [{"n": 0, "level": 1}]
+
+
+def test_extract_json_object_chooses_last_and_outer():
+    # two disjoint objects: the rightmost (the answer) wins
+    assert export_llm._extract_json_object('ignore {"x":1} then {"y":2}') \
+        == {"y": 2}
+    # nested objects: the outer one (larger span, closes last) wins
+    assert export_llm._extract_json_object('{"a":{"b":1}} trailing text') \
+        == {"a": {"b": 1}}
+
+
+def test_parse_blocks_response_robust():
+    items = export_llm.parse_blocks_response(
+        '```json\n{"blocks":[{"n":0,"ok":true,"text":"| a | b |"}]}\n``` 是。')
+    assert items == [{"n": 0, "ok": True, "text": "| a | b |"}]
+
+
+# --- retry-on-garbage -------------------------------------------------------------
+
+class _RetryClient:
+    """Serves a queue of raw responses; a response may be 'garbage'."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def chat_json(self, system, user, max_tokens):
+        self.calls.append(user)
+        return self.responses.pop(0)
+
+
+def test_fix_with_llm_retries_unparseable_json():
+    pages = [_page([_block("电压\t逻辑\n3.5 V\t1", kind="table")])]
+    client = _RetryClient([
+        "garbage",
+        _llm_json({"n": 0, "ok": True,
+                   "text": "| 电压 | 逻辑 |\n|---|---|\n| 3.5 V | 1 |"}),
+    ])
+    out = export_llm.preprocess(pages, {}, fmt="markdown", enable_blocks=True,
+                                client=client)
+    assert len(client.calls) == 2  # one automatic retry
+    assert out[0]["blocks"][0]["llm"]["text"] == \
+        "| 电压 | 逻辑 |\n|---|---|\n| 3.5 V | 1 |"
+
+
+def test_fix_with_llm_gives_up_after_retry():
+    pages = [_page([_block("电压\t逻辑\n3.5 V\t1", kind="table")])]
+    client = _RetryClient(["garbage"] * 10)
+    out = export_llm.preprocess(pages, {}, fmt="markdown", enable_blocks=True,
+                                client=client)
+    # one retry, then the batch keeps its pre-LLM content
+    assert len(client.calls) == 2
+    assert "llm" not in out[0]["blocks"][0]
+
+
+# --- outline chunking ---------------------------------------------------------------
+
+class _ChunkClient:
+    """Answers each outline chunk with exactly the asked n's and a level map."""
+
+    def __init__(self, levels=None):
+        self.levels = levels or {}
+        self.calls = []       # the chunk n ranges per call
+
+    def chat_json(self, system, user, max_tokens):
+        import re as _re
+        ns = [int(m.group(1))
+              for m in _re.finditer(r"(?m)^(\d+)\|L\d+\|", user)]
+        self.calls.append((min(ns), max(ns)))
+        return json.dumps({"headings": [
+            {"n": n, "level": self.levels.get(n, 2)} for n in ns]})
+
+
+def test_refine_outline_chunks_large_outlines():
+    pages = [_page([_block(f"标题{i}", kind="heading", bbox=[100, 60, 900, 120])
+                    for i in range(130)])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 2
+    client = _ChunkClient()
+    applied = export_llm._refine_outline(pages, {}, client, [])
+    assert len(client.calls) == 3            # 60 + 60 + 10
+    assert client.calls[0] == (0, 59)
+    assert client.calls[1] == (60, 119)
+    assert client.calls[2] == (120, 129)
+    assert applied == 130                     # every heading refined
+    assert all(b["llm_level"] == 2 for b in pages[0]["blocks"])
+
+
+def test_refine_outline_chunk_boundary_guard():
+    pages = [_page([_block(f"标题{i}", kind="heading", bbox=[100, 60, 900, 120])
+                    for i in range(122)])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 2
+    # n=60 (the first heading of chunk 2) jumps 2 -> 4 across the boundary —
+    # deeper by more than one: rejected, deterministic level kept.
+    client = _ChunkClient({60: 4})
+    applied = export_llm._refine_outline(pages, {}, client, [])
+    assert len(client.calls) == 3
+    assert pages[0]["blocks"][60]["llm_level"] == 2  # rejected
+    assert pages[0]["blocks"][59]["llm_level"] == 2  # accepted
+    assert applied == 121
+
+
+def test_refine_outline_one_bad_chunk_keeps_rest():
+    class _OneGarbage:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, system, user, max_tokens):
+            self.calls += 1
+            import re as _re
+            ns = [int(m.group(1))
+                  for m in _re.finditer(r"(?m)^(\d+)\|L\d+\|", user)]
+            if min(ns) == 60:
+                return "garbage"              # this chunk always fails
+            return json.dumps({"headings": [
+                {"n": n, "level": 2} for n in ns]})
+
+    pages = [_page([_block(f"标题{i}", kind="heading", bbox=[100, 60, 900, 120])
+                    for i in range(130)])]
+    for b in pages[0]["blocks"]:
+        b["llm_level"] = 2
+    client = _OneGarbage()
+    applied = export_llm._refine_outline(pages, {}, client, [])
+    # chunk 1 (the 60-119 range) fell back after its retry; the others applied
+    assert client.calls == 4                   # 3 chunks + 1 retry
+    assert applied == 70                       # 60 + 0 (failed chunk) + 10
+
+
+# --- TOC scan window ---------------------------------------------------------------
+
+def test_detect_toc_entries_scans_long_front_matter():
+    # A book whose 目录 starts on page 8 — beyond the old 5-page window — is
+    # still picked up (front matter + 目录 routinely span a dozen pages).
+    pages = []
+    for i in range(12):
+        if i == 8:
+            pages.append(_page(
+                [_block("第一章 绪论........1\n第二章 方法........9",
+                        kind="text")], page_index=i))
+        else:
+            pages.append(_page([_block(f"封面占位 {i}", kind="text")],
+                               page_index=i))
+    entries = export_llm.detect_toc_entries(pages)
+    assert [e["title"] for e in entries] == ["第一章 绪论", "第二章 方法"]
+
+
+def test_detect_toc_entries_stops_after_toc_region():
+    # The scan stops two pages after the last TOC page, so body pages deep in
+    # the document that merely LOOK like TOC lines are never scanned.
+    pages = [
+        _page([_block("第一章 绪论........1", kind="text")], page_index=0),
+        _page([_block("前言正文", kind="text")], page_index=1),
+        _page([_block("正文开头", kind="text")], page_index=2),
+        _page([_block("参考文献 Smith (2020)....1", kind="text")],
+              page_index=3),
+    ]
+    entries = export_llm.detect_toc_entries(pages)
+    assert [e["title"] for e in entries] == ["第一章 绪论"]
+
+
+# --- chat_json: thinking-model compatibility ---------------------------------------
+
+class _Resp:
+    """Canned chat-completions response for the fake httpx client."""
+
+    def __init__(self, data, status=200, exc=None):
+        self._data = data
+        self.status_code = status
+        self._exc = exc
+
+    def raise_for_status(self):
+        if self._exc is not None:
+            raise self._exc
+        return None
+
+    def json(self):
+        return self._data
+
+
+def _fake_httpx(monkeypatch, responses, requests_cb=None):
+    """Patch export_llm.httpx.Client so chat_json talks to canned responses."""
+    queue = list(responses)
+
+    class _FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None, headers=None):
+            if requests_cb is not None:
+                requests_cb(json)
+            return queue.pop(0)
+
+    monkeypatch.setattr(export_llm.httpx, "Client", lambda **kw: _FakeClient())
+    monkeypatch.setattr(export_llm.time, "sleep", lambda _s: None)
+    return export_llm.ExportLlmClient(
+        base_url="https://example.test/v1", api_key="k", model="m",
+        max_retries=2)
+
+
+def test_chat_json_uses_content(monkeypatch):
+    client = _fake_httpx(monkeypatch, [
+        _Resp({"choices": [{"message": {"content": "{\"ok\":true}"},
+                            "finish_reason": "stop"}]})])
+    assert client.chat_json("s", "u", 100) == "{\"ok\":true}"
+
+
+def test_chat_json_falls_back_to_reasoning_content(monkeypatch):
+    # A gateway that returns the answer only in reasoning_content.
+    client = _fake_httpx(monkeypatch, [
+        _Resp({"choices": [{
+            "message": {"content": "", "reasoning_content": "{\"ok\":true}"},
+            "finish_reason": "stop"}]})])
+    assert client.chat_json("s", "u", 100) == "{\"ok\":true}"
+
+
+def test_chat_json_retries_on_truncation_with_larger_budget(monkeypatch):
+    seen = []
+
+    def requests_cb(payload):
+        seen.append(payload["max_tokens"])
+
+    client = _fake_httpx(monkeypatch, [
+        _Resp({"choices": [{"message": {"content": "{\"ok\":"},
+                            "finish_reason": "length"}]}),
+        _Resp({"choices": [{"message": {"content": "{\"ok\":true}"},
+                            "finish_reason": "stop"}]})], requests_cb)
+    assert client.chat_json("s", "u", 1000) == "{\"ok\":true}"
+    assert seen == [1000, 1600]  # budget grew by 1.6x on truncation
+
+
+def test_chat_json_http_retries_then_none(monkeypatch):
+    import httpx
+
+    class _Err(httpx.HTTPStatusError):
+        def __init__(self):
+            super().__init__("boom", request=None, response=None)
+
+    client = _fake_httpx(monkeypatch, [
+        _Resp({}, status=500, exc=_Err()),
+        _Resp({}, status=500, exc=_Err()),
+        _Resp({}, status=500, exc=_Err()),
+    ])
+    assert client.chat_json("s", "u", 100) is None
+
+
+def test_chat_json_missing_key_returns_none():
+    client = export_llm.ExportLlmClient(base_url="", api_key="", model="m")
+    assert client.chat_json("s", "u", 100) is None
+
+
+def test_chat_json_drops_response_format_on_400(monkeypatch):
+    """A gateway without structured output rejects response_format with 400 —
+    the client drops the field and retries once in plain mode."""
+    import httpx
+
+    class _Err(httpx.HTTPStatusError):
+        def __init__(self):
+            super().__init__("response_format not supported",
+                             request=None, response=None)
+
+    seen = []
+
+    def requests_cb(payload):
+        seen.append("response_format" in payload)
+
+    client = _fake_httpx(monkeypatch, [
+        _Resp({}, status=400, exc=_Err()),
+        _Resp({"choices": [{"message": {"content": "{\"ok\":true}"},
+                            "finish_reason": "stop"}]})], requests_cb)
+    assert client.chat_json("s", "u", 100) == "{\"ok\":true}"
+    assert seen == [True, False]  # mode on first attempt, dropped on the retry
+
+
+def test_chat_json_sends_response_format_by_default(monkeypatch):
+    seen = []
+
+    def requests_cb(payload):
+        seen.append(payload.get("response_format"))
+
+    client = _fake_httpx(monkeypatch, [
+        _Resp({"choices": [{"message": {"content": "{\"ok\":true}"},
+                            "finish_reason": "stop"}]})], requests_cb)
+    assert client.chat_json("s", "u", 100) == "{\"ok\":true}"
+    assert seen == [{"type": "json_object"}]
+    # opting out removes the field
+    client2 = _fake_httpx(monkeypatch, [
+        _Resp({"choices": [{"message": {"content": "x"},
+                            "finish_reason": "stop"}]})], requests_cb)
+    assert client2.chat_json("s", "u", 100, json_mode=False) == "x"
+    assert seen[-1] is None
+
+
+def test_export_stream_split_zip_done(tmp_path, monkeypatch):
+    """split=1 streams progress and finishes with a single-use zip_url that
+    serves one archive of per-chapter markdown files."""
+    import io
+    import zipfile
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    blocks = [
+        {"kind": "heading", "bbox": [0, 0, 100, 20], "text": "第三章 插值",
+         "lines": ["第三章 插值"]},
+        {"kind": "text", "bbox": [0, 30, 100, 50], "text": "插值正文。",
+         "lines": ["插值正文。"]},
+    ]
+    _seed_job(tmp_path, blocks=blocks)
+    try:
+        with TestClient(app) as tc:
+            with tc.stream("GET", "/api/export/stream/export-1.md?split=1") as r:
+                assert r.status_code == 200
+                body = "".join(chunk for chunk in r.iter_text())
+            events, _ = _read_sse(body)
+            assert any(ev["type"] == "progress" for ev in events)
+            done = events[-1]
+            assert done["type"] == "done"
+            assert done["zte_url"] if False else done["zip_url"].startswith(
+                "/api/export/download/")
+            token = done["zip_url"].rsplit("/", 1)[-1]
+            r2 = tc.get(done["zip_url"])
+            assert r2.status_code == 200
+            assert r2.headers["content-type"].startswith("application/zip")
+            zf = zipfile.ZipFile(io.BytesIO(r2.content))
+            names = zf.namelist()
+            assert any(n.startswith("chapters/") for n in names)
+            assert any("第三章 插值" in n for n in names)
+            # the token is single-use
+            r3 = tc.get(done["zip_url"])
+            assert r3.status_code == 404
+            assert token
+    finally:
+        ocr_service._JOBS.pop("export-1", None)
+
+
+def test_export_route_split_returns_zip(tmp_path, monkeypatch):
+    """The plain GET honors split=1 and returns a chapter ZIP directly."""
+    import io
+    import zipfile
+    from fastapi.testclient import TestClient
+    from backend import ocr_service
+    from backend.main import app
+    monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
+    monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
+    _seed_job(tmp_path, blocks=[
+        {"kind": "text", "bbox": [0, 0, 100, 20], "text": "封面内容",
+         "lines": ["封面内容"]}])
+    # a second page opens a chapter (level-1 heading)
+    hocr = tmp_path / "work" / "export-1" / "hocr"
+    page2 = {"page_index": 1, "width": 1000, "height": 1400, "blocks": [
+        {"kind": "heading", "bbox": [0, 0, 100, 20], "text": "第一章 概述",
+         "lines": ["第一章 概述"]}]}
+    (hocr / "000002_ocr_hocr.blocks.json").write_text(
+        json.dumps({"page": page2, "dpi": 300.0}, ensure_ascii=False),
+        encoding="utf-8")
+    ocr_service._JOBS["export-1"].update(num_pages=2, current=2)
+    try:
+        with TestClient(app) as tc:
+            r = tc.get("/api/export/export-1.md?split=1")
+            assert r.status_code == 200
+            assert r.headers["content-type"].startswith("application/zip")
+            zf = zipfile.ZipFile(io.BytesIO(r.content))
+            names = zf.namelist()
+            assert "chapters/01_front-matter.md" in names
+            assert any("第一章 概述" in n for n in names)
+    finally:
+        ocr_service._JOBS.pop("export-1", None)

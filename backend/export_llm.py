@@ -10,13 +10,18 @@ Two passes over the page dicts, BEFORE the pure builders run:
   tab-text tables are padded (single-column ones downgrade to text), and
   page-boundary paragraphs are merged.  Pure functions, no network.
 * **P1 LLM post-processing (default OFF — export options)** — two independent
-  steps: the block fix-up (``?llm_blocks=1`` — tables / equations /
-  low-confidence blocks sent in numbered ``<<<BLOCK n>>>`` batches) and the
-  outline refinement (``?llm_outline=1`` — all headings plus the detected
-  table of contents, correcting the hierarchy).  The legacy ``?llm=1``
-  enables both.  Both must answer strict JSON; per-block / per-heading
-  guards reject hallucinations; any failure falls back to the P0 result, so
-  export NEVER fails because of the LLM.
+  steps: the outline refinement (``?llm_outline=1`` — all headings plus the
+  detected table of contents, correcting the hierarchy) and the block fix-up
+  (``?llm_blocks=1`` — tables / equations / low-confidence blocks sent in
+  numbered ``<<<BLOCK n>>>`` batches).  The legacy ``?llm=1`` enables both.
+  The outline runs FIRST — it is one or two small requests while the block
+  fix-up can be dozens — so the chapter hierarchy is never left sitting
+  behind the block queue.  Thinking-capable models are supported: responses
+  are located with a robust JSON extractor (fences, prose, think blocks), a
+  call whose JSON does not parse is retried once, truncation
+  (``finish_reason=length``) retries with a larger budget, and per-block /
+  per-heading guards reject hallucinations; any failure falls back to the P0
+  result, so export NEVER fails because of the LLM.
 
 The pass is a pages->pages transform: ``preprocess`` deep-copies and rewrites
 blocks in place, tagging them with an ``llm`` field — ``backend.export``'s
@@ -39,11 +44,12 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import re
 import statistics
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -52,6 +58,16 @@ from backend.config import as_bool
 log = logging.getLogger(__name__)
 
 PROMPT_V = 1
+
+# How many headings one outline request may carry.  A 200-heading book must
+# not ride on one fragile call: a rejected chunk falls back per chunk instead
+# of killing the whole outline, and each chunk stays small enough that even a
+# thinking model finishes it inside the request budget.  The
+# monotonic-deepening guard stays global across chunks.
+_OUTLINE_CHUNK = 60
+# Parse retries: real models occasionally wrap the JSON in prose or fences
+# once; retry that one call before falling back to the deterministic result.
+_PARSE_RETRIES = 1
 
 # Block kinds that are page furniture: never content, never reflowed.
 _FURNITURE_KINDS = {"page_number", "header", "footer", "page_footnote",
@@ -362,18 +378,79 @@ def _user_prompt(items: List[dict], fmt: str) -> str:
     return "\n".join(lines)
 
 
-def parse_blocks_response(raw: str) -> Optional[List[dict]]:
-    """Parse the model's JSON answer into item dicts (never raises)."""
+def _extract_json_object(raw: str) -> Optional[dict]:
+    """Extract a top-level JSON object from a model response (never raises).
+
+    Real models rarely emit the bare JSON we ask for: they wrap it in ```json
+    fences, lead with a newline or a sentence, or trail prose after the
+    closing brace (and thinking models may prepend a think block).  Tries, in
+    order: the stripped text as-is; the text minus code fences and think
+    blocks; then a brace-balanced scan that returns the LAST parseable
+    ``{...}`` object — the one whose closing brace is farthest right (trailing
+    prose after the answer is common), tie-broken by the larger span (so the
+    outer object wins over an inner one).
+    """
     if not raw:
         return None
-    match = re.search(r"\{.*\}", raw, re.S)
-    if not match:
+    text = raw.strip()
+    if not text:
         return None
+    # Fast path: the whole text is the JSON.
     try:
-        data = json.loads(match.group(0))
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
     except ValueError:
+        pass
+    # Code fences (```json … ```) and a leading/trailing think block — both
+    # shapes seen from real providers (<think>… and <|think|>…<|/think|>).
+    cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned).strip()
+    cleaned = re.sub(r"<(?:think|\|?think\|)>.*?</(?:think|\|?/think\|)>",
+                     "", cleaned, flags=re.S).strip()
+    if cleaned and cleaned != text:
+        try:
+            data = json.loads(cleaned)
+            if isinstance(data, dict):
+                return data
+        except ValueError:
+            pass
+        text = cleaned
+    # Brace-balanced scan: collect every balanced ``{...}`` span, then try
+    # them in order of (farthest closing brace, largest span) — trailing
+    # prose after the answer is common, and for nested objects the OUTER one
+    # closes last and wins over an inner one.
+    spans: List[Tuple[int, int]] = []  # (end, start), end preferred
+    for start in [m.start() for m in re.finditer(r"\{", text)]:
+        depth = 0
+        for i in range(start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    break
+                if depth == 0:
+                    spans.append((i, start))
+                    break
+    best = None
+    for end, start in sorted(spans, key=lambda p: (-p[0], p[1])):
+        try:
+            data = json.loads(text[start:end + 1])
+        except ValueError:
+            continue
+        if isinstance(data, dict):
+            best = data
+            break
+    return best
+
+
+def parse_blocks_response(raw: str) -> Optional[List[dict]]:
+    """Parse the model's JSON answer into item dicts (never raises)."""
+    data = _extract_json_object(raw)
+    if not data:
         return None
-    items = data.get("blocks") if isinstance(data, dict) else None
+    items = data.get("blocks")
     if not isinstance(items, list):
         return None
     return [it for it in items if isinstance(it, dict)]
@@ -398,6 +475,9 @@ class ExportLlmClient:
         self.max_retries = max(0, int(max_retries))
         self.retry_base_delay = float(retry_base_delay)
         self.retry_max_delay = float(retry_max_delay)
+        # Whether the gateway accepted ``response_format`` structured output
+        # on this client (a 400/422 turns it off for the rest of the calls).
+        self._json_mode_ok = True
 
     @classmethod
     def from_config(cls, cfg: Dict[str, Any], model: str) -> "ExportLlmClient":
@@ -406,16 +486,34 @@ class ExportLlmClient:
             base_url=str(cfg.get("base_url") or ""),
             api_key=str(cfg.get("api_key") or ""),
             model=model,
-            timeout_s=float(cfg.get("export_llm_timeout_s") or 120.0),
+            timeout_s=float(cfg.get("export_llm_timeout_s") or 240.0),
             max_retries=int(cfg.get("max_retries") or 2),
             retry_base_delay=float(cfg.get("retry_base_delay") or 1.0),
             retry_max_delay=float(cfg.get("retry_max_delay") or 15.0),
         )
 
     def chat_json(self, system: str, user: str,
-                  max_tokens: int) -> Optional[str]:
+                  max_tokens: int, json_mode: bool = True) -> Optional[str]:
         """One chat-completions call; returns the message content or ``None``
-        on any failure (transport error, 5xx after retries, bad shape)."""
+        on any failure (transport error, 5xx after retries, bad shape).
+
+        Thinking-capable models are handled: their answer arrives in
+        ``message.content`` (``reasoning_content`` carries the chain of
+        thought), but some gateways count reasoning tokens against
+        ``max_tokens``, so the answer can be cut off before the JSON closes —
+        a ``finish_reason="length"`` retries with a larger budget.  A missing
+        content falls back to ``reasoning_content`` as a last resort (the
+        callers' per-type JSON guards reject anything that is not the
+        requested shape).
+
+        ``json_mode=True`` (default) requests **structured output**
+        (``response_format: {"type": "json_object"}``): gateways that support
+        it (the OpenAI-compatible standard — e.g. qwen3.8-chat on vLLM
+        answers in 2–3s instead of 1–2 min of unconstrained thinking) return
+        guaranteed-parseable JSON.  A gateway that rejects the field with
+        400/422 has it silently dropped and the call is retried once in plain
+        mode, so the client keeps working on any endpoint.
+        """
         if not self.api_key or not self.base_url:
             return None
         payload = {
@@ -427,6 +525,9 @@ class ExportLlmClient:
                 {"role": "user", "content": user},
             ],
         }
+        json_ok = json_mode and self._json_mode_ok
+        if json_ok:
+            payload["response_format"] = {"type": "json_object"}
         headers = {"Authorization": f"Bearer {self.api_key}",
                    "Content-Type": "application/json"}
         url = f"{self.base_url}/chat/completions"
@@ -441,9 +542,42 @@ class ExportLlmClient:
                     time.sleep(min(delay, self.retry_max_delay))
                     delay = min(delay * 2, self.retry_max_delay)
                     continue
+                if (resp.status_code in (400, 422) and json_ok
+                        and attempt < self.max_retries):
+                    # Structured output not implemented by this gateway: drop
+                    # the field and retry once in plain mode (the callers'
+                    # JSON guards still catch any free-form answer).
+                    log.warning("export LLM gateway rejected response_format "
+                                "(%s) — retrying in plain JSON mode",
+                                resp.status_code)
+                    self._json_mode_ok = False
+                    payload.pop("response_format", None)
+                    json_ok = False
+                    time.sleep(min(delay, self.retry_max_delay))
+                    delay = min(delay * 2, self.retry_max_delay)
+                    continue
                 resp.raise_for_status()
                 data = resp.json()
-                return data["choices"][0]["message"]["content"] or ""
+                choice = data["choices"][0]
+                message = choice.get("message") or {}
+                content = (message.get("content") or "").strip()
+                if not content:
+                    # Last resort: some gateways return only reasoning when
+                    # the answer slot is empty.
+                    content = (message.get("reasoning_content") or "").strip()
+                # A thinking model burning its token budget before the answer
+                # finished: retry once with a bigger budget (still < 32768).
+                if (choice.get("finish_reason") == "length"
+                        and attempt < self.max_retries):
+                    log.warning("export LLM response truncated "
+                                "(finish_reason=length); retrying with a "
+                                "larger token budget")
+                    time.sleep(min(delay, self.retry_max_delay))
+                    delay = min(delay * 2, self.retry_max_delay)
+                    payload["max_tokens"] = min(
+                        32767, int(payload["max_tokens"] * 1.6))
+                    continue
+                return content
             except (httpx.HTTPError, ValueError,
                     KeyError, IndexError, TypeError):
                 if attempt >= self.max_retries:
@@ -624,20 +758,34 @@ _TOC_LINE_RE = re.compile(
     r"^(?P<title>.+?)[\s.．·⋅…‥⋯\u2026]{2,}\s*(?P<page>\d{1,4})\s*$")
 _INDENT_RE = re.compile(r"^[\s\u3000]+")
 
+# A real book's front matter (covers, forewords, a multi-page 目录) can span a
+# dozen pages — far beyond the old 5-page window — so scan a larger region…
+_TOC_MAX_PAGES = 30
+# …but stop after this many consecutive pages without a TOC line once at
+# least one entry was found (bounds false positives from body-text pages).
+_TOC_STOP_GAP = 2
 
-def detect_toc_entries(pages: List[dict], max_pages: int = 5) -> List[dict]:
-    """Parse the document's table of contents from the first pages (pure).
+
+def detect_toc_entries(pages: List[dict],
+                       max_pages: Optional[int] = None) -> List[dict]:
+    """Parse the document's table of contents from the front matter (pure).
 
     A TOC line is a title followed by dot leaders and a trailing page number
     (``第一章 绪论........1``).  The entry depth comes from the numbering
     (``heading_numbering_depth``) when present, else from the leading
-    indentation (~2 spaces per level).  Must run on the ORIGINAL line
-    structure — the reflow pass joins dot-leader lines.
+    indentation (~2 spaces per level).  The default scan window covers a long
+    front matter (a book's 目录 often starts on page 5+); scanning stops two
+    pages after the last TOC-looking page once entries were found, so body
+    pages are never scanned.  Must run on the ORIGINAL line structure — the
+    reflow pass joins dot-leader lines.
     """
     from backend.export import heading_numbering_depth
 
     entries: List[dict] = []
-    for page in pages[:max(1, max_pages)]:
+    scan = pages[:max(1, max_pages or _TOC_MAX_PAGES)]
+    gap = 0
+    for page in scan:
+        before = len(entries)
         for block in (page.get("blocks") or []):
             kind = str(block.get("kind") or "text")
             if kind not in ("text", "heading", "title"):
@@ -662,6 +810,12 @@ def detect_toc_entries(pages: List[dict], max_pages: int = 5) -> List[dict]:
                         depth = 1 + width // 2
                     entries.append({"title": title,
                                     "level": int(max(1, min(depth, 4)))})
+        if len(entries) > before:
+            gap = 0
+        else:
+            gap += 1
+            if gap >= _TOC_STOP_GAP and entries:
+                break
     return entries
 
 
@@ -703,16 +857,10 @@ def _outline_prompt(items: List[dict], toc_entries: List[dict]) -> str:
 
 def parse_outline_response(raw: str) -> Optional[List[dict]]:
     """Parse the model's outline answer into item dicts (never raises)."""
-    if not raw:
+    data = _extract_json_object(raw)
+    if not data:
         return None
-    match = re.search(r"\{.*\}", raw, re.S)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except ValueError:
-        return None
-    items = data.get("headings") if isinstance(data, dict) else None
+    items = data.get("headings")
     if not isinstance(items, list):
         return None
     return [it for it in items if isinstance(it, dict)]
@@ -722,9 +870,16 @@ def _refine_outline(pages: List[dict], settings: Dict[str, Any], client: Any,
                     toc_entries: List[dict],
                     progress: Optional[Any] = None) -> int:
     """LLM outline refinement over the heading blocks (in place).  Returns
-    the applied count.  Per-heading guards (level range, monotonic deepening,
-    first heading) reject bad corrections; every failure keeps the
-    deterministic ``llm_level``."""
+    the applied count.
+
+    Headings are processed in ``_OUTLINE_CHUNK``-sized requests so a huge
+    book (200+ headings) never rides on one fragile call: each chunk gets
+    ``_PARSE_RETRIES`` attempts, and a rejected chunk keeps the deterministic
+    ``llm_level`` instead of killing the whole outline.  Per-heading guards
+    (level range, monotonic deepening, first heading) reject bad corrections
+    and stay GLOBAL across chunk boundaries, so a chunk split can never
+    introduce a deeper-by-more-than-one jump.
+    """
     heads = [block for page in pages
              for block in (page.get("blocks") or [])
              if str(block.get("kind") or "text") in ("title", "heading")]
@@ -733,54 +888,66 @@ def _refine_outline(pages: List[dict], settings: Dict[str, Any], client: Any,
     items = [{"n": i, "level": (block.get("llm_level") or 2),
               "text": (block.get("text") or "").strip()}
              for i, block in enumerate(heads)]
-    if progress is not None:
+    n_chunks = math.ceil(len(items) / _OUTLINE_CHUNK)
+
+    def notify(done: int) -> None:
+        if progress is None:
+            return
         try:
-            progress({"phase": "outline", "done": 0, "total": 1})
+            progress({"phase": "outline", "done": done, "total": n_chunks})
         except Exception:  # noqa: BLE001 — cosmetic
             pass
-    prompt = _outline_prompt(items, toc_entries)
-    max_tokens = max(512, min(32767, len(prompt) * 2 + 256))
-    raw = client.chat_json(_OUTLINE_SYSTEM, prompt, max_tokens)
-    parsed = parse_outline_response(raw or "")
-    if not parsed:
-        log.warning("export LLM outline returned no usable JSON — kept the "
-                    "deterministic levels")
-        if progress is not None:
-            try:
-                progress({"phase": "outline", "done": 1, "total": 1})
-            except Exception:  # noqa: BLE001
-                pass
-        return 0
-    by_n: Dict[int, dict] = {}
-    for it in parsed:
-        try:
-            by_n[int(it.get("n"))] = it
-        except (TypeError, ValueError):
-            continue
+
+    notify(0)
     applied = 0
     prev = 1
-    for i in range(len(heads)):
-        item = by_n.get(i)
-        if not item:
+    for ci, start in enumerate(range(0, len(items), _OUTLINE_CHUNK)):
+        chunk = items[start:start + _OUTLINE_CHUNK]
+        prompt = _outline_prompt(chunk, toc_entries)
+        # Generous budget: thinking models burn tokens before the answer; the
+        # chat_json length-retry grows it further on truncation.
+        max_tokens = max(1024, min(32767, len(prompt) * 3 + 512))
+        parsed = None
+        for attempt in range(_PARSE_RETRIES + 1):
+            raw = client.chat_json(_OUTLINE_SYSTEM, prompt, max_tokens)
+            parsed = parse_outline_response(raw or "")
+            if parsed:
+                break
+            if attempt < _PARSE_RETRIES:
+                log.warning("export LLM outline chunk %d/%d returned "
+                            "unparseable JSON — retrying once",
+                            ci + 1, n_chunks)
+        if not parsed:
+            log.warning("export LLM outline chunk %d/%d returned no usable "
+                        "JSON — kept the deterministic levels for it",
+                        ci + 1, n_chunks)
+            notify(ci + 1)
             continue
-        try:
-            level = int(item.get("level"))
-        except (TypeError, ValueError):
-            continue
-        if not (1 <= level <= 5):
-            continue
-        if i == 0 and level not in (1, 2):
-            continue
-        if i > 0 and level - prev > 1:
-            continue  # the hierarchy cannot deepen by more than one at a time
-        heads[i]["llm_level"] = level
-        prev = level
-        applied += 1
-    if progress is not None:
-        try:
-            progress({"phase": "outline", "done": 1, "total": 1})
-        except Exception:  # noqa: BLE001
-            pass
+        by_n: Dict[int, dict] = {}
+        for it in parsed:
+            try:
+                by_n[int(it.get("n"))] = it
+            except (TypeError, ValueError):
+                continue
+        for gi in range(start, min(start + _OUTLINE_CHUNK, len(items))):
+            item = by_n.get(gi)
+            if not item:
+                continue
+            try:
+                level = int(item.get("level"))
+            except (TypeError, ValueError):
+                continue
+            if not (1 <= level <= 5):
+                continue
+            if gi == 0 and level not in (1, 2):
+                continue
+            # Global monotonic-deepening guard (carried across chunks).
+            if gi > 0 and level - prev > 1:
+                continue
+            heads[gi]["llm_level"] = level
+            prev = level
+            applied += 1
+        notify(ci + 1)
     return applied
 
 
@@ -867,8 +1034,11 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
         merge_cross_page(pages)
         notify({"phase": "reflow", "done": 1, "total": 1})
 
-    # P1a: LLM block fix-up / P1b: LLM outline refinement — two independent
-    # post-processing steps sharing one client.
+    # P1a: LLM outline refinement / P1b: LLM block fix-up — two independent
+    # post-processing steps sharing one client.  The outline runs FIRST: it is
+    # one or two small requests, while the block fix-up can be dozens of
+    # calls (every table/equation), so the chapter hierarchy must not sit
+    # behind the block queue.
     if settings["blocks"] or settings["outline"]:
         llm_client = client
         if llm_client is None:
@@ -883,12 +1053,12 @@ def preprocess(pages: List[dict], cfg: Optional[Dict[str, Any]] = None,
                 # Base heading levels: the reflow path already assigned them
                 # pre-unwrap; here the original line structure is intact too.
                 assign_heading_levels(pages)
-            if settings["blocks"]:
-                _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
-                              progress=notify)
             if settings["outline"]:
                 _refine_outline(pages, settings, llm_client, toc_entries,
                                 progress=notify)
+            if settings["blocks"]:
+                _fix_with_llm(pages, settings, fmt, llm_client, cache_path,
+                              progress=notify)
 
     return pages
 
@@ -942,10 +1112,19 @@ def _fix_with_llm(pages: List[dict], settings: Dict[str, Any], fmt: str,
             notify(fixed)
             continue
         prompt = _user_prompt(pending, fmt)
-        max_tokens = max(1024, min(32767, int(
-            sum(len(p["text"]) for p in pending) * 2) + 256))
-        raw = client.chat_json(_SYSTEM_PROMPT, prompt, max_tokens)
-        items = parse_blocks_response(raw or "")
+        # Generous budget: thinking models burn tokens before the answer; the
+        # chat_json length-retry grows it further on truncation.
+        max_tokens = max(2048, min(32767, int(
+            sum(len(p["text"]) for p in pending) * 2.5) + 512))
+        items = None
+        for attempt in range(_PARSE_RETRIES + 1):
+            raw = client.chat_json(_SYSTEM_PROMPT, prompt, max_tokens)
+            items = parse_blocks_response(raw or "")
+            if items:
+                break
+            if attempt < _PARSE_RETRIES:
+                log.warning("export LLM batch returned unparseable JSON "
+                            "(%d block(s)) — retrying once", len(pending))
         if not items:
             log.warning("export LLM batch returned no usable JSON (%s block(s)) "
                         "— kept as-is", len(pending))
