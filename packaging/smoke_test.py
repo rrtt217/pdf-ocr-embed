@@ -102,6 +102,14 @@ def _loader_resolution(app_root: Path, binary: Path, lib_dir: Path) -> list[str]
             name = Path(resolved).name
         else:
             continue
+
+        if resolved.startswith(("@rpath/", "@loader_path/", "@executable_path/")):
+            # macOS: relative install names are the *good* case — they are how a
+            # relocatable bundle refers to its own libraries.  Just make sure we
+            # actually ship the file (PyInstaller rewrites these at build time).
+            if not (lib_dir / name).exists() and not (app_root / name).exists():
+                problems.append(f"{name} is not shipped with the app: {resolved}")
+            continue
         if _is_host_library(name, resolved):
             continue
         if not resolved.startswith(str(app_root)):
