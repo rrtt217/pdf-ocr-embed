@@ -28,3 +28,5 @@ opencode_run.log
 page15.pdf
 # Large sample book PDF (do not commit)
 数值计算*.pdf
+# gh CLI cache (redirected into the workspace in sandboxes)
+.ghcache/
