@@ -359,6 +359,8 @@ python packaging/build.py --clean --with-tesseract   # 捆绑 tesseract + eng/ch
   请用 WebUI 设置页配置，或用 `OCR_*` 环境变量覆盖。
 - **Ghostscript 自 OCRmyPDF 17.0 起为可选**（仅 PDF/A 输出需要），默认构建不需要它。
 - 需在**每个目标系统上分别构建**（PyInstaller 不能交叉编译）；
+  `.github/workflows/desktop-build.yml` 已在三平台自动构建，并在**每个平台上实跑一次
+  真实 OCR**（上传图片型 PDF → OCR → 嵌入 → 下载，断言产出 PDF 含正确文字层）。
   安装器与代码签名/公证尚未包含。
 
 ---

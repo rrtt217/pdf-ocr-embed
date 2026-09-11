@@ -410,7 +410,10 @@ See [`packaging/README.md`](packaging/README.md) for details. Key points:
 - **Ghostscript is optional since OCRmyPDF 17.0** (PDF/A output only), and the
   Unlimited API engine needs no local binary at all.
 - Build on **each target OS separately** (PyInstaller is not a cross-compiler).
-  Installers, code signing and notarization are not included yet.
+  `.github/workflows/desktop-build.yml` already builds all three and runs a
+  **real OCR job on each** (image-only PDF → OCR → embed → download, asserting
+  the output PDF is searchable). Installers, code signing and notarization are
+  not included yet.
 
 ---
 

@@ -219,29 +219,42 @@ window. Windows (WebView2) and macOS (WKWebView) need no extra system packages.
 
 ### Verified on GitHub Actions
 
-Every push builds all three platforms, and each bundle's **own** Tesseract is
-executed with only the libraries and language data inside that bundle:
+Every push builds all three platforms and then **runs a real OCR job on each**:
 
 | Job | Result | Tesseract staged | Artifact |
 | --- | --- | --- | --- |
 | Test suite | ✅ ~40 s | — | pytest on clean `ubuntu-latest` + Python 3.14 |
 | Build linux-x86_64 | ✅ ~2 m | 54 files | **152 MB** zipped (GTK + Tesseract) |
-| Build windows-x86_64 | ✅ ~2.5 m | 73 files | **136 MB** (Tesseract, system WebView2) |
+| Build windows-x86_64 | ✅ ~4 m | 73 files | **136 MB** (Tesseract, system WebView2) |
 | Build macos-arm64 | ✅ ~1.5 m | 15 files | **69 MB** (Tesseract, system WKWebView) |
 
-On all three, CI reports `bundled tesseract runs; languages: ['chi_sim', 'eng']`.
-Each also runs `smoke_test.py`, which additionally asserts the frontend and
-`/api/health` answer, that the `unlimited` plugin imported, that
-`POST /api/app/quit` is **403** without its confirmation header, and that the
-process then exits 0 — so a bundle that merely built but cannot run still fails
-the job. (The Tesseract *install* and the GTK step are `continue-on-error`: a
-runner that cannot provide them still produces a working bundle, just one that
-needs a system Tesseract / falls back to the browser.)
+`smoke_test.py --expect-tesseract --ocr` runs on **all three**, and each prints:
 
-The Windows/macOS **windows** are not exercised in CI (no interactive session),
-only the headless app, and a full OCR run through OCRmyPDF was verified on
-Linux. What CI does prove on every platform is that the shipped Tesseract
-executes and finds its language data.
+```
+smoke: bundled tesseract runs; languages: ['chi_sim', 'eng']
+smoke: running a real OCR job (tesseract engine)
+smoke: OCR job <id> finished
+smoke: text layer has 26 chars: 'The quick brown fox 12345'
+smoke: OK
+```
+
+The `--ocr` check builds an **image-only** PDF (text laid out with fpdf2,
+rasterized with pypdfium2, re-wrapped with Pillow — so there is no text layer to
+copy from), uploads it through the *frozen* app with the local Tesseract engine,
+embeds, downloads, and asserts the result is searchable. That is the whole
+chain — upload → OCRmyPDF → tesseract → hOCR → invisible text layer → download —
+verified on the target OS rather than reasoned about.
+
+The other checks assert the frontend and `/api/health` answer, that the
+`unlimited` plugin imported, that the loader takes every non-host library from
+inside the app, that `POST /api/app/quit` is **403** without its confirmation
+header, and that the process then exits 0 — so a bundle that merely built but
+cannot run still fails the job. (The Tesseract *install* and the GTK step are
+`continue-on-error`: a runner that cannot provide them still produces a working
+bundle, just one that needs a system Tesseract / falls back to the browser.)
+
+Remaining gap: the **native window** is not exercised in CI (the runners have no
+interactive session), so that part is verified on Linux only.
 
 Inspect a run with the GitHub CLI:
 
@@ -257,6 +270,5 @@ gh run download <run-id>           # fetch the artifacts
 > shells), point its cache somewhere writable: `XDG_CACHE_HOME=$PWD/.ghcache`.
 
 Not yet done: installers (Inno Setup / `.dmg` / AppImage), code signing +
-macOS notarization, and a full OCR pass through OCRmyPDF on Windows/macOS
-(CI proves the bundled Tesseract runs there, but only Linux runs the whole
-upload → OCR → embed pipeline end to end).
+macOS notarization, and native-window verification on Windows/macOS (the
+runners have no interactive session).
