@@ -52,6 +52,105 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+# Libraries the host must always provide (glibc and the loader).  Everything
+# else tesseract needs has to come from inside the app, or the bundle is not
+# actually self-contained.  Kept in sync with packaging/bundle_tesseract.py.
+_SYSTEM_LIB_RE = re.compile(
+    r"^(libc|libm|libdl|libpthread|librt|libutil|libnsl|libresolv|libcrypt"
+    r"|ld-linux|ld-musl)[.-]"
+)
+
+
+def _is_host_library(name: str, resolved: str) -> bool:
+    if sys.platform == "darwin":
+        return resolved.startswith(("/usr/lib/", "/System/"))
+    return bool(_SYSTEM_LIB_RE.match(name))
+
+
+def _loader_resolution(app_root: Path, binary: Path, lib_dir: Path) -> list[str]:
+    """Assert the loader takes every non-host library from inside the app.
+
+    Executing the bundled tesseract is not enough on a build host: the system
+    copies are still on the default search path, so a missing or mis-named
+    bundled library would go unnoticed.  Ask the loader instead.
+    """
+    if os.name == "nt":
+        # Windows keeps the DLLs next to the executable and finds them via
+        # PATH; running it (below) is the meaningful check there.
+        return []
+    if not lib_dir.is_dir():
+        return [f"bundled tesseract has no lib/ directory ({lib_dir})"]
+
+    env = dict(os.environ)
+    loader = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    env[loader] = str(lib_dir)
+    command = ["otool", "-L", str(binary)] if sys.platform == "darwin" \
+        else ["ldd", str(binary)]
+    try:
+        out = subprocess.run(command, env=env, capture_output=True, text=True,
+                             timeout=120).stdout
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [f"could not inspect {binary.name}: {exc}"]
+
+    problems: list[str] = []
+    for line in out.splitlines():
+        match = re.search(r"=>\s+(\S+)\s+\(", line)
+        if match:                                    # Linux: name => path
+            name, resolved = Path(match.group(1)).name, match.group(1)
+        elif sys.platform == "darwin" and line.startswith("\t"):
+            resolved = line.strip().split(" (")[0]    # macOS: install name
+            name = Path(resolved).name
+        else:
+            continue
+        if _is_host_library(name, resolved):
+            continue
+        if not resolved.startswith(str(app_root)):
+            problems.append(f"{name} resolves outside the app: {resolved}")
+    return problems
+
+
+def check_bundled_tesseract(exe: Path) -> list[str]:
+    """Prove the staged Tesseract is complete and actually runs.
+
+    Checking ``/api/health`` only shows the directory was found.  This runs the
+    real binary with only its bundled libraries and language data, and asks the
+    loader whether it is really using them.
+    """
+    root = exe.parent / "_internal" / "tesseract"
+    binary = root / "bin" / ("tesseract.exe" if os.name == "nt" else "tesseract")
+    if not binary.is_file():
+        return [f"bundled tesseract is missing at {binary}"]
+
+    failures = _loader_resolution(exe.parent, binary, root / "lib")
+
+    env = dict(os.environ)
+    # Deliberately do NOT expose the host's tesseract or its libraries.
+    env["PATH"] = str(binary.parent)
+    env.pop("TESSDATA_PREFIX", None)
+    lib_dir = root / "lib"
+    if lib_dir.is_dir():
+        loader = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        env[loader] = str(lib_dir)
+    env["TESSDATA_PREFIX"] = str(root / "tessdata")
+
+    try:
+        result = subprocess.run([str(binary), "--list-langs"], env=env,
+                                capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        failures.append(f"bundled tesseract did not run: {exc}")
+        return failures
+    if result.returncode != 0:
+        failures.append(f"bundled tesseract --list-langs failed "
+                        f"({result.returncode}): {result.stderr.strip()[:400]}")
+        return failures
+    languages = [line.strip() for line in result.stdout.splitlines()[1:]
+                 if line.strip() and not line.startswith("List of")]
+    print(f"smoke: bundled tesseract runs; languages: {languages}")
+    if not languages:
+        failures.append("bundled tesseract reported no languages")
+    return failures
+
+
 def get(url: str, timeout: float = 5.0):
     """GET that returns (status, body_bytes) instead of raising on 4xx/5xx."""
     request = urllib.request.Request(url)
@@ -100,6 +199,11 @@ def main(argv: list[str] | None = None) -> int:
 
     def fail(message: str) -> None:
         failures.append(message)
+
+    # Prove the staged Tesseract itself works, not just that its directory is
+    # there (see check_bundled_tesseract).
+    if args.expect_tesseract:
+        failures += check_bundled_tesseract(exe)
 
     with log_path.open("wb") as log_file:
         proc = subprocess.Popen([str(exe), "--no-window", "--port", str(port)],
