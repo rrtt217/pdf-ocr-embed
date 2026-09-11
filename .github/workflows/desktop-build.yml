@@ -3,6 +3,11 @@ name: desktop-build
 on:
   push:
     branches: [main]
+    # A full three-OS build is not worth spending on a docs edit.  Workflow
+    # changes are not ignored, so tweaking this file still triggers a run.
+    paths-ignore:
+      - "**.md"
+      - "research/**"
   pull_request:
   workflow_dispatch:
 

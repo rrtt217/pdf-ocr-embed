@@ -163,17 +163,36 @@ merely built but cannot run still fails the job.
 
 The Linux job installs the GTK stack as a `continue-on-error` step: if
 PyGObject/WebKit cannot be set up on the runner, the bundle is still produced and
-the app falls back to the system browser. Windows (WebView2) and macOS
-(WKWebView) need no extra system packages.
+the app falls back to the system browser. On `ubuntu-latest` it succeeds — the
+step pulls **PyGObject 3.50.0** through `pywebview[gtk]` (the pin that matches
+the runner's `girepository-1.0`), so the Linux artifact does carry the native
+window. Windows (WebView2) and macOS (WKWebView) need no extra system packages.
+
+### Verified on GitHub Actions
+
+| Job | Result | Notes |
+| --- | --- | --- |
+| Test suite | ✅ ~40 s | pytest on a clean `ubuntu-latest` + Python 3.14 |
+| Build linux-x86_64 | ✅ ~2 m | GTK bundled; artifact **105 MB** zipped |
+| Build windows-x86_64 | ✅ ~2 m | no GTK (system WebView2); **58 MB** |
+| Build macos-arm64 | ✅ ~1.5 m | no GTK (system WKWebView); **60 MB** |
+
+All three run `smoke_test.py` against the frozen binary and pass. The
+Windows/macOS *window* itself is not exercised in CI (no interactive session),
+only the headless app — that part is verified on Linux.
 
 Inspect a run with the GitHub CLI:
 
 ```bash
 gh run list --workflow=desktop-build.yml
 gh run watch                       # live-tail the newest run
-gh run view <run-id> --log-failed  # only the failing steps
+gh run view --log-failed           # only the failing steps
+gh run view --job=<job-id> --log   # one job's full log
 gh run download <run-id>           # fetch the artifacts
 ```
+
+> If `gh` reports `open ~/.cache/gh/...: read-only file system` (sandboxed
+> shells), point its cache somewhere writable: `XDG_CACHE_HOME=$PWD/.ghcache`.
 
 Not yet done: installers (Inno Setup / `.dmg` / AppImage), code
 signing + macOS notarization, and bundling Tesseract for fully-offline use.
