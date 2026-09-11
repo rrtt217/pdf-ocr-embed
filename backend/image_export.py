@@ -2,8 +2,9 @@
 
 The page sidecars' ``image`` blocks carry bboxes in **raw pixel space of the
 OCR page image** (the project's hard invariant). To embed the actual figures
-into an exported markdown document, the source PDF's page is rendered with
-PyMuPDF and each image block's bbox region cropped:
+into an exported markdown document, the source PDF's page is rendered (via
+``backend.pdf_processing`` — pypdfium2) and each image block's bbox region
+cropped:
 
 * the pixel→point mapping goes through ``clip_rect`` (pure): the sidecar page
   width/height give the scale, so the crop renders 1:1 with the bbox pixels —
@@ -24,6 +25,8 @@ import logging
 import zipfile
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
+
+from backend import pdf_processing
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +62,7 @@ def clip_rect(bbox: List[int], page_w: int, page_h: int,
         return None
     sx, sy = rect_w / page_w, rect_h / page_h
     # Clamp to the page: a bbox slightly outside the raster must not produce
-    # an out-of-page clip (PyMuPDF would still render, but keep it honest).
+    # an out-of-page clip (the renderer would still draw, but keep it honest).
     x0, y0 = max(0.0, x1 * sx), max(0.0, y1 * sy)
     x2p, y2p = min(rect_w, x2 * sx), min(rect_h, y2 * sy)
     if not (x2p > x0 and y2p > y0):
@@ -181,8 +184,6 @@ def extract_images(job: dict, pages: List[dict],
     if not pdf_path or not Path(pdf_path).exists():
         raise ValueError("job has no readable source PDF for image extraction")
 
-    import fitz  # PyMuPDF (import here: the module works without it until used)
-
     # Same folder contract as the per-job export LLM cache: work/<job>/…
     hocr_dir = job.get("hocr_dir")
     out_dir = (Path(hocr_dir).parent / _IMAGES_DIRNAME if hocr_dir
@@ -190,7 +191,7 @@ def extract_images(job: dict, pages: List[dict],
 
     image_map: Dict[Tuple[int, int], Path] = {}
     out_dir.mkdir(parents=True, exist_ok=True)
-    with fitz.open(pdf_path) as doc:
+    with pdf_processing.open_pdf(pdf_path) as doc:
         for pidx, page in enumerate(pages):
             if progress is not None:
                 try:
@@ -209,34 +210,30 @@ def extract_images(job: dict, pages: List[dict],
             ph = int(inner.get("height") or page.get("height") or 0)
             if pw <= 0 or ph <= 0:
                 continue
+            try:
+                rect_w, rect_h = doc.page_size_pt(page_index)
+            except Exception:  # noqa: BLE001 - unreadable page: skip it
+                log.warning("image export: page %s unreadable", page_index)
+                continue
             blocks = inner.get("blocks") or page.get("blocks") or []
             crops = []  # [(block_index, clip, zoom)]
             for bi, block in enumerate(blocks):
                 kind = str(block.get("kind") or "text")
                 if kind not in IMAGE_KINDS:
                     continue
-                clip = clip_rect(block.get("bbox"), pw, ph,
-                                 doc[page_index].rect.width, doc[page_index].rect.height)
+                clip = clip_rect(block.get("bbox"), pw, ph, rect_w, rect_h)
                 if clip is None:
                     continue
                 # 1:1 with the OCR raster: zoom = OCR px / points ⇒ the crop
                 # comes out at exactly (bbox_w × bbox_h) pixels.
-                zoom = min(pw / doc[page_index].rect.width, _MAX_ZOOM)
+                zoom = min(pw / rect_w, _MAX_ZOOM)
                 crops.append((bi, clip, zoom))
             if not crops:
                 continue
-            try:
-                pix_base = doc[page_index]
-            except Exception:  # noqa: BLE001 - unreadable page: skip it
-                log.warning("image export: page %s unreadable", page_index)
-                continue
             for bi, clip, zoom in crops:
                 try:
-                    pix = pix_base.get_pixmap(
-                        matrix=fitz.Matrix(zoom, zoom),
-                        clip=fitz.Rect(*clip), alpha=False)
                     out_path = out_dir / image_filename(page_index, bi)
-                    pix.save(out_path)
+                    doc.render_clip_png(page_index, clip, zoom, out_path)
                     image_map[(page_index, bi)] = out_path
                 except Exception as exc:  # noqa: BLE001 - one bad crop: skip it
                     log.warning("image export: crop failed on page %s block %d: %s",

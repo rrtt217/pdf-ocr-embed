@@ -1,0 +1,106 @@
+name: desktop-build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Cheap gate: never spend 3× OS minutes building a broken commit.
+  test:
+    name: Test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false          # one platform failing must not hide the others
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+            artifact: pdf-ocr-embed-linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+            artifact: pdf-ocr-embed-windows-x86_64
+          - os: macos-latest
+            name: macos-arm64
+            artifact: pdf-ocr-embed-macos-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-desktop.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6.15"
+
+      # Windows uses WebView2 and macOS WKWebView; pywebview pulls in the
+      # platform bindings (pythonnet / pyobjc) by itself.
+      - name: Install the window backend (Windows / macOS)
+        if: runner.os != 'Linux'
+        run: pip install pywebview
+
+      # Linux needs GTK + WebKit2GTK and a matching PyGObject.  This is the one
+      # genuinely fragile part (girepository-1.0 vs 2.0 across distros), so it is
+      # best-effort: if it fails the bundle is still built and the app simply
+      # falls back to the system browser.
+      - name: Linux native window — GTK stack (best effort)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgirepository1.0-dev libcairo2-dev pkg-config gir1.2-webkit2-4.1
+          pip install "pywebview[gtk]"
+
+      - name: Build the bundle
+        run: python packaging/build.py --clean
+
+      - name: Smoke test the bundle
+        run: python packaging/smoke_test.py
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/pdf-ocr-embed
+          if-no-files-found: error
+          retention-days: 14

@@ -9,11 +9,16 @@ output/
 work/
 uploads/
 cache/
+logs/
 __pycache__/
 *.pyc
 *.egg-info/
 .venv/
 venv/
+
+# PyInstaller / desktop packaging output
+build/
+dist/
 
 # Git worktrees for parallel feature development
 .worktrees/

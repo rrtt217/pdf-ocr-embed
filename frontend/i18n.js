@@ -45,6 +45,10 @@ const I18N_DICT = {
     "header.cleanupTitle": "Delete orphaned/old working files and outputs",
     "header.logs": "Logs",
     "header.settings": "Settings",
+    "header.quit": "Quit",
+    "header.quitTitle": "Stop the local server and exit",
+    "header.quitConfirm": "Quit PDF OCR Embed? Running OCR jobs will be stopped.",
+    "header.quitFailed": "Could not quit the app.",
 
     // --- upload ---
     "upload.drop": "Drop a scanned PDF here",
@@ -331,6 +335,10 @@ const I18N_DICT = {
     "header.cleanupTitle": "删除孤儿/过期的临时工作文件与输出",
     "header.logs": "日志",
     "header.settings": "设置",
+    "header.quit": "退出",
+    "header.quitTitle": "停止本地服务并退出程序",
+    "header.quitConfirm": "退出 PDF OCR Embed？正在运行的 OCR 任务将被停止。",
+    "header.quitFailed": "无法退出程序。",
 
     // --- upload ---
     "upload.drop": "将扫描版 PDF 拖到这里",

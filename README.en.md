@@ -25,8 +25,9 @@ nothing is hardcoded in the code.
 
 - **OCR core = OCRmyPDF** — rasterization, engine scheduling, concurrency, text-layer
   rendering (its built-in fpdf2 renderer), grafting, PDF/A and optimization all live
-  in [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF) (≥17.11, system deps:
-  tesseract + ghostscript, no qpdf). The backend calls it in-process through its
+  in [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF) (≥17.11; see Installation for
+  system deps — tesseract only, ghostscript is optional since OCRmyPDF 17.0, no qpdf).
+  The backend calls it in-process through its
   official edit-round-trip channel: `_pdf_to_hocr` (OCR → per-page hOCR) +
   `_hocr_to_ocr_pdf` (edited hOCR → final PDF).
 - **unlimited-ocr as a standalone OCRmyPDF plugin** ([`ocrmypdf_unlimited/`](ocrmypdf_unlimited/README.md),
@@ -89,12 +90,23 @@ nothing is hardcoded in the code.
 
 ## Installation
 
-**System dependencies** (required by OCRmyPDF): tesseract-ocr and ghostscript; no
-qpdf requirement.
+**System dependencies**:
+
+- **tesseract-ocr** — needed only for the **Tesseract (local)** engine (neither the
+  Unlimited API engine nor No OCR needs it). Add a language pack for non-English,
+  e.g. `tesseract-ocr-chi-sim`.
+- **ghostscript** — **no longer required since OCRmyPDF 17.0.0**: the default
+  `--rasterizer auto` prefers `pypdfium2` (a pure Python wheel), and
+  `output_type="pdf"` never invokes `gs`. It is only needed for **PDF/A** output
+  (`ocrmypdf_output_type = "pdfa"`) or a forced ghostscript rasterizer.
+- No qpdf requirement; `clean` (unpaper) and `optimize=2/3` (pngquant/jbig2enc)
+  are optional.
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get install tesseract-ocr ghostscript
+# Debian/Ubuntu — with only the Unlimited API engine, neither is strictly needed
+sudo apt-get install tesseract-ocr            # for the local Tesseract engine
+sudo apt-get install tesseract-ocr-chi-sim    # Chinese language pack (optional)
+sudo apt-get install ghostscript              # only for PDF/A output
 cd /home/david/vibe-arena/pdf-ocr-embed
 python3 -m venv .venv
 source .venv/bin/activate
@@ -235,7 +247,7 @@ that do have results are always included.
 
 ### Post-embed validation & quality report
 
-After embedding, the backend re-opens the embedded PDF with PyMuPDF, extracts
+After embedding, the backend re-opens the embedded PDF with pypdfium2, extracts
 its text layer and compares it page-by-page against the OCR source
 (`backend/validation.py`) — the "can I trust this PDF?" closed loop:
 
@@ -328,20 +340,24 @@ pdf-ocr-embed/
 │   │   └── text_norm.py        # math/table text normalization
 │   ├── errors.py               # UnavailableError + 1000-canvas → pixel bbox mapping
 │   ├── http_retry.py           # HTTP retry/rate-limit (engine API calls)
+│   ├── paths.py                # path resolution: source checkout vs frozen bundle
+│   ├── server.py               # EmbeddedServer: uvicorn on a thread, 127.0.0.1, free port
 │   ├── ocr_service.py          # OCRmyPDF orchestration (_pdf_to_hocr + _hocr_to_ocr_pdf) + job state
 │   ├── models.py               # editor page JSON (OcrPage/OcrBlock compatible)
-│   ├── pdf_processing.py       # page preview rendering (PyMuPDF)
+│   ├── pdf_processing.py       # the only PDF-library seam (pypdfium2)
 │   ├── validation.py           # post-embed coverage report
 │   ├── batch.py                # ZIP packaging (streamed)
 │   ├── cleanup.py              # temp-file cleanup
-│   ├── logging_config.py       # logging
+│   ├── logging_config.py       # logging (plus a file handler when packaged)
 │   └── cli.py                  # headless CLI (python -m backend.cli)
+├── desktop.py                  # desktop entry point (freeze_support + window + cleanup)
+├── packaging/                  # desktop packaging (PyInstaller spec / build.py / docs)
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # EN + 中文 UI strings
-├── tests/                      # pytest suite (146 tests)
+├── tests/                      # pytest suite (406 tests)
 ├── requirements-dev.txt        # dev dependencies (pytest)
 ├── requirements.txt
 ├── config.example.toml
@@ -349,6 +365,44 @@ pdf-ocr-embed/
 ├── AGENTS.md     # agent-oriented project guide (engine plugins + page store)
 └── DESIGN.md     # design doc (OCRmyPDF architecture + frontend rationale)
 ```
+
+---
+
+## Packaging as a desktop app
+
+Build a double-clickable bundle with PyInstaller (onedir, ~199 MB on Linux):
+
+```bash
+pip install -r requirements.txt -r requirements-desktop.txt
+python packaging/build.py --clean
+./dist/pdf-ocr-embed/pdf-ocr-embed              # native window, or the browser
+./dist/pdf-ocr-embed/pdf-ocr-embed --no-window  # serve only (smoke tests)
+```
+
+See [`packaging/README.md`](packaging/README.md) for details. Key points:
+
+- **The native window** renders the UI in the OS webview via pywebview (WebView2
+  / WKWebView / WebKit2GTK); closing it quits. If pywebview is missing or its
+  backend fails to start, the app **falls back to the system browser** instead
+  of failing.
+- **A Quit button** appears in the WebUI header whenever the app was launched by
+  `desktop.py` (`/api/health` reports `desktop: true`) and calls
+  `POST /api/app/quit` — the only way out in the browser-fallback mode. The
+  endpoint demands a custom header, and CORS allows loopback origins only, so a
+  random web page cannot pass the preflight needed to quit your app.
+- The server binds **`127.0.0.1` on a kernel-assigned free port** and runs on a
+  background thread (`backend/server.py`); `desktop.py` handles
+  `multiprocessing.freeze_support()`, the window, and graceful exit (it stops
+  running OCR jobs through the project's `cancel` contract).
+- **A packaged build writes data/config/logs to per-user directories**
+  (`backend/paths.py`, via `platformdirs`) instead of next to its code. It
+  therefore does **not** read the repo's `backend/ocr_config.toml` — configure
+  it in the WebUI Settings dialog or with `OCR_*` environment variables.
+- **The Tesseract engine needs a system `tesseract`** (PyInstaller does not
+  bundle it); the Unlimited API engine needs no local binary. **Ghostscript is
+  optional since OCRmyPDF 17.0** (PDF/A output only).
+- Build on **each target OS separately** (PyInstaller is not a cross-compiler).
+  Installers, code signing and notarization are not included yet.
 
 ---
 

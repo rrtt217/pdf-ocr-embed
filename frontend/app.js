@@ -2330,11 +2330,38 @@ async function init() {
   updateZipButton();
   renderPendingPanel();
 
-  try { await api("/api/health"); setStatus("online"); }
+  let health = null;
+  try { health = await api("/api/health"); setStatus("online"); }
   catch { setStatus("offline", "error"); }
+  initQuitButton(health);
 
   // The server knows all jobs — show every one of them (running ones get SSE).
   loadJobs();
+}
+
+// --- desktop mode: offer the only way out in the browser-fallback mode -----
+// (In windowed mode closing the window quits; in browser mode this button is
+// what stops the local server.)
+function initQuitButton(health) {
+  const btn = $("#btn-quit");
+  if (!btn) return;
+  if (!health || !health.desktop) { btn.classList.add("hidden"); return; }
+  btn.classList.remove("hidden");
+  btn.onclick = async () => {
+    if (!window.confirm(I18N.t("header.quitConfirm"))) return;
+    btn.disabled = true;
+    try {
+      // The custom header is required by the endpoint (CSRF guard).
+      await api("/api/app/quit", {
+        method: "POST",
+        headers: { "X-PDF-OCR-Embed": "quit" },
+      });
+      setStatus("offline");
+    } catch (e) {
+      btn.disabled = false;
+      window.alert(I18N.t("header.quitFailed"));
+    }
+  };
 }
 
 init();

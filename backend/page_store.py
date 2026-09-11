@@ -25,6 +25,8 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from backend import pdf_processing
+
 log = logging.getLogger(__name__)
 
 
@@ -173,10 +175,9 @@ def _dpi_from_origin_pdf(origin_pdf: Optional[Path], page_no: int,
     if not origin_pdf or not Path(origin_pdf).exists():
         return None
     try:
-        import fitz
-        with fitz.open(origin_pdf) as doc:
-            page = doc[max(0, page_no - 1)]
-            width_inches = page.rect.width / 72.0
+        width_pt, _height_pt = pdf_processing.page_size_pt(
+            origin_pdf, max(0, page_no - 1))
+        width_inches = width_pt / 72.0
         if width_inches <= 0:
             return None
         return float(width_px) / width_inches

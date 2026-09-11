@@ -18,7 +18,6 @@ import zipfile
 from collections import deque
 from pathlib import Path
 
-import fitz  # PyMuPDF
 from fastapi.testclient import TestClient
 
 from backend import batch
@@ -26,6 +25,7 @@ from backend import cleanup as cleanup_mod
 from backend import ocr_service
 from backend import pdf_processing
 from backend.main import app
+from pdf_fixtures import page_count, pdf_bytes as make_pdf, write_pdf
 
 
 def _stub_lifespan(monkeypatch):
@@ -191,12 +191,7 @@ def _noop_run_ocr(*_args, **_kwargs):
 
 
 def _real_pdf(tag: str) -> bytes:
-    doc = fitz.open()
-    page = doc.new_page(width=100, height=100)
-    page.insert_text(fitz.Point(10, 50), tag)
-    data = doc.tobytes()
-    doc.close()
-    return data
+    return make_pdf(text=tag, width=100, height=100)
 
 
 def test_upload_accepts_multiple_files(monkeypatch, tmp_path):
@@ -271,12 +266,8 @@ def test_upload_rejects_empty_batch_and_empty_file(monkeypatch, tmp_path):
 
 def _make_embedded(job_id: str, tmp_path: Path, filename: str) -> dict:
     """Write a real tiny PDF on disk as the job's embedded output."""
-    doc = fitz.open()
-    page = doc.new_page(width=100, height=100)
-    page.insert_text(fitz.Point(10, 50), f"job {job_id}")
-    out = tmp_path / f"{job_id}_embedded.pdf"
-    doc.save(str(out), garbage=4, deflate=True)
-    doc.close()
+    out = write_pdf(tmp_path / f"{job_id}_embedded.pdf",
+                    text=f"job {job_id}", width=100, height=100)
     return _make_job(job_id, filename, embedded_path=str(out))
 
 
@@ -294,9 +285,7 @@ def test_zip_endpoint_returns_archive_with_source_names(monkeypatch, tmp_path):
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
             assert sorted(zf.namelist()) == ["paper-a.pdf", "paper-b.pdf"]
             for name in zf.namelist():
-                doc = fitz.open(stream=zf.read(name), filetype="pdf")
-                assert doc.page_count == 1
-                doc.close()
+                assert page_count(zf.read(name)) == 1
     finally:
         _drop_job("zip-aa")
         _drop_job("zip-bb")

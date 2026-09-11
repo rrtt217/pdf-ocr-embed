@@ -30,7 +30,8 @@ selectable / copyable **invisible text layer**. The OCR core is
 Tech: Python 3 + FastAPI backend, ocrmypdf (plugin: the standalone
 [`ocrmypdf_unlimited`](ocrmypdf_unlimited/README.md) package, with
 `backend/ocrmypad/` kept as a compatibility alias), vanilla-JS frontend,
-PyMuPDF (page previews), httpx. No CUDA/NVIDIA.
+pypdfium2 + pikepdf (the only two PDF libraries — see
+`backend/pdf_processing.py`), httpx. No PyMuPDF (AGPL), no CUDA/NVIDIA.
 **All coordinates are integers in raw pixel space** (top-left origin), which is
 the single most important invariant to preserve.
 
@@ -70,8 +71,22 @@ the single most important invariant to preserve.
 - `max_tokens` must stay `< 32768` (enforced by the plugin's own CLI arg too).
 - ocrmypdf runs must use `use_threads=True` (the engines are HTTP/IO-bound;
   a forked child could not report progress through the work files).
-- Runtime artifacts (`output/`, `work/`, `uploads/`, `.venv/`,
-  `backend/ocr_config.toml`) are gitignored. Never commit keys or large sample PDFs.
+- **Never derive a writable location from `Path(__file__)`.** In a packaged
+  build `__file__` points inside a read-only or temporary bundle
+  (`sys._MEIPASS`). Writable state comes from `backend/paths.py`
+  (`UPLOAD_DIR` / `WORK_DIR` / `OUTPUT_DIR` / `CONFIG_FILE` / `LOG_FILE`) and
+  read-only bundled assets from `paths.resource_dir()`. Add new locations
+  THERE, not ad hoc — and never write next to the code.
+- **Never start uvicorn with `reload=True`, `workers>1`, or the string form
+  `"pkg.mod:app"`.** The reloader/multi-process paths re-execute
+  `sys.executable`, which in a frozen app is the application itself. Use
+  `backend.server.EmbeddedServer` (background thread, `127.0.0.1`,
+  kernel-assigned port) or `backend.main.run()`, and call
+  `multiprocessing.freeze_support()` in every new entry point before heavy
+  imports.
+- Runtime artifacts (`output/`, `work/`, `uploads/`, `logs/`, `build/`,
+  `dist/`, `.venv/`, `backend/ocr_config.toml`) are gitignored. Never commit
+  keys or large sample PDFs.
 
 ## Layout
 
@@ -101,15 +116,21 @@ backend/
   ocr_service.py          # job flow on _pdf_to_hocr + _hocr_to_ocr_pdf
   models.py               # editor page JSON (OcrPage/OcrBlock compatible)
   export.py               # other-format export: markdown + LaTeX (pure builders)
-  pdf_processing.py       # page preview rendering (PyMuPDF)
+  paths.py                # path resolution: source checkout vs frozen bundle
+  server.py               # EmbeddedServer: uvicorn on a thread, 127.0.0.1, free port
+  lifecycle.py            # desktop mode flag + quit state (the WebUI Quit button)
+  pdf_processing.py       # the ONLY PDF-library seam (pypdfium2: previews/geometry/text)
   validation.py           # post-embed coverage report
   batch.py                # ZIP packaging (streamed)
   image_export.py         # markdown image embedding: crop image blocks -> zip/base64
   cleanup.py              # temp-file cleanup
   cli.py                  # headless CLI (python -m backend.cli)
+desktop.py                # desktop entry point (freeze_support, window, exit cleanup)
+packaging/                # desktop packaging: PyInstaller spec + build.py + README
 frontend/                 # index.html / style.css / app.js / i18n.js (no build)
 tests/                    # pytest suite (incl. tests/test_ocrmypdf_unlimited_plugin.py)
-requirements.txt
+requirements.txt          # server / CLI / test dependencies
+requirements-desktop.txt  # optional: pywebview + PyGObject + pyinstaller
 AGENTS.md  README.md  DESIGN.md  config.example.toml  .gitignore
 ```
 
@@ -264,10 +285,14 @@ def get_ocr_engine(options):
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
-# system deps (once): sudo apt-get install tesseract-ocr ghostscript
+# system deps (once): tesseract-ocr (only for the Tesseract engine);
+# ghostscript is OPTIONAL since OCRmyPDF 17.0 (needed only for PDF/A output)
 uvicorn backend.main:app --host 0.0.0.0 --port 8000   # or: python -m backend.main
 # health + engines:
 curl http://localhost:8000/api/health
 # headless:
 python -m backend.cli input.pdf -o output/out.pdf --pages 1-3
+# desktop app: run in source, or build a frozen bundle (see packaging/README.md)
+python desktop.py --no-window
+python packaging/build.py --clean && ./dist/pdf-ocr-embed/pdf-ocr-embed
 ```

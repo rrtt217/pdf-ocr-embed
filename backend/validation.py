@@ -2,16 +2,16 @@
 
 After ``embed_invisible_text`` writes the *invisible* text layer, the only way
 to know whether the output PDF really is searchable / faithful is to open it
-back up and read the text PyMuPDF sees.  This module re-opens the embedded PDF,
-extracts per-page text, and compares it against the OCR source pages
-(``backend.models.OcrPage``) that were embedded — the "can I trust this PDF?"
-closed loop of feature #17.
+back up and read the text layer back.  This module re-opens the embedded PDF,
+extracts per-page text (via ``backend.pdf_processing`` — pypdfium2), and
+compares it against the OCR source pages (``backend.models.OcrPage``) that were
+embedded — the "can I trust this PDF?" closed loop of feature #17.
 
 The comparison math lives in pure functions (``normalize_text``,
 ``token_coverage``, ``coverage``, ``text_metrics``, ``summarize_report``...)
-so it is unit-testable without any real PDF; only ``build_report`` touches
-PyMuPDF, and only defensively (missing / unreadable file -> an error dict, not
-a traceback).
+so it is unit-testable without any real PDF; only ``build_report`` touches a
+PDF library, and only defensively (missing / unreadable file -> an error dict,
+not a traceback).
 
 Validation only READS artifacts: it never modifies ``pdf_processing.py`` /
 ``ocr_service.py`` state, nor the embedded file itself.
@@ -26,8 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import fitz  # PyMuPDF
-
+from backend import pdf_processing
 from backend.models import OcrBlock, OcrPage
 
 log = logging.getLogger(__name__)
@@ -306,16 +305,17 @@ def build_report(embedded_pdf_path: str, ocr_pages: List[OcrPage]) -> Dict[str, 
     if not path.exists():
         return _error_report(f"embedded PDF not found: {path.name}")
     try:
-        with fitz.open(str(path)) as doc:
+        with pdf_processing.open_pdf(path) as doc:
             by_index = {p.page_index: p for p in ocr_pages}
             reports = []
             for idx in sorted(by_index):
                 page = by_index[idx]
-                embedded_text = doc[idx].get_text() if 0 <= idx < doc.page_count else ""
+                embedded_text = (doc.extract_text(idx)
+                                 if 0 <= idx < doc.page_count else "")
                 reports.append(page_report(page, embedded_text))
     except Exception as exc:  # noqa: BLE001
-        # PyMuPDF raises for truncated/corrupt files — surface as a report with
-        # an error flag instead of a 500 traceback.
+        # A truncated/corrupt file raises here — surface it as a report with an
+        # error flag instead of a 500 traceback.
         log.warning("validation: failed to read %s: %s", path.name, exc)
         return _error_report(f"could not read embedded PDF: {exc}")
     return {

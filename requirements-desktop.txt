@@ -1,0 +1,25 @@
+# Optional desktop-app extras: a native window and the bundler.
+#
+#   pip install -r requirements.txt -r requirements-desktop.txt
+#
+# The server, CLI and test suite do NOT need these — they are needed only to
+# run `python desktop.py` in windowed mode and to build the frozen bundle.
+
+# Renders the UI in the OS webview (WebView2 / WKWebView / WebKit2GTK).
+# Without it the app still runs and falls back to the system browser.
+pywebview>=6.0
+
+# Linux only: pywebview's GTK backend needs PyGObject, plus the system
+# WebKit2GTK runtime (Fedora: `dnf install python3-gobject webkit2gtk4.1`;
+# Debian/Ubuntu: `apt install python3-gi gir1.2-webkit2-4.1`).  macOS/Windows
+# use the bundled platform webview and need nothing extra here.
+#
+# Caveat: PyGObject is a C extension tied to the system gobject-introspection
+# ABI — 3.52+ needs girepository-2.0 (Fedora 41+, Ubuntu 25.04+), while older
+# systems need girepository-1.0 and PyGObject 3.50.  If the line below fails to
+# build, use pywebview's own extra instead, which pins the older, compatible
+# pair:  pip install "pywebview[gtk]"
+PyGObject>=3.50; sys_platform == "linux"
+
+# Freezing the app into a double-clickable bundle (Python 3.14 needs >=6.15).
+pyinstaller>=6.15

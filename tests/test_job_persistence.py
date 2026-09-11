@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import json
 
-import fitz
-
 from backend import ocr_service
 from backend.ocrmypad import parser as parser_mod
+from pdf_fixtures import pdf_bytes as make_pdf
 
 
 def _use_tmp_dirs(monkeypatch, tmp_path):
@@ -30,12 +29,7 @@ def _state_path(job):
 
 
 def _real_pdf(text: str = "hello page") -> bytes:
-    doc = fitz.open()
-    page = doc.new_page(width=200, height=200)
-    page.insert_text(fitz.Point(20, 100), text)
-    data = doc.tobytes()
-    doc.close()
-    return data
+    return make_pdf(text=text, width=200, height=200)
 
 
 def _write_sidecar(job, page_no: int, text: str = "block text"):

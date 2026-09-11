@@ -16,6 +16,7 @@ from backend import cleanup as cleanup_mod
 from backend import ocr_service
 from backend.main import app
 from backend.ocr_service import select_pages
+from pdf_fixtures import pdf_bytes as make_pdf
 
 
 def test_default_selects_all_pages():
@@ -123,8 +124,6 @@ def test_upload_route_threads_lang_to_run_ocr(monkeypatch, tmp_path):
     """The WebUI sends ``lang`` on upload; it must reach run_ocr's overrides
     as ``language`` (previously the form field was silently dropped and the
     engine always fell back to English)."""
-    import fitz
-
     from backend import ocr_service
 
     _stub_lifespan(monkeypatch)
@@ -138,10 +137,7 @@ def test_upload_route_threads_lang_to_run_ocr(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ocr_service, "run_ocr", fake_run_ocr)
 
-    doc = fitz.open()
-    doc.new_page(width=200, height=200)
-    pdf_bytes = doc.tobytes()
-    doc.close()
+    pdf_bytes = make_pdf(width=200, height=200)
 
     try:
         with TestClient(app) as client:
@@ -161,8 +157,6 @@ def test_upload_route_threads_page_range_to_run_ocr(monkeypatch, tmp_path):
     """The WebUI's per-file start flow sends ``page_start``/``page_end`` on
     upload; they must reach run_ocr's overrides (as ``pages``) so a first run
     can be restricted to a page range."""
-    import fitz
-
     _stub_lifespan(monkeypatch)
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
@@ -174,11 +168,7 @@ def test_upload_route_threads_page_range_to_run_ocr(monkeypatch, tmp_path):
 
     monkeypatch.setattr(ocr_service, "run_ocr", fake_run_ocr)
 
-    doc = fitz.open()
-    for _ in range(4):
-        doc.new_page(width=200, height=200)
-    pdf_bytes = doc.tobytes()
-    doc.close()
+    pdf_bytes = make_pdf(pages=4, width=200, height=200)
 
     try:
         with TestClient(app) as client:
@@ -198,8 +188,6 @@ def test_upload_route_open_end_range_resolves_to_page_count(monkeypatch,
                                                            tmp_path):
     """Only ``page_start`` given -> the range's end is filled from the
     document's page count (open-ended, like the retry flow's semantics)."""
-    import fitz
-
     _stub_lifespan(monkeypatch)
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
@@ -211,11 +199,7 @@ def test_upload_route_open_end_range_resolves_to_page_count(monkeypatch,
 
     monkeypatch.setattr(ocr_service, "run_ocr", fake_run_ocr)
 
-    doc = fitz.open()
-    for _ in range(4):
-        doc.new_page(width=200, height=200)
-    pdf_bytes = doc.tobytes()
-    doc.close()
+    pdf_bytes = make_pdf(pages=4, width=200, height=200)
 
     try:
         with TestClient(app) as client:
@@ -233,8 +217,6 @@ def test_upload_route_open_end_range_resolves_to_page_count(monkeypatch,
 
 def test_upload_route_rejects_invalid_page_range(monkeypatch, tmp_path):
     """Bad ranges are client errors (400) and never leave a job behind."""
-    import fitz
-
     _stub_lifespan(monkeypatch)
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
@@ -243,11 +225,7 @@ def test_upload_route_rejects_invalid_page_range(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr_service, "run_ocr",
                         lambda job_id, overrides=None: calls.append(job_id))
 
-    doc = fitz.open()
-    for _ in range(4):
-        doc.new_page(width=200, height=200)
-    pdf_bytes = doc.tobytes()
-    doc.close()
+    pdf_bytes = make_pdf(pages=4, width=200, height=200)
 
     try:
         with TestClient(app) as client:

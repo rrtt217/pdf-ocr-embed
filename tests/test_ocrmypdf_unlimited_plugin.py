@@ -26,6 +26,7 @@ from pathlib import Path
 import pytest
 
 from backend import ocr_service, page_store
+from pdf_fixtures import write_pdf
 
 PKG_DIR = Path(__file__).resolve().parents[1] / "ocrmypdf_unlimited"
 
@@ -264,11 +265,7 @@ def _stub_client(monkeypatch, raw=RAW):
 
 def _tiny_pdf(path: Path):
     """A blank (scanned-like) page PDF: no text layer, no prior OCR."""
-    import fitz
-    doc = fitz.open()
-    doc.new_page(width=200, height=100)  # pure image page
-    doc.save(path)
-    doc.close()
+    write_pdf(path, width=200, height=100)  # pure image page
 
 
 @pytest.mark.skipif(not ocr_service.plugin_available(),

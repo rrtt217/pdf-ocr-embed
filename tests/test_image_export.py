@@ -2,9 +2,8 @@
 
 Pins the pure geometry (raw-pixel bbox → PDF point clip), the deterministic
 crop filenames, the two resolver delivery modes (relative ZIP links vs base64
-data URIs) and the archive layout (``<stem>.md`` + ``images/``).  The crop
-rendering itself needs PyMuPDF + a real PDF and is exercised by the route
-smoke path, not here.
+data URIs) and the archive layout (``<stem>.md`` + ``images/``).  The actual
+crop rendering needs a real PDF and is covered in ``test_pdf_processing.py``.
 """
 from __future__ import annotations
 

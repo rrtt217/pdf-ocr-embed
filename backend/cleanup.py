@@ -32,14 +32,17 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from backend import paths
 from backend.config import resolve
 
 log = logging.getLogger(__name__)
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent
-WORK_DIR = PROJECT_DIR / "work"
-OUTPUT_DIR = PROJECT_DIR / "output"
-UPLOAD_DIR = PROJECT_DIR / "uploads"
+# The three writable areas this module sweeps: repo-relative in a source
+# checkout, a per-user data directory in a packaged build (backend/paths.py).
+PROJECT_DIR = paths.PROJECT_DIR
+WORK_DIR = paths.WORK_DIR
+OUTPUT_DIR = paths.OUTPUT_DIR
+UPLOAD_DIR = paths.UPLOAD_DIR
 
 # Work dirs hold per-job folders; the other two areas are scanned recursively.
 AREAS = ("work", "output", "uploads")

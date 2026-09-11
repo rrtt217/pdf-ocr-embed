@@ -31,7 +31,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
@@ -43,7 +43,7 @@ from backend import batch
 from backend import cleanup as cleanup_mod
 from backend import config, export as export_mod, export_llm
 from backend import image_export
-from backend import ocr_service, validation
+from backend import lifecycle, ocr_service, paths, validation
 from backend.logging_config import recent_logs, setup_logging
 
 setup_logging()
@@ -52,6 +52,18 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # A packaged build writes to a per-user directory that may not exist yet
+    # (and might be unwritable).  Create it up front so a misconfigured
+    # location is reported once, at startup, instead of surfacing as a
+    # traceback on the user's first upload.
+    try:
+        for folder in (paths.data_dir(), paths.WORK_DIR, paths.UPLOAD_DIR,
+                       paths.OUTPUT_DIR, paths.config_dir()):
+            paths.ensure_dir(folder)
+        log.info("runtime data directory: %s", paths.data_dir())
+    except OSError as exc:
+        log.error("cannot prepare the writable data directory %s: %s — "
+                  "uploads and OCR results will fail", paths.data_dir(), exc)
     # Bring back jobs persisted in work/<job_id>/job.json so a restart
     # resumes the task list (completed pages / embeds survive for retry).
     ocr_service.restore_jobs()
@@ -87,13 +99,16 @@ def _inject_plugin_settings() -> bool:
 
 app = FastAPI(title="PDF OCR Embed", version="1.0.0", lifespan=lifespan)
 
-# Served frontend lives in ../frontend relative to this package dir.
-BACKEND_DIR = Path(__file__).resolve().parent
-FRONTEND_DIR = BACKEND_DIR.parent / "frontend"
+# Served frontend assets: ``../frontend`` in a source checkout, the bundled
+# data directory when frozen (see backend/paths.py).
+FRONTEND_DIR = paths.FRONTEND_DIR
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # The WebUI is served same-origin, so CORS only needs to cover local
+    # development (any loopback port).  Keeping it off "*" also means a remote
+    # page cannot pass the preflight needed to send the quit header (below).
+    allow_origin_regex=r"^http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -165,7 +180,26 @@ def health() -> dict:
         "status": "ok",
         "adapters": ["unlimited", "tesseract"],
         "engines": engines,
+        # True when launched by desktop.py: the WebUI then offers a Quit button
+        # (the only way out in the browser-fallback mode).
+        "desktop": lifecycle.desktop_mode(),
     }
+
+
+@app.post("/api/app/quit")
+def app_quit(x_pdf_ocr_embed: Optional[str] = Header(None)) -> dict:
+    """Ask the desktop app to exit (used by the WebUI's Quit button).
+
+    Guarded by a custom header: cross-origin JavaScript cannot set one without
+    passing a CORS preflight, and CORS here only allows loopback origins — so a
+    random web page cannot shut the app down.  A plain server (not desktop
+    mode) is unaffected: the request simply sets a flag nothing waits on.
+    """
+    if (x_pdf_ocr_embed or "").strip().lower() != lifecycle.QUIT_HEADER_VALUE:
+        raise HTTPException(status_code=403, detail="missing quit confirmation header")
+    log.info("quit requested from the UI")
+    lifecycle.request_quit()
+    return {"status": "quitting"}
 
 
 @app.get("/api/logs")
@@ -1098,8 +1132,8 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
 
 @app.get("/api/validation/{job_id}")
 def validation_report(job_id: str):
-    """Re-validate an embedded output on demand: extract its text with
-    PyMuPDF and compare it against the stored OCR pages.
+    """Re-validate an embedded output on demand: extract its text layer and
+    compare it against the stored OCR pages.
 
     Returns the same report shape as the one baked into the embed response
     (``{"ok", "generated_at", "threshold", "summary", "pages"}``).  404 when
@@ -1144,11 +1178,31 @@ if FRONTEND_DIR.exists():
 
     app.add_middleware(NoCacheStaticMiddleware)
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+else:
+    # A packaged build that forgot to bundle frontend/ would otherwise show a
+    # bare 404 for the whole UI — make the cause obvious in the log.
+    log.error("frontend assets missing at %s — the UI will not load "
+              "(packaging must ship the frontend/ data directory)", FRONTEND_DIR)
 
 
-def run() -> None:
+def run(host: str = "127.0.0.1", port: int = 8000,
+        open_browser: bool = False) -> None:
+    """Run the WebUI server in the *foreground* (development convenience).
+
+    Freeze-safe: passes the app object, never enables the reloader, and binds
+    loopback only.  For the packaged desktop app use ``desktop.py``, which adds
+    a window, a kernel-assigned port and graceful shutdown.
+    """
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+
+    url = f"http://{host}:{port}/"
+    log.info("starting PDF OCR Embed on %s", url)
+    if open_browser:
+        import threading
+        import webbrowser
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    uvicorn.run(app, host=host, port=port, reload=False, workers=1,
+                access_log=False, log_config=None)
 
 
 if __name__ == "__main__":

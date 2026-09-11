@@ -4,12 +4,12 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-import fitz  # PyMuPDF
 from fastapi.testclient import TestClient
 
 from backend import ocr_service, pdf_processing, validation
 from backend.main import app
 from backend.models import OcrBlock, OcrPage, dict_to_page
+from pdf_fixtures import pdf_bytes as make_pdf, write_pdf
 
 
 # ---------------------------------------------------------------------------
@@ -122,12 +122,7 @@ def test_summarize_report_aggregates():
 # ---------------------------------------------------------------------------
 
 def _make_text_pdf(path: Path, text: str) -> Path:
-    doc = fitz.open()
-    page = doc.new_page(width=400, height=300)
-    page.insert_text((50, 50), text, fontsize=14)
-    doc.save(str(path), garbage=4, deflate=True)
-    doc.close()
-    return path
+    return write_pdf(path, text=text, width=400, height=300)
 
 
 def test_build_report_missing_file_returns_error():
@@ -184,11 +179,7 @@ def test_validation_api_endpoint(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr_service, "WORK_DIR", tmp_path / "work")
     monkeypatch.setattr(ocr_service, "UPLOAD_DIR", tmp_path / "uploads")
 
-    doc = fitz.open()
-    page = doc.new_page(width=400, height=300)
-    page.insert_text((50, 50), "api validation roundtrip", fontsize=14)
-    pdf_bytes = doc.tobytes(garbage=4, deflate=True)
-    doc.close()
+    pdf_bytes = make_pdf(text="api validation roundtrip", width=400, height=300)
 
     job = ocr_service.create_job("doc.pdf", pdf_bytes)
     p0 = {"page_index": 0, "width": 400, "height": 300, "blocks": [
@@ -216,11 +207,7 @@ def test_validation_api_endpoint(monkeypatch, tmp_path):
     # real finalize output the validation endpoint can extract text from.
     out_path = tmp_path / "output" / "embedded.pdf"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open()
-    page = doc.new_page(width=400, height=300)
-    page.insert_text((50, 50), "api validation roundtrip", fontsize=14)
-    doc.save(str(out_path), garbage=4, deflate=True)
-    doc.close()
+    write_pdf(out_path, text="api validation roundtrip", width=400, height=300)
     ocr_service._set(job["job_id"], embedded_path=str(out_path))
 
     with TestClient(app) as client:

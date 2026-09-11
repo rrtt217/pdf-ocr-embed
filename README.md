@@ -20,7 +20,8 @@
 
 - **OCR 核心 = OCRmyPDF**：栅格化、引擎调度、并发、文本层渲染（内置 fpdf2 渲染器）、
   graft 回写、PDF/A 与优化全部交给 [OCRmyPDF](https://github.com/ocrmypdf/OCRmyPDF)
-  （≥17.11，系统依赖 tesseract + ghostscript，无需 qpdf）。后端通过
+  （≥17.11，系统依赖见下：默认只需 tesseract，ghostscript 自 17.0 起已非必需，无需 qpdf）。
+  后端通过
   `ocrmypdf.api` 进程内调用其官方**编辑回写**通道：
   `_pdf_to_hocr`（OCR → 每页 hOCR）+ `_hocr_to_ocr_pdf`（编辑后合成最终 PDF）。
 - **unlimited-ocr 以独立 OCRmyPDF 插件实现**（[`ocrmypdf_unlimited/`](ocrmypdf_unlimited/README.md)，
@@ -65,11 +66,21 @@
 
 ## 安装
 
-**系统依赖**（OCRmyPDF 需要）：tesseract-ocr 与 ghostscript；无 qpdf 要求。
+**系统依赖**：
+
+- **tesseract-ocr** —— 仅当使用 **Tesseract (local)** 引擎时需要（Unlimited API 引擎
+  与 No OCR 都不需要）。中文需装语言包，如 `tesseract-ocr-chi-sim`。
+- **ghostscript** —— **自 OCRmyPDF 17.0.0 起已不是必需依赖**：默认的
+  `--rasterizer auto` 优先用 `pypdfium2`（纯 Python wheel）光栅化，`output_type="pdf"`
+  时完全不调用 `gs`。只有在输出 **PDF/A**（`ocrmypdf_output_type = "pdfa"`）或显式
+  强制 ghostscript 光栅化时才需要它。
+- 无 qpdf 要求；`clean`（unpaper）与 `optimize=2/3`（pngquant/jbig2enc）均为可选。
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get install tesseract-ocr ghostscript
+# Debian/Ubuntu —— 只跑 Unlimited API 引擎时，tesseract/ghostscript 都可省
+sudo apt-get install tesseract-ocr            # 使用本地 Tesseract 引擎时
+sudo apt-get install tesseract-ocr-chi-sim    # 中文语言包（可选）
+sudo apt-get install ghostscript              # 仅输出 PDF/A 时需要
 cd /home/david/vibe-arena/pdf-ocr-embed
 python3 -m venv .venv
 source .venv/bin/activate
@@ -198,7 +209,7 @@ uvicorn backend.main:app --port 8000
 读入内存；请求的任务中没有任何嵌入结果时返回 404，有结果的任务会正常包含在内。
 ### 嵌后自动校验 + 质量报告
 
-嵌入完成后，后端会用 PyMuPDF 重新抽取嵌入输出的文字层，与 OCR 源文本逐页比对
+嵌入完成后，后端会用 pypdfium2 重新抽取嵌入输出的文字层，与 OCR 源文本逐页比对
 （`backend/validation.py`），给出一份「这份 PDF 能不能信」的报告：
 
 - 页级 **覆盖率**（容忍换行/标点差异的 token 重叠 + 字符连续度）、源/嵌字符数
@@ -315,6 +326,39 @@ API key 等配置仍走 `resolve()`（TOML / 环境变量），不做任何硬�
 
 ---
 
+## 打包为桌面应用
+
+用 PyInstaller 产出一个可双击运行的桌面构建（onedir，Linux 约 199MB）：
+
+```bash
+pip install -r requirements.txt -r requirements-desktop.txt
+python packaging/build.py --clean
+./dist/pdf-ocr-embed/pdf-ocr-embed        # 原生窗口（pywebview），缺失则退回系统浏览器
+./dist/pdf-ocr-embed/pdf-ocr-embed --no-window   # 只起服务，便于冒烟测试
+```
+
+细节见 [`packaging/README.md`](packaging/README.md)。要点：
+
+- **原生窗口**用 pywebview 渲染系统 WebView（WebView2 / WKWebView / WebKit2GTK）；
+  关闭窗口即退出。若 pywebview 缺失或后端起不来，会**退回系统浏览器**而不是失败。
+- **退出按钮**：由 `desktop.py` 启动时，WebUI 页头会多出一个 **Quit** 按钮
+  （`/api/health` 的 `desktop: true`），调用 `POST /api/app/quit`——浏览器回退模式下
+  这是唯一的退出方式。该接口要求自定义请求头，且 CORS 只允许 loopback 源，
+  因此普通网页无法通过预检来关掉你的程序。
+- **只监听 `127.0.0.1` 的随机空闲端口**，用后台线程跑 uvicorn（`backend/server.py`）；
+  入口 `desktop.py` 负责 `multiprocessing.freeze_support()`、开窗与退出清理
+  （退出时按项目既有的 `cancel` 契约优雅停止在跑的 OCR 任务）。
+- **打包后数据/配置/日志写入用户目录**（`backend/paths.py`，基于 `platformdirs`），
+  不再写安装目录。因此打包版**不会读取仓库里的 `backend/ocr_config.toml`**——
+  请用 WebUI 设置页配置，或用 `OCR_*` 环境变量覆盖。
+- **Tesseract 引擎需要系统装有 `tesseract`**（PyInstaller 不会自动打包它）；
+  Unlimited API 引擎不需要任何本地二进制。**Ghostscript 自 OCRmyPDF 17.0 起为可选**
+  （仅 PDF/A 输出需要）。
+- 需在**每个目标系统上分别构建**（PyInstaller 不能交叉编译）；
+  安装器与代码签名/公证尚未包含。
+
+---
+
 ## 目录结构
 
 ```
@@ -331,20 +375,24 @@ pdf-ocr-embed/
 │   │   └── text_norm.py        # 数学/表格文本规范化
 │   ├── errors.py               # UnavailableError + 1000 画布 → 像素坐标换算
 │   ├── http_retry.py           # HTTP 重试/限速（引擎 API 调用）
+│   ├── paths.py                # 路径解析：源码仓库 vs 打包后（只读资源 / 可写用户目录）
+│   ├── server.py               # 嵌入式服务器（后台线程 + 127.0.0.1 随机端口，冻结安全）
 │   ├── ocr_service.py          # OCRmyPDF 编排（_pdf_to_hocr + _hocr_to_ocr_pdf）+ 任务状态
 │   ├── models.py               # 编辑器页 JSON 结构（OcrPage/OcrBlock 兼容）
-│   ├── pdf_processing.py       # 页面预览渲染（PyMuPDF）
+│   ├── pdf_processing.py       # 唯一的 PDF 库访问层（pypdfium2：预览/几何/文本）
 │   ├── validation.py           # 嵌后校验（覆盖率报告）
 │   ├── batch.py                # ZIP 打包（流式）
 │   ├── cleanup.py              # 临时文件清理
-│   ├── logging_config.py       # 日志
+│   ├── logging_config.py       # 日志（打包后额外落文件）
 │   └── cli.py                  # 无头 CLI（python -m backend.cli）
+├── desktop.py                  # 桌面入口（freeze_support + 窗口 + 退出清理）
+├── packaging/                  # 桌面打包（PyInstaller spec / 构建脚本 / 说明）
 ├── frontend/
 │   ├── index.html
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
-├── tests/                      # pytest 测试（146 项）
+├── tests/                      # pytest 测试（406 项）
 ├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml

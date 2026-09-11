@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from backend import ocr_service, pdf_processing
+from backend import ocr_service, paths, pdf_processing
 from backend.errors import UnavailableError
 from backend.logging_config import setup_logging
 
@@ -141,7 +141,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    out_dir = Path(__file__).resolve().parent.parent / "output"
+    out_dir = paths.OUTPUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = (Path(args.output) if args.output else
                    out_dir / f"{input_path.stem}_embedded_{uuid.uuid4().hex[:8]}.pdf")

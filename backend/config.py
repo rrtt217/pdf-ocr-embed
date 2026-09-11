@@ -19,6 +19,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+from backend import paths
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
@@ -26,9 +28,12 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
 
 log = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
+# Where ``ocr_config.toml`` lives: repo-relative in a source checkout, a
+# per-user config directory in a packaged build (see backend/paths.py).  Kept
+# as module globals so tests can monkeypatch ``config.CONFIG_FILE``.
+BASE_DIR = paths.config_dir()
 BACKEND_DIR = BASE_DIR
-CONFIG_FILE = BACKEND_DIR / "ocr_config.toml"
+CONFIG_FILE = paths.CONFIG_FILE
 
 # Provider presets (only a *default example* for USTC; any OpenAI-compatible
 # endpoint works via base_url + api_key + model).
@@ -306,6 +311,9 @@ def save(settings: Dict[str, Any]) -> Dict[str, Any]:
         if settings.get(key) is not None:
             data[key] = str(settings[key]).strip()
 
+    # The config lives in a writable per-user directory when packaged; make
+    # sure it exists (a source checkout already has backend/).
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(_dump_toml(data), encoding="utf-8")
     _saved.update(data)
     return get_effective_settings()

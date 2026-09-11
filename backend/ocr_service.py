@@ -30,16 +30,17 @@ from collections import deque
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
-import fitz  # PyMuPDF
-
-from backend import page_store, pdf_processing
+from backend import page_store, paths, pdf_processing
 from backend.config import as_bool, redact_secrets, resolve
 from backend.errors import UnavailableError
 
 log = logging.getLogger(__name__)
 
-UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
-WORK_DIR = Path(__file__).resolve().parent.parent / "work"
+# Writable runtime state: repo-relative in a source checkout, a per-user data
+# directory in a packaged build (see backend/paths.py).  Kept as module
+# globals so the test suite can monkeypatch them.
+UPLOAD_DIR = paths.UPLOAD_DIR
+WORK_DIR = paths.WORK_DIR
 
 # In-memory jobs: job_id -> job dict.
 _JOBS: Dict[str, dict] = {}
@@ -82,7 +83,15 @@ def plugin_auto_loaded() -> bool:
     In that case the plugin must NOT also be passed in ``plugins=``: pluggy
     rejects registering the same module twice, so the app only requests it
     explicitly when it is NOT auto-loaded.
+
+    Frozen builds always answer ``False``: ``importlib.metadata`` needs the
+    plugin's ``.dist-info`` directory, which packaging deliberately does not
+    collect (see ``packaging/pdf_ocr_embed.spec``).  Requesting the plugin by
+    dotted module name instead is both reliable in a bundle and avoids the
+    duplicate-registration trap described above.
     """
+    if paths.is_frozen():
+        return False
     try:
         entries = importlib.metadata.entry_points()
     except Exception:  # noqa: BLE001  (metadata query must never break OCR)
@@ -165,8 +174,7 @@ def create_job(filename: str, contents: bytes) -> dict:
     job["hocr_dir"] = str(jdir / "hocr")
     job["previews_dir"] = str(jdir / "previews")
     try:
-        with fitz.open(pdf_path) as doc:
-            job["num_pages"] = doc.page_count
+        job["num_pages"] = pdf_processing.page_count(pdf_path)
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Cannot open uploaded PDF: {exc}") from exc
     import time
@@ -625,10 +633,10 @@ def update_page(job_id: str, page_index: int, payload: dict) -> int:
         # A derived page without geometry: fall back to the source PDF page.
         try:
             with pdf_processing.open_pdf(job["pdf_path"]) as doc:
-                pg = doc[max(0, page_no - 1)]
+                width_pt, height_pt = doc.page_size_pt(max(0, page_no - 1))
                 zoom = 300.0 / 72.0
-                hocr_w = int(round(pg.rect.width * zoom))
-                hocr_h = int(round(pg.rect.height * zoom))
+                hocr_w = int(round(width_pt * zoom))
+                hocr_h = int(round(height_pt * zoom))
             page["width"], page["height"] = hocr_w, hocr_h
         except Exception:  # noqa: BLE001
             log.debug("geometry fallback failed for page %s", page_no,

@@ -31,8 +31,10 @@
 实现保留在上游。
 
 ## 技术栈
-- **OCR 核心**：OCRmyPDF ≥17.11（`pip install ocrmypdf`；系统依赖 tesseract、
-  ghostscript）。文本层渲染用其内置 **fpdf2** 渲染器（无需 qpdf）。
+- **OCR 核心**：OCRmyPDF ≥17.11（`pip install ocrmypdf`；系统依赖 tesseract，且仅
+  使用本地 Tesseract 引擎时需要）。栅格化默认用 **pypdfium2**，因此 **ghostscript 自
+  OCRmyPDF 17.0 起为可选**（仅 PDF/A 输出需要）。文本层渲染用其内置 **fpdf2** 渲染器
+  （无需 qpdf）。
 - **后端**：FastAPI + `ocrmypdf.api`（进程内调用，不 shell out）。
 - **unlimited-ocr 引擎**：OpenAI 兼容视觉 API（USTC `unlimited-ocr` 模型），输出
   `<|det|>` 标记流，由插件解析。
@@ -89,7 +91,7 @@ hooks；不 import 本应用任何模块（`backend/ocrmypad/` 仅为旧入口�
 
 ## 数据流（任务流水线）
 
-1. `POST /api/ocr/upload` → `create_job`（fitz 校验 + 页数）→ 后台线程跑 OCR 阶段。
+1. `POST /api/ocr/upload` → `create_job`（pypdfium2 校验 + 页数）→ 后台线程跑 OCR 阶段。
 2. **OCR 阶段**：`_pdf_to_hocr`（`mode=force` 等 OcrOptions 来自 config + 请求覆盖）
    → 插件引擎逐页 OCR → `work/<job>/hocr/000001_ocr_hocr.hocr` +
    `000001_ocr_hocr.blocks.json`（WebUI 的可编辑表示）+ sidecar 文本。
@@ -139,7 +141,7 @@ hooks；不 import 本应用任何模块（`backend/ocrmypad/` 仅为旧入口�
 | `POST /api/ocr/stop/{job_id}` | 请求停止（引擎逐页检查取消标志） |
 | `GET /api/pages/{job_id}` | 已完成页（块 sidecar JSON，含 `parse_version`） |
 | `POST /api/pages/{job_id}/{i}` | 编辑页 → 写 sidecar + 重生成 hOCR |
-| `GET /api/pages/{job_id}/{i}/image` | 页面预览 PNG（PyMuPDF 渲染） |
+| `GET /api/pages/{job_id}/{i}/image` | 页面预览 PNG（pypdfium2 渲染） |
 | `POST /api/embed/{job_id}` | finalize（`optimize`、`output_type`）+ 校验报告 |
 | `GET /api/validation/{job_id}` | 按需重跑校验 |
 | `GET /api/download/{job_id}.pdf` | 下载结果 |
