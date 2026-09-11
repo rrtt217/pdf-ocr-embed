@@ -3,18 +3,23 @@
 
 Starts the frozen executable headless, checks that the UI and API answer, that
 the plugin is importable, then quits it through the real Quit endpoint and
-asserts a clean exit.  Used by CI and handy locally::
+asserts a clean exit.  With ``--ocr`` it also runs a **real OCR job** through
+the app's local Tesseract and asserts the produced PDF has a text layer.  Used
+by CI and handy locally::
 
     python packaging/smoke_test.py
+    python packaging/smoke_test.py --expect-tesseract --ocr
     python packaging/smoke_test.py --exe dist/pdf-ocr-embed/pdf-ocr-embed
 
-Cross-platform (Linux/macOS/Windows) and dependency-light: stdlib only, so it
-runs before anything else is installed.  Exits non-zero with the captured log
-on failure.
+Cross-platform (Linux/macOS/Windows) and dependency-light: the base checks are
+stdlib only, so it runs before anything else is installed.  ``--ocr`` lazily
+imports fpdf2 / pypdfium2 / Pillow (all normal app dependencies) to build its
+scanned-page fixture.  Exits non-zero with the captured log on failure.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import socket
@@ -59,6 +64,128 @@ _SYSTEM_LIB_RE = re.compile(
     r"^(libc|libm|libdl|libpthread|librt|libutil|libnsl|libresolv|libcrypt"
     r"|ld-linux|ld-musl)[.-]"
 )
+
+# Short, OCR-friendly English text for the end-to-end run.
+OCR_FIXTURE_TEXT = "The quick brown fox 12345"
+OCR_EXPECTED = "quick"
+
+
+def _post_multipart(url: str, fields: dict[str, str], filename: str,
+                    payload: bytes, timeout: float = 120.0):
+    """POST a multipart/form-data body with the stdlib (no httpx needed)."""
+    boundary = "----pdf-ocr-embed-smoke-boundary"
+    chunks: list[bytes] = []
+    for name, value in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"'
+            f"\r\n\r\n{value}\r\n".encode())
+    chunks.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="files"; '
+        f'filename="{filename}"\r\nContent-Type: application/pdf\r\n\r\n'
+        .encode())
+    chunks.append(payload)
+    chunks.append(f"\r\n--{boundary}--\r\n".encode())
+    body = b"".join(chunks)
+
+    request = urllib.request.Request(
+        url, data=body, method="POST",
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}",
+                 "Content-Length": str(len(body))})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+def _scanned_pdf(path: Path, text: str) -> Path:
+    """A single-page, **image-only** PDF whose pixels spell ``text``.
+
+    Laid out with fpdf2 (core font), rasterized with pypdfium2 and re-wrapped
+    with Pillow — so the file carries no text layer at all and the OCR run has
+    to produce one.  Imported lazily: this is the only check needing more than
+    the standard library.
+    """
+    from fpdf import FPDF
+    import pypdfium2 as pdfium
+    from PIL import Image
+
+    doc = FPDF(unit="pt", format=(600.0, 200.0))
+    doc.set_auto_page_break(False)
+    doc.add_page()
+    doc.set_font("helvetica", size=30)
+    doc.text(40, 110, text)
+    rendered = bytes(doc.output())
+
+    source = pdfium.PdfDocument(rendered)
+    bitmap = source[0].render(scale=200 / 72)      # ~200 dpi, OCR-friendly
+    bitmap.to_pil().convert("RGB").save(path, format="PDF", resolution=200.0)
+    return path
+
+
+def check_ocr_pipeline(url: str, workdir: Path, timeout: float,
+                       label: str = "tesseract") -> list[str]:
+    """Run a real OCR job through the frozen app and assert a text layer.
+
+    This is what proves the whole chain on the target OS: upload -> OCRmyPDF ->
+    tesseract -> hOCR -> invisible text layer -> downloadable searchable PDF.
+    The earlier checks only show the pieces are present.
+    """
+    import pypdfium2 as pdfium            # already a hard app dependency
+
+    failures: list[str] = []
+    fixture = _scanned_pdf(workdir / "scan.pdf", OCR_FIXTURE_TEXT)
+    print(f"smoke: running a real OCR job ({label} engine)")
+
+    status, body = _post_multipart(
+        url + "api/ocr/upload",
+        {"ocr_engine": label, "lang": "eng", "page_start": "1", "page_end": "1"},
+        fixture.name, fixture.read_bytes())
+    if status != 200:
+        return [f"OCR upload -> {status}: {body[:200]!r}"]
+    job_id = json.loads(body)["job_id"]
+
+    state = None
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = get(url + "api/jobs")
+        listed = json.loads(body)
+        listed = listed if isinstance(listed, list) else listed.get("jobs", [])
+        job = next((j for j in listed if j.get("job_id") == job_id), None)
+        state = (job or {}).get("status")
+        if state in ("done", "error", "stopped"):
+            break
+        time.sleep(2)
+    if state != "done":
+        return [f"OCR job {job_id} ended as {state!r} "
+                f"(did not finish within {timeout:.0f}s)"]
+    print(f"smoke: OCR job {job_id} finished")
+
+    request = urllib.request.Request(
+        url + f"api/embed/{job_id}",
+        data=json.dumps({"job_id": job_id}).encode(), method="POST",
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=300) as resp:
+            embed_status = resp.status
+    except urllib.error.HTTPError as exc:
+        embed_status = exc.code
+    if embed_status != 200:
+        return [f"embed -> {embed_status}"]
+
+    status, pdf_bytes = get(url + f"api/download/{job_id}.pdf", timeout=300)
+    if status != 200 or len(pdf_bytes) < 1000:
+        return [f"download -> {status} ({len(pdf_bytes)} bytes)"]
+
+    document = pdfium.PdfDocument(pdf_bytes)
+    text = document[0].get_textpage().get_text_range()
+    print(f"smoke: text layer has {len(text)} chars: {text.strip()[:80]!r}")
+    if not text.strip():
+        failures.append("embedded PDF has no text layer")
+    elif OCR_EXPECTED not in text.lower():
+        failures.append(f"text layer is missing {OCR_EXPECTED!r}: "
+                        f"{text.strip()[:120]!r}")
+    return failures
 
 
 def _is_host_library(name: str, resolved: str) -> bool:
@@ -186,6 +313,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="seconds to wait for the server to come up")
     parser.add_argument("--expect-tesseract", action="store_true",
                         help="fail unless the app reports a bundled tesseract")
+    parser.add_argument("--ocr", action="store_true",
+                        help="also run a real OCR job and assert the output PDF "
+                             "has a text layer (needs a tesseract to run)")
+    parser.add_argument("--ocr-timeout", type=float, default=240.0,
+                        help="seconds to allow the OCR job (default: 240)")
     args = parser.parse_args(argv)
 
     exe = find_executable(args.exe)
@@ -254,7 +386,11 @@ def main(argv: list[str] | None = None) -> int:
                 if args.expect_tesseract and b'"source":"bundled"' not in compact:
                     fail("no bundled tesseract (health did not report "
                          "'source: bundled')")
-                # 3. quitting is guarded, then works
+                # 3. a real OCR run produces a searchable PDF
+                if args.ocr:
+                    failures.extend(check_ocr_pipeline(url, workdir,
+                                                       args.ocr_timeout))
+                # 4. quitting is guarded, then works
                 status, _ = post(url + "api/app/quit", {})
                 if status != 403:
                     fail(f"quit without header -> {status} (expected 403)")

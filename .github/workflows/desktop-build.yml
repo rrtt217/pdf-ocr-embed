@@ -129,11 +129,14 @@ jobs:
 
       # Only demand a bundled Tesseract when the staging step actually produced
       # one, so a runner without a host tesseract does not fail the build.
+      # With Tesseract present we also run the FULL pipeline on this OS:
+      # upload -> OCRmyPDF -> tesseract -> invisible text layer -> download,
+      # asserting the produced PDF is actually searchable.
       - name: Smoke test the bundle
         shell: bash
         run: |
           if [ -d packaging/tesseract-staging ]; then
-            python packaging/smoke_test.py --expect-tesseract
+            python packaging/smoke_test.py --expect-tesseract --ocr
           else
             python packaging/smoke_test.py
           fi
