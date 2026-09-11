@@ -61,12 +61,10 @@ def log(message: str) -> None:
 
 # --- locating the host installation -----------------------------------------
 
-def find_tesseract() -> Path:
+def find_tesseract() -> Path | None:
+    """The host tesseract, or None when there is none to copy from."""
     found = shutil.which("tesseract")
-    if not found:
-        sys.exit("[tesseract] no `tesseract` on PATH — install it first "
-                 "(apt: tesseract-ocr, brew: tesseract, choco: tesseract)")
-    return Path(found).resolve()
+    return Path(found).resolve() if found else None
 
 
 def find_tessdata(exe: Path) -> Path | None:
@@ -116,27 +114,40 @@ def _ldd_closure(binary: Path) -> list[Path]:
 
 
 def _otool_closure(binary: Path) -> list[Path]:
-    """macOS: the dylibs the binary links against (non-system ones only).
+    """macOS: the dylib closure, walked recursively.
 
-    Kept unresolved for the same reason as :func:`_ldd_closure` — the install
-    name the loader asks for is the symlink, not its target.
+    ``otool -L`` lists only **direct** dependencies (unlike ``ldd``, which is
+    already transitive), so restricting the walk to the binary itself misses
+    everything libtesseract's own dependencies need.
+
+    Paths are kept unresolved for the same reason as :func:`_ldd_closure` — the
+    install name the loader asks for is the symlink, not its target.
     """
-    try:
-        out = subprocess.run(["otool", "-L", str(binary)], capture_output=True,
-                             text=True, check=False).stdout
-    except OSError as exc:
-        log(f"otool failed ({exc}); skipping the library closure")
-        return []
-    libs: list[Path] = []
-    for line in out.splitlines()[1:]:
-        path = line.strip().split(" (")[0]
-        if not path.startswith("/"):
-            continue
-        if path.startswith(("/usr/lib/", "/System/")):
-            continue          # provided by the OS
-        if Path(path).exists():
-            libs.append(Path(path))
-    return libs
+    seen: set[Path] = set()
+    result: list[Path] = []
+
+    def visit(path: Path) -> None:
+        try:
+            out = subprocess.run(["otool", "-L", str(path)], capture_output=True,
+                                 text=True, check=False).stdout
+        except OSError as exc:
+            log(f"otool failed on {path.name} ({exc})")
+            return
+        for line in out.splitlines()[1:]:
+            lib = line.strip().split(" (")[0]
+            if not lib.startswith("/"):
+                continue          # @rpath / @loader_path: handled by the copy
+            if lib.startswith(("/usr/lib/", "/System/")):
+                continue          # provided by the OS
+            candidate = Path(lib)
+            if candidate in seen or not candidate.exists():
+                continue
+            seen.add(candidate)
+            result.append(candidate)
+            visit(candidate)
+
+    visit(binary)
+    return result
 
 
 def _bundleable(lib: Path) -> bool:
@@ -245,12 +256,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.clean:
         shutil.rmtree(out, ignore_errors=True)
 
-    try:
-        exe = find_tesseract()
-    except SystemExit as exc:
+    exe = find_tesseract()
+    if exe is None:
+        message = ("no `tesseract` on PATH — install it first "
+                   "(apt: tesseract-ocr, brew: tesseract, choco: tesseract)")
         if args.require:
-            raise
-        log(str(exc))
+            log(message)
+            return 1
+        log(message)
         log("skipping tesseract bundling — the app will need a system tesseract")
         return 0
 
