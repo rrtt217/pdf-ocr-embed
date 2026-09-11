@@ -61,7 +61,7 @@ def _serve_until_quit() -> None:
         pass
 
 
-def _preferred_gui() -> str | None:
+def _preferred_gui(forced: str | None = None) -> str | None:
     """Name a GUI backend to force, or None to let pywebview choose.
 
     pywebview probes every backend in turn and logs a full traceback for each
@@ -70,7 +70,13 @@ def _preferred_gui() -> str | None:
     front when GTK/WebKit is usable — that is the backend
     ``requirements-desktop.txt`` installs.  Elsewhere we keep auto-detection
     (WebView2 on Windows, WKWebView on macOS).
+
+    ``forced`` comes from ``--gui`` and wins over the detection, so a user
+    whose GTK stack is broken (or who prefers the Qt/WebEngine renderer) can
+    pick a backend explicitly.
     """
+    if forced:
+        return forced
     if not sys.platform.startswith("linux"):
         return None
     try:
@@ -119,6 +125,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="use the system browser instead of a native window")
     parser.add_argument("--no-window", action="store_true",
                         help="serve only; open no window (smoke tests, CI)")
+    parser.add_argument("--gui", default=None,
+                        help="force a pywebview backend (e.g. gtk, qt); "
+                             "default: GTK on Linux when usable, else auto")
     args = parser.parse_args(argv)
 
     from backend import lifecycle, paths
@@ -158,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
                 import webview
 
                 # blocks until the last window is closed
-                webview.start(gui=_preferred_gui())
+                webview.start(gui=_preferred_gui(args.gui))
             except Exception as exc:  # noqa: BLE001 - GUI backend unavailable
                 log.warning("native window failed to start (%s); "
                             "falling back to the system browser", exc)

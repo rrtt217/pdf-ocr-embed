@@ -48,6 +48,28 @@ On Linux the native window needs system GTK/WebKit at runtime — for the
 `python3-gobject` + `webkit2gtk4.1` (Fedora) / `python3-gi` +
 `gir1.2-webkit2-4.1` (Debian).
 
+`--gui <backend>` overrides the choice (e.g. `--gui qt`), for a machine whose
+GTK/WebKit stack is unusable. Note that only **GTK is bundled**; see below.
+
+### Why GTK and not Qt
+
+Qt is deliberately *not* used, even though pywebview supports it and it works
+from a source checkout (verified: a Qt window opens and the app runs with
+`--gui qt`):
+
+| | GTK / WebKit2GTK | Qt / PyQt6-WebEngine |
+| --- | --- | --- |
+| Bundle size | **242 MB** | **795 MB** (measured) — PyQt6 alone is 494 MB |
+| Licence of the Python bindings | PyGObject is **LGPL-2.1+** | PyQt6 is **GPL-3.0-only** (or commercial from Riverbank) |
+| Collected by PyInstaller automatically | yes | **no** — qtpy picks its binding dynamically, so PyInstaller reports every `PyQt6.*` module as missing |
+| Frozen build | works | `qtpy.QtBindingsNotFoundError: No Qt bindings could be found`, then silently falls back to GTK |
+
+The GPL-3.0 bindings would undo the point of having removed the AGPL PyMuPDF,
+and nearly triple the download. If Qt were ever wanted, the licensing-clean
+route is **PySide6** (LGPL-3.0, the official Qt for Python) plus real
+QtWebEngine bundling work — plugins, resources and `QtWebEngineProcess` all
+need explicit handling.
+
 ## What the build produces
 
 ```
