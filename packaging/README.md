@@ -219,16 +219,29 @@ window. Windows (WebView2) and macOS (WKWebView) need no extra system packages.
 
 ### Verified on GitHub Actions
 
-| Job | Result | Notes |
-| --- | --- | --- |
-| Test suite | ✅ ~40 s | pytest on a clean `ubuntu-latest` + Python 3.14 |
-| Build linux-x86_64 | ✅ ~2 m | GTK bundled; artifact **105 MB** zipped |
-| Build windows-x86_64 | ✅ ~2 m | no GTK (system WebView2); **58 MB** |
-| Build macos-arm64 | ✅ ~1.5 m | no GTK (system WKWebView); **60 MB** |
+Every push builds all three platforms, and each bundle's **own** Tesseract is
+executed with only the libraries and language data inside that bundle:
 
-All three run `smoke_test.py` against the frozen binary and pass. The
-Windows/macOS *window* itself is not exercised in CI (no interactive session),
-only the headless app — that part is verified on Linux.
+| Job | Result | Tesseract staged | Artifact |
+| --- | --- | --- | --- |
+| Test suite | ✅ ~40 s | — | pytest on clean `ubuntu-latest` + Python 3.14 |
+| Build linux-x86_64 | ✅ ~2 m | 54 files | **152 MB** zipped (GTK + Tesseract) |
+| Build windows-x86_64 | ✅ ~2.5 m | 73 files | **136 MB** (Tesseract, system WebView2) |
+| Build macos-arm64 | ✅ ~1.5 m | 15 files | **69 MB** (Tesseract, system WKWebView) |
+
+On all three, CI reports `bundled tesseract runs; languages: ['chi_sim', 'eng']`.
+Each also runs `smoke_test.py`, which additionally asserts the frontend and
+`/api/health` answer, that the `unlimited` plugin imported, that
+`POST /api/app/quit` is **403** without its confirmation header, and that the
+process then exits 0 — so a bundle that merely built but cannot run still fails
+the job. (The Tesseract *install* and the GTK step are `continue-on-error`: a
+runner that cannot provide them still produces a working bundle, just one that
+needs a system Tesseract / falls back to the browser.)
+
+The Windows/macOS **windows** are not exercised in CI (no interactive session),
+only the headless app, and a full OCR run through OCRmyPDF was verified on
+Linux. What CI does prove on every platform is that the shipped Tesseract
+executes and finds its language data.
 
 Inspect a run with the GitHub CLI:
 
@@ -243,5 +256,7 @@ gh run download <run-id>           # fetch the artifacts
 > If `gh` reports `open ~/.cache/gh/...: read-only file system` (sandboxed
 > shells), point its cache somewhere writable: `XDG_CACHE_HOME=$PWD/.ghcache`.
 
-Not yet done: installers (Inno Setup / `.dmg` / AppImage), code
-signing + macOS notarization, and bundling Tesseract for fully-offline use.
+Not yet done: installers (Inno Setup / `.dmg` / AppImage), code signing +
+macOS notarization, and a full OCR pass through OCRmyPDF on Windows/macOS
+(CI proves the bundled Tesseract runs there, but only Linux runs the whole
+upload → OCR → embed pipeline end to end).
