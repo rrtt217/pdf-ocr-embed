@@ -36,6 +36,29 @@ datas = [
 # OCRmyPDF ships small runtime data; harmless when empty.
 datas += collect_data_files("ocrmypdf")
 
+# --- optional bundled Tesseract ----------------------------------------------
+# Staged by `python packaging/bundle_tesseract.py`, which the build runs with
+# --with-tesseract.  Installing the program + its shared libraries + language
+# data is what lets the Tesseract engine work on a machine with nothing
+# installed; `backend.bundled_tools` wires PATH/LD_LIBRARY_PATH/TESSDATA_PREFIX
+# to this directory.  Executables and libraries go through `binaries` so their
+# permission bits and (on macOS) their install names are handled properly.
+TESSERACT_STAGING = ROOT / "packaging" / "tesseract-staging"
+binaries = []
+if (TESSERACT_STAGING / "bin").is_dir():
+    binaries += [(str(p), "tesseract/bin")
+                 for p in sorted((TESSERACT_STAGING / "bin").iterdir())
+                 if p.is_file()]
+    if (TESSERACT_STAGING / "lib").is_dir():
+        binaries += [(str(p), "tesseract/lib")
+                     for p in sorted((TESSERACT_STAGING / "lib").iterdir())
+                     if p.is_file()]
+    if (TESSERACT_STAGING / "tessdata").is_dir():
+        datas += [(str(TESSERACT_STAGING / "tessdata"), "tesseract/tessdata")]
+    print(f"[spec] bundling tesseract ({len(binaries)} binary/lib file(s))")
+else:
+    print("[spec] no tesseract staged — the app will need a system tesseract")
+
 # --- metadata ----------------------------------------------------------------
 # Some libraries read their own version at runtime via importlib.metadata.
 # NOTE: deliberately NOT copy_metadata("ocrmypdf-unlimited") — see the module
@@ -84,7 +107,7 @@ excludes = [
 a = Analysis(
     [str(ROOT / "desktop.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

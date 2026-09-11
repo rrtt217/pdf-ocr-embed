@@ -43,7 +43,7 @@ from backend import batch
 from backend import cleanup as cleanup_mod
 from backend import config, export as export_mod, export_llm
 from backend import image_export
-from backend import lifecycle, ocr_service, paths, validation
+from backend import bundled_tools, lifecycle, ocr_service, paths, validation
 from backend.logging_config import recent_logs, setup_logging
 
 setup_logging()
@@ -64,6 +64,10 @@ async def lifespan(_app: FastAPI):
     except OSError as exc:
         log.error("cannot prepare the writable data directory %s: %s — "
                   "uploads and OCR results will fail", paths.data_dir(), exc)
+    # Put a bundled Tesseract ahead of any system one before OCRmyPDF probes
+    # for it (no-op in a source checkout).
+    bundled_tools.activate()
+    log.info("ocr tooling: %s", bundled_tools.describe())
     # Bring back jobs persisted in work/<job_id>/job.json so a restart
     # resumes the task list (completed pages / embeds survive for retry).
     ocr_service.restore_jobs()
@@ -183,6 +187,10 @@ def health() -> dict:
         # True when launched by desktop.py: the WebUI then offers a Quit button
         # (the only way out in the browser-fallback mode).
         "desktop": lifecycle.desktop_mode(),
+        # Which tesseract OCRmyPDF will run, and whether it came from the
+        # bundle.  Lets the packaging smoke test assert the app is
+        # self-contained.
+        "tesseract": bundled_tools.describe(),
     }
 
 

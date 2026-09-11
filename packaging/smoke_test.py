@@ -77,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exe", default=None, help="path to the built binary")
     parser.add_argument("--timeout", type=float, default=60.0,
                         help="seconds to wait for the server to come up")
+    parser.add_argument("--expect-tesseract", action="store_true",
+                        help="fail unless the app reports a bundled tesseract")
     args = parser.parse_args(argv)
 
     exe = find_executable(args.exe)
@@ -137,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:
                     fail("health does not report desktop mode")
                 if b'"unlimited"' not in body:
                     fail("health does not list the unlimited engine")
+                if args.expect_tesseract and b'"source":"bundled"' not in compact:
+                    fail("no bundled tesseract (health did not report "
+                         "'source: bundled')")
                 # 3. quitting is guarded, then works
                 status, _ = post(url + "api/app/quit", {})
                 if status != 403:

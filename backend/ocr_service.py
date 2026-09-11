@@ -30,7 +30,7 @@ from collections import deque
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
-from backend import page_store, paths, pdf_processing
+from backend import bundled_tools, page_store, paths, pdf_processing
 from backend.config import as_bool, redact_secrets, resolve
 from backend.errors import UnavailableError
 
@@ -407,6 +407,10 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     page already has a result: the job is marked done without re-running OCR.
     """
     import ocrmypdf.api
+
+    # A packaged build ships its own Tesseract; put it ahead of any system one
+    # before OCRmyPDF probes for it.  Idempotent, and a no-op when unbundled.
+    bundled_tools.activate()
 
     job = get_job(job_id)
     if job is None:

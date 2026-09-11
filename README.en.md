@@ -370,17 +370,26 @@ pdf-ocr-embed/
 
 ## Packaging as a desktop app
 
-Build a double-clickable bundle with PyInstaller (onedir, ~199 MB on Linux):
+Build a double-clickable bundle with PyInstaller (onedir; ~242 MB on Linux with
+Tesseract bundled):
 
 ```bash
 pip install -r requirements.txt -r requirements-desktop.txt
-python packaging/build.py --clean
+python packaging/build.py --clean --with-tesseract   # ship tesseract + eng/chi_sim
 ./dist/pdf-ocr-embed/pdf-ocr-embed              # native window, or the browser
 ./dist/pdf-ocr-embed/pdf-ocr-embed --no-window  # serve only (smoke tests)
 ```
 
 See [`packaging/README.md`](packaging/README.md) for details. Key points:
 
+- **Tesseract can be bundled** — `--with-tesseract` ships the program, its shared
+  library closure and the language data (default `eng` + `chi_sim`, including the
+  `configs/` OCRmyPDF requires), and `backend/bundled_tools.py` puts them on
+  `PATH`/`LD_LIBRARY_PATH` and sets `TESSDATA_PREFIX` at runtime. **Users then
+  install nothing**: with the system `tesseract` removed from `PATH` entirely,
+  the packaged app still completes a full OCR run. `/api/health`'s
+  `tesseract.source` reports `bundled` or `system`. Without the flag the build
+  falls back to requiring a system Tesseract.
 - **The native window** renders the UI in the OS webview via pywebview (WebView2
   / WKWebView / WebKit2GTK); closing it quits. If pywebview is missing or its
   backend fails to start, the app **falls back to the system browser** instead
@@ -398,9 +407,8 @@ See [`packaging/README.md`](packaging/README.md) for details. Key points:
   (`backend/paths.py`, via `platformdirs`) instead of next to its code. It
   therefore does **not** read the repo's `backend/ocr_config.toml` — configure
   it in the WebUI Settings dialog or with `OCR_*` environment variables.
-- **The Tesseract engine needs a system `tesseract`** (PyInstaller does not
-  bundle it); the Unlimited API engine needs no local binary. **Ghostscript is
-  optional since OCRmyPDF 17.0** (PDF/A output only).
+- **Ghostscript is optional since OCRmyPDF 17.0** (PDF/A output only), and the
+  Unlimited API engine needs no local binary at all.
 - Build on **each target OS separately** (PyInstaller is not a cross-compiler).
   Installers, code signing and notarization are not included yet.
 

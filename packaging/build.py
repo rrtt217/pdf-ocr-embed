@@ -27,11 +27,25 @@ def main(argv: list[str] | None = None) -> int:
                         help="delete build/ and dist/ before building")
     parser.add_argument("--distpath", default=str(ROOT / "dist"))
     parser.add_argument("--workpath", default=str(ROOT / "build"))
+    parser.add_argument("--with-tesseract", action="store_true",
+                        help="bundle Tesseract + language data so the app needs "
+                             "no install (adds ~35 MB on Linux)")
+    parser.add_argument("--langs", default=None,
+                        help="languages for --with-tesseract (default: eng,chi_sim)")
     args = parser.parse_args(argv)
 
     if args.clean:
         for folder in (Path(args.distpath), Path(args.workpath)):
             shutil.rmtree(folder, ignore_errors=True)
+
+    if args.with_tesseract:
+        # Best effort: a failure here leaves the staging directory absent and
+        # the spec simply builds an app that needs a system tesseract.
+        bundle_cmd = [sys.executable, str(ROOT / "packaging" / "bundle_tesseract.py")]
+        if args.langs:
+            bundle_cmd += ["--langs", args.langs]
+        print("+", " ".join(bundle_cmd), flush=True)
+        subprocess.call(bundle_cmd, cwd=str(ROOT))
 
     # NOTE: no --name here — PyInstaller rejects makespec options (including
     # --name) when a .spec file is given.  The bundle name lives in the spec.

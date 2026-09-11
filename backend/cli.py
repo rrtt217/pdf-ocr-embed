@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
-from backend import ocr_service, paths, pdf_processing
+from backend import bundled_tools, ocr_service, paths, pdf_processing
 from backend.errors import UnavailableError
 from backend.logging_config import setup_logging
 
@@ -124,6 +124,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="run the LLM heading/outline refinement only "
                              "(uses the detected table of contents)")
     args = parser.parse_args(argv)
+
+    # Use the Tesseract shipped with the app, when there is one.
+    bundled_tools.activate()
 
     input_path = Path(args.input)
     if not input_path.exists():

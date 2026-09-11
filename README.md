@@ -328,17 +328,23 @@ API key 等配置仍走 `resolve()`（TOML / 环境变量），不做任何硬�
 
 ## 打包为桌面应用
 
-用 PyInstaller 产出一个可双击运行的桌面构建（onedir，Linux 约 199MB）：
+用 PyInstaller 产出一个可双击运行的桌面构建（onedir；Linux 约 242MB，自带 Tesseract）：
 
 ```bash
 pip install -r requirements.txt -r requirements-desktop.txt
-python packaging/build.py --clean
+python packaging/build.py --clean --with-tesseract   # 捆绑 tesseract + eng/chi_sim
 ./dist/pdf-ocr-embed/pdf-ocr-embed        # 原生窗口（pywebview），缺失则退回系统浏览器
 ./dist/pdf-ocr-embed/pdf-ocr-embed --no-window   # 只起服务，便于冒烟测试
 ```
 
 细节见 [`packaging/README.md`](packaging/README.md)。要点：
 
+- **自带 Tesseract**：`--with-tesseract` 会把 `tesseract` 程序、其共享库闭包以及
+  语言包（默认 `eng` + `chi_sim`，含 OCRmyPDF 必需的 `configs/`）打进包里，
+  运行时由 `backend/bundled_tools.py` 前置到 `PATH`/`LD_LIBRARY_PATH` 并设置
+  `TESSDATA_PREFIX`。**因此用户无需安装任何东西**——实测把系统 tesseract 从
+  `PATH` 完全移除后，打包版仍能完成整条 OCR 流水线。`/api/health` 的
+  `tesseract.source` 会显示 `bundled` 还是 `system`。不加该参数则退回依赖系统 tesseract。
 - **原生窗口**用 pywebview 渲染系统 WebView（WebView2 / WKWebView / WebKit2GTK）；
   关闭窗口即退出。若 pywebview 缺失或后端起不来，会**退回系统浏览器**而不是失败。
 - **退出按钮**：由 `desktop.py` 启动时，WebUI 页头会多出一个 **Quit** 按钮
@@ -351,9 +357,7 @@ python packaging/build.py --clean
 - **打包后数据/配置/日志写入用户目录**（`backend/paths.py`，基于 `platformdirs`），
   不再写安装目录。因此打包版**不会读取仓库里的 `backend/ocr_config.toml`**——
   请用 WebUI 设置页配置，或用 `OCR_*` 环境变量覆盖。
-- **Tesseract 引擎需要系统装有 `tesseract`**（PyInstaller 不会自动打包它）；
-  Unlimited API 引擎不需要任何本地二进制。**Ghostscript 自 OCRmyPDF 17.0 起为可选**
-  （仅 PDF/A 输出需要）。
+- **Ghostscript 自 OCRmyPDF 17.0 起为可选**（仅 PDF/A 输出需要），默认构建不需要它。
 - 需在**每个目标系统上分别构建**（PyInstaller 不能交叉编译）；
   安装器与代码签名/公证尚未包含。
 

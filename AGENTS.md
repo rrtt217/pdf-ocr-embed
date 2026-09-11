@@ -54,8 +54,18 @@ the single most important invariant to preserve.
   `resolve()` as **highest-priority overrides** (`_ENV_ALIASES` maps names), so
   they can override file/WebUI values for the running process. Do not
   reintroduce JSON / `.env` file config, and never read `os.environ` outside
-  `backend/config.py`. (The STANDALONE plugin is the one exception: it has its
-  own `OCR_UNLIMITED_*` env surface in `ocrmypdf_unlimited/settings.py`.)
+  `backend/config.py`. Two sanctioned exceptions: the STANDALONE plugin has its
+  own `OCR_UNLIMITED_*` env surface in `ocrmypdf_unlimited/settings.py`, and
+  `backend/bundled_tools.py` sets `PATH`/`LD_LIBRARY_PATH`/`TESSDATA_PREFIX` so
+  a packaged build can use the Tesseract it ships. Add new env coupling THERE
+  or in `config.py` — not scattered through the code.
+- **Tesseract is optional but, when bundled, must actually be used.** A
+  packaged build may ship its own `tesseract` under `_internal/tesseract/`;
+  `backend.bundled_tools.activate()` puts it ahead of any system copy and is
+  called from `run_ocr`, the server lifespan and the CLI. Locating it relies on
+  OCRmyPDF resolving `tesseract` by name on `PATH`, so keep that call before
+  any ocrmypdf invocation. `TESSDATA_PREFIX` points at the tessdata DIRECTORY
+  (tesseract 5.x semantics — the parent makes it list bogus `tessdata/eng`).
 - Config reaches the plugin three ways, highest first:
   `--unlimited-*` CLI/API args (`options.unlimited_*`) > `OCR_UNLIMITED_*` env >
   host-injected snapshot. The host pushes `config.resolve()` into the plugin's
@@ -119,6 +129,7 @@ backend/
   paths.py                # path resolution: source checkout vs frozen bundle
   server.py               # EmbeddedServer: uvicorn on a thread, 127.0.0.1, free port
   lifecycle.py            # desktop mode flag + quit state (the WebUI Quit button)
+  bundled_tools.py        # put the bundled Tesseract on PATH/LD_LIBRARY_PATH/TESSDATA_PREFIX
   pdf_processing.py       # the ONLY PDF-library seam (pypdfium2: previews/geometry/text)
   validation.py           # post-embed coverage report
   batch.py                # ZIP packaging (streamed)
@@ -126,7 +137,7 @@ backend/
   cleanup.py              # temp-file cleanup
   cli.py                  # headless CLI (python -m backend.cli)
 desktop.py                # desktop entry point (freeze_support, window, exit cleanup)
-packaging/                # desktop packaging: PyInstaller spec + build.py + README
+packaging/                # desktop packaging: PyInstaller spec, build.py, bundle_tesseract.py, smoke_test.py
 frontend/                 # index.html / style.css / app.js / i18n.js (no build)
 tests/                    # pytest suite (incl. tests/test_ocrmypdf_unlimited_plugin.py)
 requirements.txt          # server / CLI / test dependencies

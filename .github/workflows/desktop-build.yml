@@ -96,11 +96,44 @@ jobs:
             libgirepository1.0-dev libcairo2-dev pkg-config gir1.2-webkit2-4.1
           pip install "pywebview[gtk]"
 
-      - name: Build the bundle
-        run: python packaging/build.py --clean
+      # A host Tesseract is only the *source* we copy from; the app ships its
+      # own copy so users need nothing installed.  Best effort: without a host
+      # the bundle is still built and simply needs a system tesseract.
+      - name: Install Tesseract to bundle (Linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
+          tesseract --version
 
+      - name: Install Tesseract to bundle (macOS)
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          brew install tesseract
+          tesseract --version
+
+      - name: Install Tesseract to bundle (Windows)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: |
+          choco install tesseract --no-progress -y
+          & "C:\Program Files\Tesseract-OCR\tesseract.exe" --version
+
+      - name: Build the bundle
+        run: python packaging/build.py --clean --with-tesseract
+
+      # Only demand a bundled Tesseract when the staging step actually produced
+      # one, so a runner without a host tesseract does not fail the build.
       - name: Smoke test the bundle
-        run: python packaging/smoke_test.py
+        shell: bash
+        run: |
+          if [ -d packaging/tesseract-staging ]; then
+            python packaging/smoke_test.py --expect-tesseract
+          else
+            python packaging/smoke_test.py
+          fi
 
       - name: Upload the bundle
         uses: actions/upload-artifact@v7
