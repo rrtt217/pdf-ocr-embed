@@ -25,6 +25,7 @@ const I18N_DICT = {
     "status.dirty": "unsaved changes",
     "status.embedded": "embedded",
     "status.error": "error",
+    "status.quitting": "quitting…",
 
     // --- job status pills ---
     "job.uploaded": "starting",
@@ -49,6 +50,7 @@ const I18N_DICT = {
     "header.quitTitle": "Stop the local server and exit",
     "header.quitConfirm": "Quit PDF OCR Embed? Running OCR jobs will be stopped.",
     "header.quitFailed": "Could not quit the app.",
+    "header.quitClosing": "The app is closing — you can close this tab.",
 
     // --- upload ---
     "upload.drop": "Drop a scanned PDF here",
@@ -315,6 +317,7 @@ const I18N_DICT = {
     "status.dirty": "有未保存修改",
     "status.embedded": "已嵌入",
     "status.error": "出错",
+    "status.quitting": "正在退出…",
 
     // --- job status pills ---
     "job.uploaded": "启动中",
@@ -339,6 +342,7 @@ const I18N_DICT = {
     "header.quitTitle": "停止本地服务并退出程序",
     "header.quitConfirm": "退出 PDF OCR Embed？正在运行的 OCR 任务将被停止。",
     "header.quitFailed": "无法退出程序。",
+    "header.quitClosing": "程序正在退出——可以关闭此标签页了。",
 
     // --- upload ---
     "upload.drop": "将扫描版 PDF 拖到这里",

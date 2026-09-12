@@ -25,6 +25,7 @@ import json
 import logging
 import shutil
 import threading
+import time
 import uuid
 from collections import deque
 from pathlib import Path
@@ -49,6 +50,24 @@ _jobs_lock = threading.Lock()
 # Per-job SSE buffers (deque of messages) indexed by job id.
 _STREAMS: Dict[str, Deque[dict]] = {}
 _streams_lock = threading.Lock()
+
+# Worker threads running this process's OCR phases, by thread -> job id.
+#
+# Why a registry instead of a bare ``threading.Thread(...)``: the OCR phase
+# takes minutes, and Python's interpreter exit JOINS every non-daemon thread.
+# Jobs started as ``loop.run_in_executor`` (or any non-daemon thread) therefore
+# keep the process alive after the user quits — the app looks hung.  Jobs are
+# started as DAEMON threads (so they can never block interpreter exit) and
+# tracked here, so shutdown can stop them the graceful way — cancel flag first,
+# then wait — instead of leaving half-written work folders behind.
+_WORKERS: Dict[threading.Thread, str] = {}
+_workers_cv = threading.Condition()
+#: Set once shutdown began: no new OCR job may start.
+_shutting_down = False
+
+# Job error text for a shutdown-stopped run (also the marker the API uses to
+# tell "stopped because the app is quitting" from "stopped by the user").
+SHUTDOWN_MESSAGE = "Stopped: the application is shutting down"
 
 # The OCRmyPDF plugin package (the unlimited engine).  Loaded by its dotted
 # module name, packaged-plugin style — the plugin is the standalone
@@ -406,6 +425,26 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     comma-separated list.  A page selection that is empty means every selected
     page already has a result: the job is marked done without re-running OCR.
     """
+    # The quit guard belongs HERE, in the public entry point: a worker thread
+    # scheduled just before the quit may only get its first slice of CPU after
+    # it, and it must not launch a minutes-long OCR run then.
+    if is_shutting_down():
+        _mark_stopped_by_shutdown(job_id)
+        return
+    _run_ocr(job_id, overrides)
+
+
+def _mark_stopped_by_shutdown(job_id: str) -> None:
+    """Record that a job never started because the app is quitting."""
+    if get_job(job_id) is None:
+        return
+    _set(job_id, status="stopped", error=SHUTDOWN_MESSAGE)
+    _push_event(job_id, {"type": "status", "status": "stopped",
+                         "message": SHUTDOWN_MESSAGE})
+    _persist_if_live(job_id)
+
+
+def _run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     import ocrmypdf.api
 
     # A packaged build ships its own Tesseract; put it ahead of any system one
@@ -415,6 +454,9 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
     job = get_job(job_id)
     if job is None:
         return
+    # A new run starts uncancelled: the flag from a previous stop would
+    # otherwise abort this run on its first page.
+    page_store.clear_cancel(_job_dir(job_id))
     overrides = dict(overrides or {})
     options = _ocrmypdf_options(**overrides)
     total = int(job.get("num_pages") or 0)
@@ -472,7 +514,13 @@ def run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
         return
     except Exception as exc:  # noqa: BLE001
         cancelled = page_store.is_cancelled(_job_dir(job_id))
-        message = "OCR stopped by user" if cancelled else redact_secrets(str(exc))
+        if not cancelled:
+            message = redact_secrets(str(exc))
+        elif is_shutting_down():
+            # The cancel flag was written by shutdown_jobs, not by the user.
+            message = SHUTDOWN_MESSAGE
+        else:
+            message = "OCR stopped by user"
         status = "stopped" if cancelled else "error"
         log.error("job %s: OCR phase failed: %s", job_id, message)
         # pages_done reflects the pages that actually have results on disk
@@ -543,14 +591,155 @@ def retry_job(job_id: str, overrides: Optional[dict] = None,
         int(job.get("num_pages") or 0),
         _page_status_list(job_id),
         page_range=page_range, force=force)
-    threading.Thread(target=run_ocr, args=(job_id, overrides),
-                     daemon=True, name=f"ocr-{job_id}").start()
-    return True
+    return start_job(job_id, overrides)
 
 
 def _page_status_list(job_id: str) -> list:
     """Truthy-per-page list of pages that already have a block sidecar."""
     return [bool(p) for p in get_page_dicts(job_id)]
+
+
+# --- OCR worker threads (start / shutdown) -----------------------------------
+
+def start_job(job_id: str, overrides: Optional[dict] = None) -> bool:
+    """Start the OCR phase for a job on a tracked daemon worker thread.
+
+    Every caller (upload, retry) goes through here.  Daemon threads are what
+    make quitting work: the interpreter joins non-daemon threads at exit, so a
+    running OCR phase started any other way keeps the whole app alive after
+    the user asked it to quit.  Returns False once shutdown began (the job is
+    left for the next start — its work folder is intact).
+    """
+    def _worker() -> None:
+        # Deregistration lives in the thread body, not in run_ocr: the
+        # registry must never outlive the thread it names, whatever the run
+        # itself does (or whoever replaced it).
+        try:
+            run_ocr(job_id, overrides)
+        finally:
+            _deregister_worker()
+
+    thread = threading.Thread(target=_worker, daemon=True, name=f"ocr-{job_id}")
+    with _workers_cv:
+        if _shutting_down:
+            log.info("not starting job %s: the app is shutting down", job_id)
+            return False
+        _WORKERS[thread] = job_id
+    try:
+        thread.start()
+    except Exception:  # noqa: BLE001 - a failed start must not leak the slot
+        with _workers_cv:
+            _WORKERS.pop(thread, None)
+            _workers_cv.notify_all()
+        raise
+    return True
+
+
+def is_shutting_down() -> bool:
+    """True once ``shutdown_jobs`` began (used to refuse starting new work)."""
+    with _workers_cv:
+        return _shutting_down
+
+
+def _deregister_worker() -> None:
+    """Remove the calling thread from the worker registry (wakes waiters)."""
+    with _workers_cv:
+        _WORKERS.pop(threading.current_thread(), None)
+        _workers_cv.notify_all()
+
+
+def _live_workers() -> List[threading.Thread]:
+    """Registry entries that name a thread still running (prunes the rest).
+
+    Pruning keeps the registry honest for the shutdown waiter: an entry whose
+    thread object cannot even answer ``is_alive()`` (a test double, or a
+    thread someone replaced) and one whose thread already finished are both
+    "not running" here.
+    """
+    live: List[threading.Thread] = []
+    stale: List[object] = []
+    with _workers_cv:
+        for thread in list(_WORKERS):
+            is_alive = getattr(thread, "is_alive", None)
+            if callable(is_alive) and is_alive():
+                live.append(thread)
+            else:
+                stale.append(thread)          # finished, or not a real thread
+        for thread in stale:
+            _WORKERS.pop(thread, None)
+    return live
+
+
+def reset_shutdown_state() -> None:
+    """Allow new jobs again (a fresh start in the same process — tests)."""
+    global _shutting_down
+    with _workers_cv:
+        _shutting_down = False
+        _WORKERS.clear()
+        _workers_cv.notify_all()
+
+
+def active_jobs() -> List[str]:
+    """Job ids whose OCR worker thread is still running."""
+    return [str(_WORKERS[t]) for t in _live_workers()]
+
+
+def request_all_cancels() -> List[str]:
+    """Write the cancel flag for every job that is running, and return them.
+
+    The IMMEDIATE half of a shutdown: it never waits, so a quit that has to
+    answer a browser request can still stop the engine (which polls the flag
+    per page) without blocking.  Also marks the jobs as stopping, so the WebUI
+    reports the truth while the wait happens elsewhere.
+    """
+    cancelled: List[str] = []
+    for job in all_jobs():
+        if job.get("status") not in ("running", "queued", "stopping"):
+            continue
+        job_id = job.get("job_id") or ""
+        if not job_id:
+            continue
+        page_store.request_cancel(_job_dir(job_id))
+        _set(job_id, status="stopping", error=SHUTDOWN_MESSAGE)
+        _push_event(job_id, {"type": "status", "status": "stopping",
+                             "message": SHUTDOWN_MESSAGE})
+        cancelled.append(job_id)
+    return cancelled
+
+
+def shutdown_jobs(wait: float = 10.0) -> bool:
+    """Stop every in-flight OCR job and wait for its worker thread.
+
+    Freezing the worker registry is the important half: it happens FIRST, so a
+    job that has not reached its first page yet returns immediately instead of
+    starting (or continuing) a long OCR run while the app is quitting.
+
+    Returns True when every worker thread finished within ``wait`` seconds.
+    Threads are daemons, so a straggler can never block interpreter exit —
+    the app just leaves it behind (its completed pages stay on disk).
+    """
+    global _shutting_down
+    with _workers_cv:
+        _shutting_down = True
+    # Cancel every job that is still running/queued/stopping — including one
+    # restored from job.json, which has no worker but still owns a work folder.
+    request_all_cancels()
+    deadline = time.monotonic() + max(0.0, wait)
+    pending = _live_workers()
+    while pending:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        with _workers_cv:
+            _workers_cv.wait(min(remaining, 0.25))
+        pending = [t for t in pending if t.is_alive()]
+    if pending:
+        log.warning("shutdown: %d OCR worker(s) still running after %.1fs; "
+                    "leaving them behind (pages already written are kept)",
+                    len(pending), wait)
+        return False
+    log.info("shutdown: every OCR worker stopped")
+    return True
 
 
 # --- editable pages ----------------------------------------------------------

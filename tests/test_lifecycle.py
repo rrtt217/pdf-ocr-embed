@@ -89,6 +89,54 @@ def test_wait_for_quit_unblocks_after_a_request():
     assert lifecycle.wait_for_quit(timeout=0) is True
 
 
+# --- the shutdown hook (what actually stops OCR jobs) ------------------------
+
+def test_quit_runs_the_shutdown_hook(client):
+    """Desktop registers this hook so the Quit button stops running jobs."""
+    order: list[str] = []
+    lifecycle.set_shutdown_hook(lambda: order.append("hook"))
+    lifecycle.set_quit_handler(lambda: order.append("handler"))
+
+    client.post("/api/app/quit", headers=QUIT_HEADERS)
+
+    # The hook runs BEFORE the window handler: jobs are already stopping when
+    # the window goes away.
+    assert order == ["hook", "handler"]
+
+
+def test_a_failing_shutdown_hook_still_answers_200(client):
+    def boom() -> None:
+        raise RuntimeError("nope")
+
+    lifecycle.set_shutdown_hook(boom)
+    resp = client.post("/api/app/quit", headers=QUIT_HEADERS)
+    assert resp.status_code == 200
+
+
+def test_the_quit_endpoint_is_not_held_up_by_a_slow_hook(client):
+    """A hook stuck mid-page must not turn the quit into a browser timeout.
+
+    The endpoint bounds its wait (``QUIT_REQUEST_TIMEOUT``); the hook keeps
+    running on its own thread while the response is already on its way.
+    """
+    import threading
+    import time
+
+    released = threading.Event()
+
+    def slow_hook() -> None:
+        released.wait(10)
+
+    lifecycle.set_shutdown_hook(slow_hook)
+    start = time.monotonic()
+    resp = client.post("/api/app/quit", headers=QUIT_HEADERS)
+    elapsed = time.monotonic() - start
+
+    assert resp.status_code == 200
+    assert elapsed < lifecycle.QUIT_REQUEST_TIMEOUT + 2.0
+    released.set()
+
+
 # --- CORS: loopback only (this is what makes the header guard real) ----------
 
 def test_cors_allows_loopback_origins(client):

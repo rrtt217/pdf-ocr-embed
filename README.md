@@ -351,6 +351,13 @@ python packaging/build.py --clean --with-tesseract   # 捆绑 tesseract + eng/ch
   （`/api/health` 的 `desktop: true`），调用 `POST /api/app/quit`——浏览器回退模式下
   这是唯一的退出方式。该接口要求自定义请求头，且 CORS 只允许 loopback 源，
   因此普通网页无法通过预检来关掉你的程序。
+- **`uvicorn backend.main:app` 也支持退出**：这条命令由 uvicorn 自己接管信号，应用只在 lifespan 里补两件事——信号到达时先给 OCR 任务写 cancel（让引擎在当前页边界停），以及给解释器退出设一个 5 秒上限（否则它会一直等引擎的线程池，表现为「必须再按一次 Ctrl+C」）。
+- **退出一定生效（四条路都一样）**：关闭窗口、Quit 按钮、`Ctrl+C`、`SIGTERM`
+  走同一条退出流程——先按既有 `cancel` 契约请求停止在跑的 OCR 任务（有界等待，
+  保住已完成的页），再停掉 HTTP 服务，最后以硬性截止（`os._exit`）兜底。
+  OCR 任务跑在**守护线程**上，所以再长的任务也吊不住进程；通常 2~5 秒退出完成。
+  非桌面模式（`python -m backend.main`）同样响应 `Ctrl+C`/`SIGTERM`：
+  第一次信号优雅退出，**再按一次立即退出**。实现见 `backend/shutdown.py`。
 - **只监听 `127.0.0.1` 的随机空闲端口**，用后台线程跑 uvicorn（`backend/server.py`）；
   入口 `desktop.py` 负责 `multiprocessing.freeze_support()`、开窗与退出清理
   （退出时按项目既有的 `cancel` 契约优雅停止在跑的 OCR 任务）。

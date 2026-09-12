@@ -80,8 +80,48 @@ async def lifespan(_app: FastAPI):
     # save_settings).  The plugin is optional: the app runs without it, so
     # wire it up only when it is actually importable.
     _inject_plugin_settings()
-    yield
-    cleanup_mod.stop_background_cleanup()
+    # Exiting must work no matter how the server was started.  See the two
+    # helpers below: one makes interpreter exit immediate, the other adds the
+    # OCR cancel to a signal handler this app does not own (plain uvicorn).
+    undo_signal_chain = _wire_exit_safety()
+    try:
+        yield
+    finally:
+        cleanup_mod.stop_background_cleanup()
+        if undo_signal_chain is not None:
+            undo_signal_chain()
+
+
+def _wire_exit_safety():
+    """Install the exit guarantees that only need the app, not the launcher.
+
+    ``python -m backend.main`` and the desktop app install their own signal
+    handlers (``backend.shutdown``); a plain ``uvicorn backend.main:app`` does
+    not, and that path used to be the one that hung.  Two things are wired
+    here:
+
+    * an exit hook that BOUNDS interpreter exit: when leftover non-daemon
+      worker threads would otherwise be joined for as long as their in-flight
+      work takes (the "needs a second Ctrl-C" hang), the process force-exits
+      after a short grace period;
+    * a wrapper around the handler uvicorn installed, which asks the OCR
+      engine to stop before uvicorn drains — uvicorn cannot know that a
+      minutes-long job is running behind the HTTP server.
+
+    Returns the restore callable for the signal wrapper, or None.
+    """
+    from backend import shutdown
+
+    shutdown.register_exit_cleanup()
+
+    def on_signal(_signum: int) -> None:
+        """Cancel the in-flight jobs without waiting (the engine polls it)."""
+        try:
+            ocr_service.request_all_cancels()
+        except Exception:  # noqa: BLE001 - a signal handler must not raise
+            log.debug("could not cancel jobs on signal", exc_info=True)
+
+    return shutdown.chain_signal_handler(on_signal)
 
 
 def _inject_plugin_settings() -> bool:
@@ -202,11 +242,18 @@ def app_quit(x_pdf_ocr_embed: Optional[str] = Header(None)) -> dict:
     passing a CORS preflight, and CORS here only allows loopback origins — so a
     random web page cannot shut the app down.  A plain server (not desktop
     mode) is unaffected: the request simply sets a flag nothing waits on.
+
+    Answers IMMEDIATELY.  The registered shutdown hook (``desktop.py``) runs
+    with its own short deadline and continues on its helper thread, so this
+    response is written before the server starts shutting down — waiting here
+    instead (while OCR finishes its current page) would let uvicorn cancel the
+    very request that asked for the quit, and the WebUI would report a failure
+    for a quit that is in fact happening.
     """
     if (x_pdf_ocr_embed or "").strip().lower() != lifecycle.QUIT_HEADER_VALUE:
         raise HTTPException(status_code=403, detail="missing quit confirmation header")
     log.info("quit requested from the UI")
-    lifecycle.request_quit()
+    lifecycle.request_quit(timeout=lifecycle.QUIT_REQUEST_TIMEOUT)
     return {"status": "quitting"}
 
 
@@ -351,7 +398,6 @@ async def upload_pdf(
     if concurrency is not None and int(concurrency) > 0:
         extra["jobs"] = int(concurrency)
 
-    loop = asyncio.get_running_loop()
     jobs = []
     for uf in uploads:
         contents = await uf.read()
@@ -377,8 +423,18 @@ async def upload_pdf(
                     detail=f"Page range {start}..{end} exceeds the "
                            f"document's {total} page(s)")
             job_options["pages"] = f"{start}-{end}"
-        loop.run_in_executor(
-            None, ocr_service.run_ocr, job["job_id"], job_options or None)
+        # Start on the service's own TRACKED DAEMON thread — deliberately not
+        # loop.run_in_executor: the default executor's threads are non-daemon,
+        # so a running OCR phase would keep the interpreter alive after the
+        # user quits (the app appears to hang).  The thread is spawned in
+        # microseconds, so the event loop is not blocked.
+        if not ocr_service.start_job(job["job_id"], job_options or None):
+            # Shutdown began between the upload and the worker start.
+            ocr_service.clear_job(job["job_id"])
+            raise HTTPException(
+                status_code=503,
+                detail="The application is shutting down; the upload was not "
+                       "started")
         log.info("upload job %s: %s (engine=%s%s)", job["job_id"],
                  job["filename"], extra.get("ocr_engine") or "unlimited",
                  f", pages={job_options['pages']}"
@@ -610,6 +666,13 @@ async def stream(job_id: str):
                 if not any(e.get("type") == "error" for e in events):
                     yield _sse({"type": "error", "message": cur.get("error", "OCR failed")})
                 break
+            # A quit (window closed, Quit button, Ctrl-C) must end every open
+            # stream promptly: uvicorn cannot finish shutting down while a
+            # response is still streaming, and the OCR job itself is already
+            # being stopped by the same shutdown path.
+            if lifecycle.is_quit_requested():
+                yield _sse_shutdown_notice()
+                break
             await asyncio.sleep(0.5)
 
     return StreamingResponse(gen(), media_type="text/event-stream")
@@ -617,6 +680,16 @@ async def stream(job_id: str):
 
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _sse_shutdown_notice() -> str:
+    """The terminal SSE frame sent when the app is quitting.
+
+    Without it an EventSource sees only a dropped connection and the WebUI
+    shows a connection error; with it the page can say "the app is closing".
+    """
+    return _sse({"type": "status", "status": "shutdown",
+                 "message": "The application is shutting down"})
 
 
 @app.get("/api/pages/{job_id}")
@@ -1109,6 +1182,13 @@ def export_document_stream(job_id: str, ext: str, raw: str = "1",
 
         threading.Thread(target=work, daemon=True, name="export-llm").start()
         while True:
+            # Quit closes the stream even while the LLM steps are running: the
+            # export worker is a daemon thread, so nothing is lost by ending
+            # the response here, and uvicorn cannot finish a shutdown while a
+            # response is still streaming.
+            if lifecycle.is_quit_requested():
+                yield _sse_shutdown_notice()
+                break
             try:
                 # asyncio.to_thread: the blocking queue.get must NOT run on
                 # the event loop — it would stall every other request and
@@ -1200,18 +1280,66 @@ def run(host: str = "127.0.0.1", port: int = 8000,
     Freeze-safe: passes the app object, never enables the reloader, and binds
     loopback only.  For the packaged desktop app use ``desktop.py``, which adds
     a window, a kernel-assigned port and graceful shutdown.
-    """
-    import uvicorn
 
-    url = f"http://{host}:{port}/"
-    log.info("starting PDF OCR Embed on %s", url)
+    Ctrl-C / SIGTERM exit this cleanly: the first signal stops the in-flight
+    OCR jobs (cancel flag, bounded wait), closes the open SSE streams and stops
+    the server; a second signal exits immediately.  Running uvicorn directly
+    (``uvicorn.run``) does not get this — its own signal handler stops the HTTP
+    server but leaves the OCR worker threads behind, and the interpreter then
+    hangs in ``concurrent.futures.thread._python_exit`` joining them.
+    """
+    from backend import server as server_mod, shutdown
+
+    srv = server_mod.EmbeddedServer(app, host=host, port=port)
+    log.info("starting PDF OCR Embed on %s", srv.url)
     if open_browser:
         import threading
         import webbrowser
-        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    uvicorn.run(app, host=host, port=port, reload=False, workers=1,
-                access_log=False, log_config=None)
+        threading.Timer(1.0, lambda: webbrowser.open(srv.url)).start()
+    # No exit deadline at startup: it is armed when a quit actually begins (by
+    # the signal handler, and again by stop_server) — a timer armed at launch
+    # would kill a healthy, long-running server.
+    #
+    # The hook cancels the jobs FIRST and never waits: it runs on whichever
+    # thread requested the quit, and the engine (which polls the cancel flag
+    # per page) must already be stopping before anything blocks.  The bounded
+    # wait and the server stop happen in the ``finally`` below, on the main
+    # thread — and, for the desktop app, in the hook itself.
+    def _quit_hook() -> None:
+        ocr_service.request_all_cancels()
+        shutdown.stop_server(srv)
+
+    lifecycle.set_shutdown_hook(_quit_hook)
+    shutdown.install_signal_handlers(shutdown.make_signal_handler(
+        lambda: lifecycle.request_quit(timeout=lifecycle.QUIT_REQUEST_TIMEOUT),
+        label="the server",
+    ))
+    try:
+        srv.start()
+        try:
+            lifecycle.wait_for_quit()
+        except KeyboardInterrupt:
+            pass
+    except Exception:  # noqa: BLE001 - report, do not dump a bare traceback
+        log.exception("could not start the local server")
+        return
+    finally:
+        lifecycle.set_shutdown_hook(None)
+        shutdown.stop_jobs()
+        shutdown.stop_server(srv)
+    log.info("pdf-ocr-embed server stopped")
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+
+    _parser = argparse.ArgumentParser(prog="python -m backend.main",
+                                      description="PDF OCR Embed WebUI server")
+    _parser.add_argument("--host", default="127.0.0.1",
+                         help="bind address (default: 127.0.0.1)")
+    _parser.add_argument("--port", type=int, default=8000,
+                         help="bind port (default: 8000)")
+    _parser.add_argument("--open-browser", action="store_true",
+                         help="open the WebUI in the system browser")
+    _args = _parser.parse_args()
+    run(host=_args.host, port=_args.port, open_browser=_args.open_browser)

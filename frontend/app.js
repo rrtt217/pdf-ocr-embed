@@ -2350,16 +2350,35 @@ function initQuitButton(health) {
   btn.onclick = async () => {
     if (!window.confirm(I18N.t("header.quitConfirm"))) return;
     btn.disabled = true;
+    setStatus("quitting", "running");
     try {
       // The custom header is required by the endpoint (CSRF guard).
+      // The server answers as soon as the quit is accepted and then finishes
+      // stopping the jobs in the background, so the connection dying right
+      // after this response is the EXPECTED outcome — not a failure.
       await api("/api/app/quit", {
         method: "POST",
         headers: { "X-PDF-OCR-Embed": "quit" },
       });
-      setStatus("offline");
+      // Nothing is running any more (the server is going away): drop the live
+      // streams and the log poller so the page stops asking a dead server,
+      // and say so instead of showing a stale "running" UI forever.
+      Object.keys(state.es).forEach((id) => {
+        try { state.es[id].close(); } catch (e) { /* already gone */ }
+        delete state.es[id];
+      });
+      stopLogPolling();
+      setStatus("offline", "");
+      toast(I18N.t("header.quitClosing"));
     } catch (e) {
-      btn.disabled = false;
-      window.alert(I18N.t("header.quitFailed"));
+      // A quit the server accepted and then died on is still a successful
+      // quit: only report a failure when it is still answering.
+      const gone = !e.status;   // network error: the server already stopped
+      if (!gone) {
+        btn.disabled = false;
+        setStatus("online", "");
+        window.alert(I18N.t("header.quitFailed"));
+      }
     }
   };
 }

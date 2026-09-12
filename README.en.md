@@ -399,6 +399,16 @@ See [`packaging/README.md`](packaging/README.md) for details. Key points:
   `POST /api/app/quit` — the only way out in the browser-fallback mode. The
   endpoint demands a custom header, and CORS allows loopback origins only, so a
   random web page cannot pass the preflight needed to quit your app.
+- **`uvicorn backend.main:app` exits too**: uvicorn owns the signal there, so the app only adds two things from its lifespan — a cancel for the OCR jobs when a signal arrives, and a 5 s cap on interpreter exit (which otherwise waits for the engine's thread pool: the "needs a second Ctrl-C" hang).
+- **Quitting always works, through any of four doors**: closing the window, the
+  Quit button, `Ctrl+C`, and `SIGTERM` all run the same teardown — stop the
+  running OCR jobs through the `cancel` contract (bounded wait, completed pages
+  kept), stop the HTTP server, then a hard deadline (`os._exit`) as the
+  backstop. OCR runs on **daemon** worker threads, so even a minutes-long job
+  cannot keep the process alive; quitting normally takes 2–5 s. The plain
+  server (`python -m backend.main`) behaves the same on `Ctrl+C`/`SIGTERM`:
+  the first signal exits gracefully and a **second one exits immediately**.
+  See `backend/shutdown.py`.
 - The server binds **`127.0.0.1` on a kernel-assigned free port** and runs on a
   background thread (`backend/server.py`); `desktop.py` handles
   `multiprocessing.freeze_support()`, the window, and graceful exit (it stops

@@ -94,6 +94,58 @@ the single most important invariant to preserve.
   kernel-assigned port) or `backend.main.run()`, and call
   `multiprocessing.freeze_support()` in every new entry point before heavy
   imports.
+- **Every background OCR run MUST go through `ocr_service.start_job()` —
+  never `loop.run_in_executor`, never a bare non-daemon `Thread`.** Python's
+  interpreter exit JOINS non-daemon threads
+  (`concurrent.futures.thread._python_exit`), so an OCR phase started any other
+  way keeps the process alive after the user quits: uvicorn logs "Finished
+  server process" and then the app hangs forever. `start_job` uses a DAEMON
+  thread, tracks it in a registry, and is the only thing `shutdown_jobs()` can
+  cancel and wait for.
+- **Quitting must stay bounded, and must work from every door** (window close,
+  WebUI Quit button, `Ctrl-C`, `SIGTERM`). `backend/shutdown.py` owns the
+  mechanisms — `stop_jobs()` (cancel flag, then a bounded wait),
+  `stop_server()` (which also arms the hard-exit deadline),
+  `exit_soon()` / `force_exit_now()` (the `os._exit` backstop) and
+  `make_signal_handler()` (first signal = graceful, second = immediate).
+  Two rules that are easy to break: never set uvicorn's
+  `timeout_graceful_shutdown` back to `None` (the SSE streams the WebUI holds
+  open then keep `stop()` waiting until the OCR run ends), and never arm the
+  exit deadline at STARTUP (it would kill a healthy long-running app).
+- **`uvicorn backend.main:app` is a supported entry point too**, and it is the
+  one where the app does NOT own the signal handler. Uvicorn stops serving on
+  its own, but it cannot know an OCR job is running, and interpreter shutdown
+  then waits for the engine's worker threads — so the process needs a SECOND
+  Ctrl-C. `backend.main.lifespan` wires both halves of the fix and they must
+  stay there: `shutdown.chain_signal_handler` (cancel the jobs, then let
+  uvicorn's own handler run) and `shutdown.register_exit_cleanup` /
+  `watchdog_on_exit` (force the exit after `EXIT_JOIN_GRACE` when workers are
+  still alive). Three traps, all verified the hard way: on Python 3.13+
+  executor workers are DAEMON threads and `threading._shutdown` waits for
+  their thread state anyway (so the watchdog must consider every non-main
+  thread); `atexit.register` alone is not enough because
+  `concurrent.futures.thread` hooks in through `threading._register_atexit`,
+  whose list runs in REVERSE order (so register AFTER importing
+  `concurrent.futures`); and clearing
+  `concurrent.futures.thread._threads_queues` does NOT prevent the hang (the
+  wait is the C-level `_thread._shutdown()`) — only a hard exit does.
+- **A single page can be in flight for ~1 h** (`client.READ_TIMEOUT_MIN` =
+  900 s x `max_retries + 1` attempts), and the engine only checks the `cancel`
+  flag BEFORE a page — so "stop" (and therefore "quit") cannot interrupt the
+  page that is already running. That is accepted: quitting must still take
+  seconds (the worker is a daemon and is abandoned after `JOB_STOP_WAIT`), the
+  completed pages stay on disk, and "retry remaining" resumes at the pages
+  without a result. Never make a shutdown path wait for an OCR page to return,
+  and never treat an interrupted run as lost work.
+- **The page inventory must stay repairable**: every page `page_store.
+  page_numbers` counts as done MUST be loadable by `page_store.load_page` (the
+  reverse may not hold). A counted-but-unreadable page is invisible in the
+  editor AND skipped by "retry remaining", so nothing could ever fix it — and
+  finalize would embed it with no text layer. Concretely: the hOCR decides
+  whenever it exists (a complete hOCR counts even with a damaged sidecar,
+  which `load_page` rebuilds from it); a sidecar counts only for a page with
+  NO hOCR at all; a half-written file of either kind is not a result. Pinned
+  by `tests/test_job_resume.py` and `tests/test_page_store_inventory.py`.
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `logs/`, `build/`,
   `dist/`, `.venv/`, `backend/ocr_config.toml`) are gitignored. Never commit
   keys or large sample PDFs.
@@ -129,6 +181,7 @@ backend/
   paths.py                # path resolution: source checkout vs frozen bundle
   server.py               # EmbeddedServer: uvicorn on a thread, 127.0.0.1, free port
   lifecycle.py            # desktop mode flag + quit state (the WebUI Quit button)
+  shutdown.py             # bounded quit for every entry point (jobs, server, deadline, signals)
   bundled_tools.py        # put the bundled Tesseract on PATH/LD_LIBRARY_PATH/TESSDATA_PREFIX
   pdf_processing.py       # the ONLY PDF-library seam (pypdfium2: previews/geometry/text)
   validation.py           # post-embed coverage report
@@ -285,7 +338,17 @@ def get_ocr_engine(options):
   The standalone-plugin contract is pinned by
   `tests/test_ocrmypdf_unlimited_plugin.py` (independence, options hooks,
   entry-point discovery, exclusive cancel, filesystem contract, and a real
-  `_pdf_to_hocr` end-to-end run). When adding logic (especially coordinate
+  `_pdf_to_hocr` end-to-end run). **Exit behaviour is pinned by
+  `tests/test_exit_shutdown.py`**: the bounded server stop with a stream open,
+  job cancellation/refusal, the shared shutdown module, and real child-process
+  runs of `desktop.py` (Quit endpoint), `python -m backend.main`
+  (SIGINT/SIGTERM) and `uvicorn backend.main:app` (one signal is enough) with a
+  blocked OCR phase. Add a case there whenever you
+  touch a shutdown path. **Resuming is pinned by `tests/test_job_resume.py`**
+  (graceful stop → restart → retry runs only the missing pages; SIGKILL crash
+  artifacts → the page is either recovered from its hOCR or left re-runnable)
+  and by the inventory matrix in `tests/test_page_store_inventory.py`. When
+  adding logic (especially coordinate
   mapping, hOCR generation and parsing), prefer pure functions and extend the
   suite.
 - **Vibe-coding notice**: this project was generated largely by AI. Re-verify
