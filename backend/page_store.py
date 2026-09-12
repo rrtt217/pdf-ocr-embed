@@ -73,6 +73,20 @@ def is_cancelled(job_dir: Path) -> bool:
     return cancel_path(job_dir).exists()
 
 
+def clear_cancel(job_dir: Path) -> None:
+    """Remove the cancel flag so a fresh run may start.
+
+    The flag is a file, so it outlives the run that set it.  A retry (or a
+    restart-driven re-run) after a stop would otherwise be cancelled before its
+    first page: the engine checks the flag on entry.  Clearing it here is the
+    host's side of "a new run starts uncancelled".
+    """
+    try:
+        cancel_path(job_dir).unlink(missing_ok=True)
+    except OSError:
+        log.exception("failed to clear the cancel flag in %s", job_dir)
+
+
 # --- page inventory ----------------------------------------------------------
 
 def _page_no_from_name(path: Path) -> Optional[int]:
@@ -119,32 +133,72 @@ def _hocr_complete(hocr_file: Path) -> bool:
     return b"</html>" in tail.rstrip()
 
 
+def _sidecar_complete(sidecar_file: Path) -> bool:
+    """True when a block sidecar looks *fully written*, not mid-write.
+
+    The sidecar is a single JSON blob, so "complete" normally means "exists" —
+    but a process killed mid-write (power loss, SIGKILL) can leave a truncated
+    file, and a page whose ONLY result is such a file is unusable: there is no
+    hOCR to derive it from, so it must stay re-runnable instead of being
+    skipped by "retry remaining" and embedded without a text layer.
+
+    The structural check is enough: this payload always ends with the closing
+    brace (the engines write it with no trailing newline) and a truncated blob
+    never does.  An empty file counts as incomplete — there is nothing to read.
+    """
+    try:
+        size = sidecar_file.stat().st_size
+        if size == 0:
+            return False
+        with open(sidecar_file, "rb") as fh:
+            fh.seek(max(0, size - 32))
+            tail = fh.read()
+    except OSError:
+        return False
+    return tail.rstrip().endswith(b"}")
+
+
 def page_numbers(hocr_dir: Path) -> List[int]:
     """Sorted 1-based page numbers that have a COMPLETE result on disk.
 
-    The union of block sidecars and *fully written* hOCR files: an engine may
+    The union of *fully written* hOCR files and block sidecars: an engine may
     produce either (or both).  This is what "retry remaining", progress
     display and the embed guard count — for every engine.
 
-    The bare hOCR file is only a completion signal once it is fully written
-    (see ``_hocr_complete``): engines such as ocrmypdf's built-in Tesseract
-    stream the file while they run, and a half-written page otherwise shows up
-    as "done" in progress and fails to parse downstream.
+    The hOCR decides whenever it exists, because it is the format every engine
+    implements and the one the finalize step renders.  It only counts once it
+    is fully written (``_hocr_complete``): ocrmypdf's built-in Tesseract
+    streams the file while it OCRs, so a page that is still being written — or
+    one whose writer was killed mid-stream — must stay re-runnable rather than
+    showing up as "done".
+
+    The block sidecar is the completion signal only for a page with NO hOCR
+    at all: an engine that emits just the normalized sidecar.  It must never
+    override an existing hOCR — a stale sidecar from an earlier run would
+    otherwise mask a page that is being re-OCR'd right now (and a crash can
+    leave exactly that combination on disk).
+
+    The invariant worth keeping: every page counted here must be loadable by
+    :func:`load_page`.  A counted-but-unreadable page is invisible in the
+    editor AND skipped by every retry, so nothing could ever repair it.
     """
     hdir = Path(hocr_dir)
     if not hdir.exists():
         return []
     numbers: set[int] = set()
-    # Block sidecars are complete by construction (one JSON blob per page).
-    for path in hdir.glob("*_ocr_hocr.blocks.json"):
-        page_no = _page_no_from_name(path)
-        if page_no is not None:
-            numbers.add(page_no)
+    with_hocr: set[int] = set()
     for path in hdir.glob("*_ocr_hocr.hocr"):
         page_no = _page_no_from_name(path)
-        if page_no is None or page_no in numbers:
+        if page_no is None:
             continue
+        with_hocr.add(page_no)
         if _hocr_complete(path):
+            numbers.add(page_no)
+    for path in hdir.glob("*_ocr_hocr.blocks.json"):
+        page_no = _page_no_from_name(path)
+        if page_no is None or page_no in with_hocr:
+            continue
+        if _sidecar_complete(path):
             numbers.add(page_no)
     return sorted(numbers)
 
@@ -266,16 +320,26 @@ def load_page(hocr_dir: Path, page_no: int,
     sidecars), the page is derived from it and the derived sidecar is written
     back, so the page becomes editable exactly like an engine-native one.
     Returns ``None`` when the page has no result.
+
+    A sidecar that exists but cannot be READ (a process killed mid-write, a
+    truncated blob) does not end the page either: the hOCR is the reproducible
+    source, so it is used and the damaged sidecar is rewritten from it.
+    Returning None there would lose the page twice over — it would vanish from
+    the editor while ``page_numbers`` still counted it as done, so no retry
+    would ever repair it and the finalize step would silently embed that page
+    without a text layer.
     """
     hdir = Path(hocr_dir)
     sidecar = sidecar_path(hdir, page_no)
+    damaged_sidecar = False
     if sidecar.exists():
         try:
             data = json.loads(sidecar.read_text(encoding="utf-8"))
             return data.get("page") or data
         except (OSError, ValueError):
-            log.warning("unreadable sidecar %s", sidecar, exc_info=True)
-            return None
+            damaged_sidecar = True
+            log.warning("unreadable sidecar %s — rebuilding it from the hOCR",
+                        sidecar, exc_info=True)
 
     hocr_file = hocr_path(hdir, page_no)
     if not hocr_file.exists():
@@ -285,7 +349,7 @@ def load_page(hocr_dir: Path, page_no: int,
                              page_no=page_no)
     if page is None:
         return None
-    if persist_missing_sidecar:
+    if persist_missing_sidecar or damaged_sidecar:
         try:
             sidecar.write_text(
                 json.dumps({"page": page, "dpi": dpi or 300.0},

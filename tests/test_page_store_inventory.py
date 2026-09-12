@@ -131,3 +131,97 @@ def test_tesseract_line_confidence_is_0_to_1_fraction(tmp_path):
     assert len(page["blocks"]) == 1
     # (58 + 54 + 33) / 3 = 48.33… -> 0.48 on the 0..1 scale.
     assert page["blocks"][0]["conf"] == 0.48
+
+
+# --- crash artifacts: every counted page must be loadable --------------------
+
+_COMPLETE_HOCR = _HOCR_HEADER + (
+    "<div class='ocr_page' title='bbox 0 0 1000 2000; ppageno 2'>\n"
+    " <p class='ocr_par' title='bbox 100 100 900 200'>\n"
+    "  <span class='ocr_line' title='bbox 100 100 900 200'>\n"
+    "   <span class='ocrx_word' title='bbox 100 100 300 200'>hi</span>\n"
+    "  </span>\n"
+    " </p>\n"
+    "</div>\n</body>\n</html>\n"
+)
+_SIDECAR = ('{"page": {"page_index": 2, "width": 1000, "height": 2000, '
+            '"blocks": []}, "dpi": 300}')
+
+
+def _write(tmp_path, page_no: int, *, hocr: str | None, sidecar: str | None):
+    if hocr is not None:
+        (tmp_path / f"{page_no:06d}_ocr_hocr.hocr").write_text(
+            hocr, encoding="utf-8")
+    if sidecar is not None:
+        (tmp_path / f"{page_no:06d}_ocr_hocr.blocks.json").write_text(
+            sidecar, encoding="utf-8")
+
+
+def test_a_truncated_sidecar_still_counts_when_the_hocr_is_complete(tmp_path):
+    """The hOCR is the reproducible source: a damaged sidecar is rebuilt."""
+    _write(tmp_path, 3, hocr=_COMPLETE_HOCR, sidecar=_SIDECAR[: len(_SIDECAR) // 2])
+
+    assert page_store.page_numbers(tmp_path) == [3]
+    page = page_store.load_page(tmp_path, 3)      # repaired from the hOCR
+    assert page is not None and page["page_index"] == 2
+    # ...and the repair was persisted, so the next load reads a valid sidecar.
+    assert page_store.page_numbers(tmp_path) == [3]
+    assert page_store._sidecar_complete(
+        page_store.sidecar_path(tmp_path, 3)) is True
+
+
+def test_a_truncated_hocr_is_not_rescued_by_its_sidecar(tmp_path):
+    """A half-written hOCR must stay re-runnable, sidecar or not.
+
+    The sidecar cannot vouch for the page: a stale one from an earlier run
+    would mask a page that is being re-OCR'd right now (exactly the state a
+    crash leaves behind).  So the page is NOT counted as done, and "retry
+    remaining" re-runs it.
+    """
+    _write(tmp_path, 3, hocr=_COMPLETE_HOCR[: len(_COMPLETE_HOCR) // 2],
+           sidecar=_SIDECAR)
+
+    assert page_store.page_numbers(tmp_path) == []
+
+
+def test_every_counted_page_is_loadable(tmp_path):
+    """The invariant that keeps a page repairable: counted => readable.
+
+    A page counted as done but unreadable is invisible in the editor AND
+    skipped by every retry, so nothing could ever repair it.  ``load_page``
+    may be MORE permissive than the inventory (a valid sidecar is still
+    readable while its page waits to be re-OCR'd) — that direction is harmless.
+    """
+    _write(tmp_path, 1, hocr=_COMPLETE_HOCR, sidecar=_SIDECAR)
+    _write(tmp_path, 2, hocr=_COMPLETE_HOCR,
+           sidecar=_SIDECAR[: len(_SIDECAR) // 2])
+    _write(tmp_path, 3, hocr=_COMPLETE_HOCR[: len(_COMPLETE_HOCR) // 2],
+           sidecar=_SIDECAR)
+    _write(tmp_path, 4, hocr=None, sidecar=_SIDECAR)
+    _write(tmp_path, 5, hocr=None, sidecar=_SIDECAR[: len(_SIDECAR) // 2])
+
+    counted = set(page_store.page_numbers(tmp_path))
+    unreadable = {n for n in range(1, 6)
+                  if page_store.load_page(tmp_path, n) is None}
+    assert counted == {1, 2, 4}, counted
+    assert counted.isdisjoint(unreadable), (
+        f"counted as done but unreadable: {counted & unreadable}")
+
+
+def test_a_sidecar_only_page_counts_when_it_is_fully_written(tmp_path):
+    """Sidecar-only engines: the file is the result, but only when intact."""
+    _write(tmp_path, 4, hocr=None, sidecar=_SIDECAR)
+    assert page_store.page_numbers(tmp_path) == [4]
+
+    _write(tmp_path, 5, hocr=None, sidecar=_SIDECAR[: len(_SIDECAR) // 2])
+    _write(tmp_path, 6, hocr=None, sidecar="")
+    assert page_store.page_numbers(tmp_path) == [4]
+    # A truncated sidecar-only page has no result at all — and is not readable.
+    assert page_store.load_page(tmp_path, 5) is None
+    assert page_store.load_page(tmp_path, 6) is None
+
+
+def test_a_complete_page_still_counts_normally(tmp_path):
+    _write(tmp_path, 7, hocr=_COMPLETE_HOCR, sidecar=_SIDECAR)
+    assert page_store.page_numbers(tmp_path) == [7]
+    assert page_store.load_page(tmp_path, 7) is not None
