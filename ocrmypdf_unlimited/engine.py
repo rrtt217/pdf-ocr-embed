@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -51,6 +52,7 @@ from ocrmypdf_unlimited.files import (
     hocr_path,
     is_cancelled,
     page_index_from_name,
+    write_progress,
 )
 from ocrmypdf_unlimited.line_split import (
     split_block_into_lines,
@@ -216,6 +218,21 @@ def _batcher_for(job_dir: Path, batch_size: int, client: UnlimitedOcrClient,
         return batcher
 
 
+def _progress_reporter(job_dir: Path, page_index: int) -> Callable[[dict], None]:
+    """A per-attempt hook that records the attempt into ``<job_dir>/progress.json``.
+
+    Without it the only host-visible sign of a request is "the page count has
+    not moved", which cannot distinguish a slow model from an endpoint that
+    accepted the upload and stopped answering — an hour of silent retries looks
+    exactly like a frozen app (see UI_IMPROVEMENTS.md §3).  Best-effort: the
+    write never raises (``files.write_progress``).
+    """
+    def report(info: dict) -> None:
+        write_progress(job_dir, {"page": page_index + 1, "at": time.time(),
+                                 **info})
+    return report
+
+
 def _cancel_check(job_dir: Optional[Path]) -> Callable[[], bool]:
     """An is_cancelled() check for the batcher (anonymous runs: never)."""
     if job_dir is None:
@@ -320,7 +337,12 @@ class UnlimitedOcrEngine(OcrEngine):
         # OCR_UNLIMITED_* env > host-injected snapshot > client defaults.
         # Never a host's config module.
         cfg = unlimited_settings.effective(options)
-        client = UnlimitedOcrClient(config=cfg)
+        client = UnlimitedOcrClient(
+            config=cfg,
+            # Anonymous runs (no work folder) simply have no progress sink.
+            on_attempt=(_progress_reporter(job_dir, page_index)
+                        if job_dir != Path() else None),
+        )
 
         # generate_raw (default off): keep each block's raw (pre-normalized)
         # content — the block sidecar gains a 'raw' field and the hOCR gains

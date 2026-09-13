@@ -341,6 +341,71 @@ def clear_job(job_id: str) -> bool:
     return True
 
 
+# Statuses where a run is (or is about to be) inside an OCR phase.
+_LIVE_STATUSES = ("uploaded", "running", "retrying")
+
+
+def _read_run_progress(job: dict) -> Optional[dict]:
+    """The plugin's optional ``progress.json``: what the engine is doing now.
+
+    Additive and best-effort by design — an older plugin never writes it, so a
+    missing/garbled file just means "less detail".  A file left over from a
+    PREVIOUS run is ignored (timestamped before this run started) so a finished
+    job can never look busy.
+    """
+    path = page_store.progress_path(_job_dir(job["job_id"]))
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    started = job.get("run_started_at")
+    at = raw.get("at")
+    if isinstance(started, (int, float)) and isinstance(at, (int, float)) \
+            and at < started:
+        return None
+    return raw
+
+
+def run_activity(job_id: str) -> dict:
+    """Stall-vs-working signals for the WebUI (never raises).
+
+    Derived rather than bookkept: "progress" means "a page got a result on
+    disk", so the newest hOCR mtime *is* the time of the last progress — it
+    survives a restart and cannot drift from what is really on disk.  Together
+    with the plugin's per-attempt ``progress.json`` this answers the question a
+    bare ``223/224`` cannot: is it working, or is it waiting on an endpoint
+    that accepted the upload and stopped answering?
+    """
+    job = get_job(job_id)
+    if job is None:
+        return {}
+    hdir = Path(job.get("hocr_dir") or "")
+    newest = 0.0
+    try:
+        for path in hdir.glob("*_ocr_hocr.hocr"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    now = time.time()
+    started = job.get("run_started_at")
+    activity = {
+        "pages_done": int(job.get("pages_done") or 0),
+        "num_pages": int(job.get("num_pages") or 0),
+        "last_progress_at": newest or None,
+        "seconds_since_progress": (now - newest) if newest else None,
+        "running_for": (now - started)
+        if isinstance(started, (int, float)) else None,
+        "progress": _read_run_progress(job)
+        if job.get("status") in _LIVE_STATUSES else None,
+    }
+    return activity
+
+
 def list_jobs() -> List[dict]:
     """Every job (running or finished), newest first.
 
@@ -367,6 +432,10 @@ def list_jobs() -> List[dict]:
         "current": j.get("pages_done", 0),
         "total": j.get("num_pages", 0),
         "created": j.get("created") or 0,
+        # Stall-vs-working detail for a live run (absent/None for finished
+        # jobs, so nothing changes for the common case).
+        "activity": run_activity(j.get("job_id") or "")
+        if j.get("status") in _LIVE_STATUSES else None,
     } for j in jobs]
 
 
@@ -477,7 +546,8 @@ def _run_ocr(job_id: str, overrides: Optional[dict] = None) -> None:
         if len(selection) < total:
             options["pages"] = ",".join(str(n) for n in sorted(selection))
 
-    _set(job_id, status="running", current=0, error="")
+    _set(job_id, status="running", current=0, error="",
+         run_started_at=time.time())
     _push_event(job_id, {"type": "status", "status": "running",
                          "message": "OCR started (OCRmyPDF)"})
     _persist_if_live(job_id)

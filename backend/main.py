@@ -602,7 +602,9 @@ async def stream(job_id: str):
         # branch in the next one — the client gets "done" twice.
         terminal_delivered = False
         delivered_pages: set = set()
+        tick = 0
         while True:
+            tick += 1
             cur = ocr_service.get_job(job_id)
             if cur is None:
                 break
@@ -642,6 +644,17 @@ async def stream(job_id: str):
                         "pages_done": len(done),
                         "page_index": page_no - 1,
                     })
+
+            # Periodic "still working" signal for a live run: how long since the
+            # last page finished, plus the engine's current HTTP attempt (from
+            # the plugin's optional progress.json).  Without it a page that only
+            # times out leaves the card frozen at N/total with no way to tell
+            # "slow model" from "endpoint stopped answering" — an hour of silent
+            # retries looked exactly like a hung app.
+            if status in ("uploaded", "running", "retrying") and tick % 4 == 1:
+                activity = ocr_service.run_activity(job_id)
+                if activity:
+                    yield _sse({"type": "activity", **activity})
 
             if status in ("done", "embedded"):
                 # Guarantee the "done" status reaches the client even if the

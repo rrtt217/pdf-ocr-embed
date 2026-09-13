@@ -7,6 +7,7 @@ removed); they are exercised through the plugin's own module.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -223,3 +224,77 @@ def test_rate_limiter_context_manager():
     with limiter as l:
         assert l is limiter
     assert limiter.enabled is True
+
+
+# --- attempt visibility (a stalled endpoint must not look like a frozen app) --
+
+def test_failed_attempts_are_logged_at_warning(caplog):
+    """A page that only times out used to retry in total silence (DEBUG), which
+    made an hour of blocked requests indistinguishable from a hung app.  Every
+    failed attempt must be visible in a default INFO log, with its index, the
+    total attempt count and the elapsed time."""
+    def handler(request):
+        raise httpx.ConnectTimeout("simulated timeout")
+
+    with caplog.at_level(logging.WARNING, logger="ocrmypdf_unlimited.http_retry"):
+        with pytest.raises(RuntimeError):
+            post_json_with_retry(
+                _make_client(handler), "http://x/chat/completions",
+                json={"a": 1}, headers={}, max_retries=2, base_delay=0.001,
+                max_delay=0.01, sleep=lambda s: None, timeout=900.0,
+            )
+
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(messages) == 3           # 2 failed attempts + the give-up line
+    assert "attempt 1/3" in messages[0] and "attempt 2/3" in messages[1]
+    assert "ConnectTimeout" in messages[0]
+    assert "read timeout 900s" in messages[0]
+    assert "giving up after 3 attempt(s)" in messages[2]
+
+
+def test_retryable_status_is_logged_at_warning(caplog):
+    def handler(request):
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    with caplog.at_level(logging.WARNING, logger="ocrmypdf_unlimited.http_retry"):
+        with pytest.raises(httpx.HTTPStatusError):
+            post_json_with_retry(
+                _make_client(handler), "http://x", json={}, headers={},
+                max_retries=1, base_delay=0.001, max_delay=0.01,
+                sleep=lambda s: None,
+            )
+
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "attempt 1/2 got retryable status 503" in text
+    assert "giving up after 2 attempt(s)" in text
+
+
+def test_on_attempt_reports_progress_and_never_breaks_the_request():
+    """The host's UI reads these events; a broken hook must not fail OCR."""
+    seen = []
+
+    def handler(request):
+        raise httpx.ConnectTimeout("nope")
+
+    with pytest.raises(RuntimeError):
+        post_json_with_retry(
+            _make_client(handler), "http://x", json={}, headers={},
+            max_retries=1, base_delay=0.001, max_delay=0.01,
+            sleep=lambda s: None, timeout=900.0, on_attempt=seen.append,
+        )
+    assert [e["event"] for e in seen] == ["start", "retrying", "start", "failed"]
+    assert seen[0] == {"event": "start", "attempt": 1, "attempts_total": 2,
+                       "elapsed": seen[0]["elapsed"], "timeout": 900.0}
+    assert seen[1]["attempt"] == 1 and seen[1]["reason"] == "ConnectTimeout"
+    assert seen[3]["attempt"] == 2 and seen[3]["attempts_total"] == 2
+
+    # A hook that raises must be swallowed: progress is a courtesy.
+    def boom(_info):
+        raise RuntimeError("broken hook")
+
+    resp = post_json_with_retry(
+        _make_client(lambda request: httpx.Response(200, json={"ok": True})),
+        "http://x", json={}, headers={}, max_retries=0, sleep=lambda s: None,
+        on_attempt=boom,
+    )
+    assert resp.status_code == 200

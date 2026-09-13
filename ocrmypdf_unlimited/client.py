@@ -26,7 +26,7 @@ import hashlib
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -70,7 +70,8 @@ class UnlimitedOcrClient:
 
     def __init__(self, base_url: str | None = None, api_key: str | None = None,
                  model: str | None = None, max_tokens: int | None = None,
-                 config: Dict[str, Any] | None = None):
+                 config: Dict[str, Any] | None = None,
+                 on_attempt: Optional[Callable[[dict], None]] = None):
         # No explicit config -> the plugin settings store: the host may push a
         # snapshot via settings.configure() (the engine passes the fully
         # resolved settings.effective() config instead).
@@ -94,6 +95,9 @@ class UnlimitedOcrClient:
             RateLimiter.from_requests_per_second(self.rate_limit_rps)
             if self.rate_limit_rps > 0 else None
         )
+        # Optional per-attempt hook (the engine wires it to the job's
+        # progress.json so a host's UI can show "attempt 2/4, 12 min in").
+        self.on_attempt = on_attempt
 
     def cache_fingerprint(self) -> dict:
         """Output-affecting settings (endpoint, model, key identity)."""
@@ -136,6 +140,8 @@ class UnlimitedOcrClient:
                 base_delay=self.retry_base_delay,
                 max_delay=self.retry_max_delay,
                 rate_limiter=self._rate_limiter,
+                timeout=read_timeout,
+                on_attempt=self.on_attempt,
             )
             log.debug("response %d in %.1fs (%d bytes)", resp.status_code,
                       time.time() - t0, len(resp.content))

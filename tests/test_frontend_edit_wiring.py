@@ -105,3 +105,60 @@ def test_no_control_that_cannot_affect_the_output():
     assert "function preserveFontScale(" in src
     assert "preserveFontScale(chosen[0], {" in _function_body("mergeSelected")
     assert "preserveFontScale(block, {" in _function_body("splitBlock")
+
+
+def test_job_card_surfaces_live_run_activity():
+    """A running card must answer "is it stuck?": how long since the last page
+    finished, and which HTTP attempt the engine is on.  Activity events patch
+    that one line in place — a full re-render every couple of seconds would
+    fight the user's scrolling and selection."""
+    src = _source()
+    assert "STALL_WARN_SECONDS" in src, \
+        "a run that produces nothing must be flagged as waiting on the endpoint"
+
+    card = _function_body("jobCard")
+    assert "fillActivityLine(" in card, \
+        "the job card must render the activity line for a live run"
+
+    apply_event = _function_body("applyJobEvent")
+    assert 'msg.type === "activity"' in apply_event, \
+        "applyJobEvent must handle the SSE activity event"
+    assert "updateActivityLine(" in apply_event
+
+    updater = _function_body("updateActivityLine")
+    assert "getElementById" in updater, \
+        "activity updates must patch the existing line, not re-render the list"
+
+    css = (APP_JS.parent / "style.css").read_text(encoding="utf-8")
+    assert ".job-activity" in css and ".job-activity.stalled" in css
+
+
+def test_i18n_dictionaries_stay_in_sync_and_cover_every_call():
+    """The UI is bilingual: a missing zh/en entry silently falls back to English
+    (or to the raw key), which is exactly the kind of gap nobody notices until a
+    user does.  Pure text checks — no JS runtime needed."""
+    i18n = (APP_JS.parent / "i18n.js").read_text(encoding="utf-8")
+
+    def keys_of(locale: str) -> set:
+        start = i18n.index(f"\n  {locale}: {{")
+        end = i18n.index("\n  },", start)
+        body = i18n[start:end]
+        return set(re.findall(r'^\s{4}"([^"]+)":', body, re.M))
+
+    en, zh = keys_of("en"), keys_of("zh")
+    assert en, "could not parse the en dictionary"
+    assert en == zh, (
+        f"i18n dictionaries out of sync — missing in zh: {sorted(en - zh)}; "
+        f"missing in en: {sorted(zh - en)}")
+
+    app = _source()
+    used = set(re.findall(r'\bt\("([^"]+)"', app))
+    # Two call sites build keys dynamically (`status.` + code, `cleanup.area.`).
+    missing = {k for k in used if k not in en and not k.endswith(".")}
+    assert not missing, f"t() keys with no translation: {sorted(missing)}"
+
+    html = (APP_JS.parent / "index.html").read_text(encoding="utf-8")
+    declared = set(re.findall(
+        r'data-i18n(?:-html|-title|-placeholder|-alt)?="([^"]+)"', html))
+    assert not (declared - en), \
+        f"markup keys with no translation: {sorted(declared - en)}"

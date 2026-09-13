@@ -47,6 +47,17 @@ def cancel_path(job_dir: Path) -> Path:
     return Path(job_dir) / "cancel"
 
 
+def progress_path(job_dir: Path) -> Path:
+    """The engine's OPTIONAL run-progress file (``<job_dir>/progress.json``).
+
+    Written by the plugin around every HTTP attempt (page, attempt N/M, elapsed,
+    read timeout) so the WebUI can tell "working" apart from "waiting on an
+    endpoint that accepted the request and stopped answering".  Absent for
+    engines that do not write it — the reader treats it as pure extra detail.
+    """
+    return Path(job_dir) / "progress.json"
+
+
 # --- cancel flag (service -> engine, via the filesystem) ---------------------
 
 # Cancellation is an EXCLUSIVE capability of the unlimited engine plugin: the

@@ -92,6 +92,21 @@ def _backoff_delay(attempt: int, base_delay: float, max_delay: float) -> float:
     return random.uniform(0.0, cap)
 
 
+def _notify(on_attempt: Optional[Callable[[dict], None]], payload: dict) -> None:
+    """Call the optional attempt hook.  Reporting is best-effort by design: a
+    broken/slow hook must never fail an OCR page."""
+    if on_attempt is None:
+        return
+    try:
+        on_attempt(payload)
+    except Exception:  # noqa: BLE001
+        log.debug("attempt hook failed", exc_info=True)
+
+
+def _timeout_note(timeout: Optional[float]) -> str:
+    return f", read timeout {timeout:.0f}s" if timeout else ""
+
+
 def post_json_with_retry(
     client: httpx.Client,
     url: str,
@@ -103,12 +118,19 @@ def post_json_with_retry(
     max_delay: float = 30.0,
     rate_limiter: Optional["RateLimiter"] = None,
     sleep: Callable[[float], None] = time.sleep,
+    timeout: Optional[float] = None,
+    on_attempt: Optional[Callable[[dict], None]] = None,
 ) -> httpx.Response:
     """POST ``json`` to ``url`` with retry/backoff and optional rate limiting.
 
     The first attempt is made immediately; each subsequent attempt waits for the
     rate limiter (if any) to release a permit, then applies exponential backoff
     (honouring ``Retry-After`` on 429) before issuing the next request.
+
+    Every failed attempt is logged at WARNING with its index, the total number
+    of attempts and the elapsed time: a page that spends an hour timing out
+    against a stalled endpoint must be visible in a default INFO log, not
+    silently retried (that is exactly how a hung run looked like no run at all).
 
     Args:
         client: The ``httpx.Client`` to use.
@@ -121,6 +143,12 @@ def post_json_with_retry(
         max_delay: Upper bound for the backoff delay in seconds.
         rate_limiter: Optional ``RateLimiter`` to throttle requests with.
         sleep: Injectable sleep for tests; defaults to ``time.sleep``.
+        timeout: The client's read timeout in seconds, reported in the log and
+            to ``on_attempt`` (informational only — httpx enforces it).
+        on_attempt: Optional callback receiving ``{"event": "start" |
+            "retrying" | "failed", "attempt", "attempts_total", "elapsed",
+            "timeout", "reason"}`` so a host can show live progress instead of
+            a frozen page count.
 
     Returns:
         The final ``httpx.Response`` once a non-retryable status is returned.
@@ -135,33 +163,66 @@ def post_json_with_retry(
     if max_retries < 0:
         raise ValueError("max_retries must be >= 0")
 
+    total_attempts = max_retries + 1
+    started = time.monotonic()
+
     for attempt in range(max_retries + 1):
         if rate_limiter is not None:
             rate_limiter.acquire()
 
+        _notify(on_attempt, {
+            "event": "start",
+            "attempt": attempt + 1,
+            "attempts_total": total_attempts,
+            "elapsed": time.monotonic() - started,
+            "timeout": timeout,
+        })
+
         try:
             response = client.post(url, json=json, headers=headers)
         except _TRANSPORT_ERROR as exc:
+            elapsed = time.monotonic() - started
+            reason = type(exc).__name__
             if attempt >= max_retries:
+                log.warning("POST %s giving up after %d attempt(s) in %.1fs: %s%s",
+                            url, total_attempts, elapsed, reason,
+                            _timeout_note(timeout))
+                _notify(on_attempt, {
+                    "event": "failed", "attempt": attempt + 1,
+                    "attempts_total": total_attempts, "elapsed": elapsed,
+                    "timeout": timeout, "reason": reason,
+                })
                 raise RuntimeError(
                     f"POST {url} failed after {max_retries} retries "
                     f"(transport error): {exc}"
                 ) from exc
             delay = _backoff_delay(attempt, base_delay, max_delay)
-            log.debug("POST %s transport failure (attempt %d); retrying in %.2fs",
-                      url, attempt + 1, delay)
+            log.warning("POST %s attempt %d/%d failed after %.1fs: %s%s; "
+                        "retrying in %.2fs", url, attempt + 1, total_attempts,
+                        elapsed, reason, _timeout_note(timeout), delay)
+            _notify(on_attempt, {
+                "event": "retrying", "attempt": attempt + 1,
+                "attempts_total": total_attempts, "elapsed": elapsed,
+                "timeout": timeout, "reason": reason, "retry_in": delay,
+            })
             sleep(delay)
             continue
 
         if not should_retry(response.status_code, None, "POST"):
             return response
 
+        elapsed = time.monotonic() - started
         if attempt >= max_retries:
             # Give up on this retryable status; surface it as the caller would
             # have seen from a single non-retryable request.
-            log.warning("POST %s still failing after %d retries "
-                        "(status %d); giving up", url, max_retries,
+            log.warning("POST %s giving up after %d attempt(s) in %.1fs "
+                        "(status %d)", url, total_attempts, elapsed,
                         response.status_code)
+            _notify(on_attempt, {
+                "event": "failed", "attempt": attempt + 1,
+                "attempts_total": total_attempts, "elapsed": elapsed,
+                "timeout": timeout, "reason": f"HTTP {response.status_code}",
+            })
             response.raise_for_status()
             raise RuntimeError(
                 f"POST {url} failed after {max_retries} retries "
@@ -171,8 +232,15 @@ def post_json_with_retry(
         delay = _parse_retry_after(response)
         if delay is None:
             delay = _backoff_delay(attempt, base_delay, max_delay)
-        log.debug("POST %s retryable status %d (attempt %d); retrying in %.2fs",
-                  url, response.status_code, attempt + 1, delay)
+        log.warning("POST %s attempt %d/%d got retryable status %d after "
+                    "%.1fs; retrying in %.2fs", url, attempt + 1,
+                    total_attempts, response.status_code, elapsed, delay)
+        _notify(on_attempt, {
+            "event": "retrying", "attempt": attempt + 1,
+            "attempts_total": total_attempts, "elapsed": elapsed,
+            "timeout": timeout, "reason": f"HTTP {response.status_code}",
+            "retry_in": delay,
+        })
         sleep(delay)
 
     raise RuntimeError(f"POST {url} failed after {max_retries} retries")  # pragma: no cover

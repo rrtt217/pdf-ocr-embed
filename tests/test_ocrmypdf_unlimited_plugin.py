@@ -243,14 +243,20 @@ def test_coordinate_mapping_matches_host_copy():
 # --- end-to-end through ocrmypdf ---------------------------------------------
 
 def _stub_client(monkeypatch, raw=RAW):
+    seen = {}
+
     class _FakeClient:
         max_tokens = 16384
         batch_per_page_tokens = 2048
         READ_TIMEOUT_MIN = 900.0
         READ_TIMEOUT_PER_TOKEN = 0.08
 
-        def __init__(self, config=None):
+        def __init__(self, config=None, on_attempt=None):
             self.api_key = config.get("api_key") or "k"
+            # The engine wires its progress hook in here; the real client
+            # forwards it to the retry helper (asserted by the progress test).
+            self.on_attempt = on_attempt
+            seen["on_attempt"] = on_attempt
 
         def recognize(self, path):
             return raw
@@ -260,7 +266,7 @@ def _stub_client(monkeypatch, raw=RAW):
 
     import ocrmypdf_unlimited.engine as engine_mod
     monkeypatch.setattr(engine_mod, "UnlimitedOcrClient", _FakeClient)
-    return _FakeClient
+    return seen
 
 
 def _tiny_pdf(path: Path):
@@ -299,3 +305,56 @@ def test_pdf_to_hocr_end_to_end(monkeypatch, tmp_path):
     assert "ocrx_word" in text         # parser drops lines without words
     data = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert data["page"]["blocks"][0]["text"] == "Standalone plugin works page"
+
+
+# --- run-progress file (engine -> host UI, OPTIONAL, best-effort) ------------
+
+def test_progress_path_matches_host_copy():
+    """The host reads <job_dir>/progress.json; the plugin writes it.  The path
+    is the contract, so it is pinned on both sides like hOCR/cancel."""
+    from pathlib import Path as _P
+
+    from backend import page_store
+    from ocrmypdf_unlimited import files
+
+    assert files.progress_path(_P("/j")) == page_store.progress_path(_P("/j"))
+    assert files.progress_path(_P("/j")).name == "progress.json"
+
+
+def test_write_progress_is_readable_and_never_raises(tmp_path):
+    from ocrmypdf_unlimited import files
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    files.write_progress(job_dir, {"page": 187, "at": 123.0, "event": "start",
+                                   "attempt": 2, "attempts_total": 4,
+                                   "elapsed": 12.5, "timeout": 900.0})
+    data = json.loads(files.progress_path(job_dir).read_text(encoding="utf-8"))
+    assert data["page"] == 187 and data["attempt"] == 2
+    assert data["attempts_total"] == 4 and data["timeout"] == 900.0
+
+    # A reader must never see a half-written file: the write goes through a
+    # temp sibling and is renamed into place.
+    assert not (job_dir / "progress.json.tmp").exists()
+
+    # Progress is a courtesy: an unwritable folder must not fail the page.
+    files.write_progress(tmp_path / "does" / "not" / "exist",
+                         {"page": 1})
+
+
+def test_engine_progress_reporter_writes_the_job_file(tmp_path):
+    """The engine wires the client's attempt hook to this reporter; what it
+    writes is what the host renders as "page N · attempt a/m"."""
+    from ocrmypdf_unlimited import files
+    from ocrmypdf_unlimited.engine import _progress_reporter
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    report = _progress_reporter(job_dir, page_index=186)   # 1-based page 187
+    report({"event": "start", "attempt": 2, "attempts_total": 4,
+            "elapsed": 3.0, "timeout": 900.0})
+
+    data = json.loads(files.progress_path(job_dir).read_text(encoding="utf-8"))
+    assert data["page"] == 187
+    assert data["attempt"] == 2 and data["attempts_total"] == 4
+    assert isinstance(data["at"], float) and data["at"] > 0

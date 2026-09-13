@@ -676,6 +676,66 @@ async function loadJobs() {
   }
 }
 
+/* ---------- live run activity: working vs. waiting on the endpoint ----------
+   The engine reports its current HTTP attempt into the job's work folder
+   (``progress.json``) and the server derives "how long since the last page
+   finished" from the hOCR files; both arrive as SSE ``activity`` events and in
+   ``/api/jobs``.  Without them a page that only times out shows a frozen
+   ``223 / 224`` forever — an hour of silent retries looked exactly like a hung
+   app.  A run that has produced nothing for longer than a read timeout is, in
+   practice, waiting on the OCR endpoint, so say that. */
+const STALL_WARN_SECONDS = 300;
+
+function activityId(jobId) {
+  return "job-activity-" + jobId;
+}
+
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  if (s < 60) return s + t("job.activity.unit.sec");
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + t("job.activity.unit.min");
+  return Math.floor(m / 60) + t("job.activity.unit.hour")
+    + (m % 60) + t("job.activity.unit.min");
+}
+
+function fillActivityLine(node, activity) {
+  node.className = "job-activity";
+  if (!activity) {
+    node.textContent = t("job.activity.working");
+    return;
+  }
+  const parts = [];
+  const p = activity.progress;
+  if (p && p.page) {
+    parts.push(p.attempt && p.attempts_total
+      ? t("job.activity.attemptPage",
+          { n: p.page, a: p.attempt, m: p.attempts_total })
+      : t("job.activity.page", { n: p.page }));
+  }
+  if (typeof activity.seconds_since_progress === "number") {
+    parts.push(t("job.activity.sinceProgress",
+                 { d: formatDuration(activity.seconds_since_progress) }));
+  }
+  if (typeof activity.running_for === "number") {
+    parts.push(t("job.activity.runningFor",
+                 { d: formatDuration(activity.running_for) }));
+  }
+  node.textContent = parts.join(" · ") || t("job.activity.working");
+  if (typeof activity.seconds_since_progress === "number"
+      && activity.seconds_since_progress >= STALL_WARN_SECONDS) {
+    node.classList.add("stalled");
+    node.textContent += " · " + t("job.activity.stalled");
+  }
+}
+
+/* Patch one card's line in place (called on every activity event). */
+function updateActivityLine(jobId) {
+  const node = document.getElementById(activityId(jobId));
+  const job = jobById(jobId);
+  if (node && job) fillActivityLine(node, job.activity);
+}
+
 function renderJobs() {
   const section = $("#jobs-section");
   const list = $("#jobs-list");
@@ -713,6 +773,16 @@ function jobCard(job) {
     : (job.total ? Math.round((job.current / job.total) * 100) + "%" : "2%");
   bar.appendChild(fill);
   card.appendChild(bar);
+
+  // Live activity line for a running job: is it working, or waiting on an
+  // endpoint that stopped answering?  `223/224` alone cannot say — an hour of
+  // silent request timeouts looked exactly like a frozen app.
+  if (RUNNING_STATUSES.has(job.status)) {
+    const activity = el("div", "job-activity");
+    activity.id = activityId(job.id);
+    card.appendChild(activity);
+    fillActivityLine(activity, job.activity);
+  }
 
   // Export progress: the LLM fix-up / figure extraction / chapter split
   // stream their own progress through the SSE export route (the phases can
@@ -1010,6 +1080,14 @@ function applyJobEvent(jobId, msg) {
     });
   } else if (msg.type === "error") {
     Object.assign(job, { status: "error", error: msg.message });
+  } else if (msg.type === "activity") {
+    // Live "still working / waiting on the endpoint" detail: the engine's
+    // current attempt plus how long since the last page finished.  Patch the
+    // card's line in place — a full renderJobs() every couple of seconds would
+    // fight the user's scrolling and text selection.
+    job.activity = msg;
+    updateActivityLine(jobId);
+    return;
   } else {
     return; // warning / error_page — cosmetic, nothing persisted
   }
