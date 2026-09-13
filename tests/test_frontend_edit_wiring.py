@@ -84,3 +84,24 @@ def test_conf_controls_yield_to_the_block_filter_without_conf_data():
     render = _function_body("renderPage")
     assert "updateReviewControls()" in render, \
         "renderPage() must decide between the confidence controls and the filter"
+
+
+def test_no_control_that_cannot_affect_the_output():
+    """The per-block font-size slider was removed because it could not do
+    anything: `page_store.blocks_to_hocr()` ignores `font_scale` and the fpdf2
+    renderer fits each word to its bbox (UI_IMPROVEMENTS.md §2.9 P0-1b).
+
+    If a font-size control comes back, it must come back WITH the rendering
+    support — otherwise the UI is again promising an effect it cannot deliver.
+    The data field itself stays: an older sidecar's value must survive edits.
+    """
+    src = _source()
+    assert "fs-row" not in src and "fontSize" not in src, \
+        "a font-size control reappeared in the block editor — make font_scale " \
+        "affect the embedded output first (or keep the control out)"
+    assert "font_scale: 1.0" not in src, \
+        "blocks must not be seeded with font_scale; only an existing value is kept"
+
+    assert "function preserveFontScale(" in src
+    assert "preserveFontScale(chosen[0], {" in _function_body("mergeSelected")
+    assert "preserveFontScale(block, {" in _function_body("splitBlock")

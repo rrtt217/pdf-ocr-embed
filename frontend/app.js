@@ -1544,40 +1544,15 @@ function buildBlockEditor(block, bi) {
   // Reset the nudge-undo latch when focus leaves this block editor.
   wrapper.addEventListener("focusout", () => { wrapper.dataset.nudgeUndone = ""; });
 
-  // ---- Interactive font-size control (debug: too big / too small) ----
-  if (block.font_scale == null) block.font_scale = 1.0;
-  const fsRow = el("div", "fs-row");
-  const fsLabel = el("span", "fs-label", t("editor.fontSize"));
-  const fsSlider = document.createElement("input");
-  fsSlider.type = "range";
-  fsSlider.min = "0.5"; fsSlider.max = "1.5"; fsSlider.step = "0.05";
-  fsSlider.value = block.font_scale;
-  fsSlider.className = "fs-slider";
-  const fsVal = el("span", "fs-val", block.font_scale.toFixed(2) + "×");
-  fsSlider.oninput = () => {
-    block.font_scale = parseFloat(fsSlider.value);
-    fsVal.textContent = block.font_scale.toFixed(2) + "×";
-    markDirty();
-  };
-  // Reset to auto
-  const fsReset = el("button", "small", t("editor.auto"));
-  fsReset.title = t("editor.autoTitle");
-  fsReset.onclick = () => {
-    block.font_scale = 1.0;
-    fsSlider.value = "1.0";
-    fsVal.textContent = "1.00×";
-    markDirty();
-  };
-  fsRow.appendChild(fsLabel);
-  fsRow.appendChild(fsSlider);
-  fsRow.appendChild(fsVal);
-  fsRow.appendChild(fsReset);
-  fsRow.appendChild(el("span", "fs-der", ""));
-
+  // NOTE: the per-block font-size control that used to live here was removed.
+  // It only wrote `font_scale` into the sidecar: `page_store.blocks_to_hocr()`
+  // never reads it and ocrmypdf's fpdf2 renderer fits every word to its bbox,
+  // so the slider changed nothing in the output PDF.  The field itself stays
+  // part of the interchange model (old sidecars may carry a tuned value, which
+  // blocks_to_hocr preserves through an edit) — see preserveFontScale().
   wrapper.appendChild(meta);
   wrapper.appendChild(textarea);
   wrapper.appendChild(opsRow);
-  wrapper.appendChild(fsRow);
   return wrapper;
 }
 
@@ -1590,6 +1565,15 @@ function currentPage() {
 
 function cloneBlocks(blocks) {
   return (blocks || []).map((b) => ({ ...b, bbox: [...b.bbox] }));
+}
+
+/* Carry an existing per-block `font_scale` into a block this code creates
+   (merge / split).  The control that set it is gone — finalize ignores the
+   value — but a sidecar written by an older session must round-trip
+   unchanged instead of silently losing the number on the next edit. */
+function preserveFontScale(from, to) {
+  if (from && from.font_scale != null) to.font_scale = from.font_scale;
+  return to;
 }
 
 function pushUndo() {
@@ -1703,14 +1687,13 @@ function mergeSelected() {
     Math.max(...chosen.map((b) => b.bbox[2])),
     Math.max(...chosen.map((b) => b.bbox[3])),
   ];
-  const merged = {
+  const merged = preserveFontScale(chosen[0], {
     kind: chosen[0].kind,
     bbox,
     text: chosen.map((b) => (b.text || b.caption || "")).filter((s) => s).join("\n"),
     caption: "",
     conf: chosen[0].conf,
-    font_scale: chosen[0].font_scale != null ? chosen[0].font_scale : 1.0,
-  };
+  });
   pushUndo();
   const newBlocks = blocks.filter((_, i) => !indices.includes(i));
   newBlocks.push(merged);
@@ -1737,9 +1720,8 @@ function splitBlock(bi) {
   }
   const [x1, y1, x2, y2] = block.bbox;
   const frac = Math.min(Math.max(pos / Math.max(text.length, 1), 0), 1);
-  const mk = (t1, bx) => ({
-    kind: block.kind, bbox: bx, text: t1, caption: "",
-    conf: block.conf, font_scale: block.font_scale != null ? block.font_scale : 1.0,
+  const mk = (t1, bx) => preserveFontScale(block, {
+    kind: block.kind, bbox: bx, text: t1, caption: "", conf: block.conf,
   });
   let parts;
   if ((x2 - x1) >= (y2 - y1)) {
@@ -1907,8 +1889,7 @@ function overlayPointerUp() {
     if (rect && (rect[2] - rect[0]) >= 8 && (rect[3] - rect[1]) >= 8) {
       pushUndo();
       page.blocks.push({
-        kind: "text", bbox: rect, text: "", caption: "",
-        conf: null, font_scale: 1.0,
+        kind: "text", bbox: rect, text: "", caption: "", conf: null,
       });
       sel.selection = { pageIndex: sel.pageIndex, indices: new Set([page.blocks.length - 1]) };
       sel.drawMode = false;
@@ -2107,23 +2088,9 @@ async function validateJob() {
   }
 }
 
-function downloadDataset() {
-  const sel = state.sel;
-  if (!sel || !sel.pages.length) return;
-  const ds = {
-    job_id: sel.jobId,
-    generated_at: new Date().toISOString(),
-    adapter_font_scale_def: t("dataset.def"),
-    pages: sel.pages,
-  };
-  const blob = new Blob([JSON.stringify(ds, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `ocr_font_dataset_${sel.jobId}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+/* NOTE: downloadDataset() used to live here — an unreachable helper (no button
+   or shortcut ever called it) that exported state.sel.pages with a blurb about
+   `font_scale`.  Both the blurb and the font-size control it served are gone. */
 
 /* ---------- settings ---------- */
 // OCRmyPDF pipeline knobs (persisted server-side; see backend/config.py).
