@@ -129,8 +129,17 @@ def test_job_card_surfaces_live_run_activity():
     assert "getElementById" in updater, \
         "activity updates must patch the existing line, not re-render the list"
 
+    filler = _function_body("fillActivityLine")
+    assert "progress_this_run" in filler, (
+        "the card must stay quiet about \"no new page\" until THIS run has "
+        "produced one — otherwise a fresh retry announces the age of the "
+        "previous run's results")
+    assert "pastTimeout" in filler and "job.activity.waiting" in filler, (
+        "an attempt still inside its read timeout is \"waiting\", not a stall")
+
     css = (APP_JS.parent / "style.css").read_text(encoding="utf-8")
     assert ".job-activity" in css and ".job-activity.stalled" in css
+    assert ".job-activity.waiting" in css
 
 
 def test_i18n_dictionaries_stay_in_sync_and_cover_every_call():

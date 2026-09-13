@@ -713,19 +713,56 @@ function fillActivityLine(node, activity) {
           { n: p.page, a: p.attempt, m: p.attempts_total })
       : t("job.activity.page", { n: p.page }));
   }
-  if (typeof activity.seconds_since_progress === "number") {
-    parts.push(t("job.activity.sinceProgress",
-                 { d: formatDuration(activity.seconds_since_progress) }));
+  const idle = activity.seconds_since_progress;
+  const runFor = activity.running_for;
+  const attemptElapsed = p && typeof p.elapsed === "number" ? p.elapsed : null;
+  const timeout = p && typeof p.timeout === "number" ? p.timeout : null;
+  // An idle figure older than the run itself describes the PREVIOUS run's
+  // results (the false "no new page for 9 h 39 min" 41 s into a retry).  The
+  // current backend clamps it to the run start and says so with
+  // `progress_this_run`; against an older backend (page refreshed, server not
+  // restarted yet) apply the same rule locally so the false alarm cannot come
+  // back in that mixed state.
+  const idleTrusted = activity.progress_this_run !== undefined
+    ? true
+    : (typeof runFor === "number" && typeof idle === "number"
+       && idle < runFor + 60);
+  const progressThisRun = activity.progress_this_run !== undefined
+    ? !!activity.progress_this_run
+    : (typeof runFor === "number" && typeof idle === "number"
+       && idle < runFor + 60);
+  const idleWarn = idleTrusted && typeof idle === "number"
+    && idle >= STALL_WARN_SECONDS;
+  const pastTimeout = attemptElapsed !== null && timeout !== null
+    && attemptElapsed >= timeout;
+  // "No new page for X" only means something once THIS run has produced a page
+  // (or it has gone quiet long enough to be worth flagging): a retry that just
+  // started must not announce the age of the PREVIOUS run's results.
+  if ((progressThisRun || idleWarn) && typeof idle === "number") {
+    parts.push(t("job.activity.sinceProgress", { d: formatDuration(idle) }));
   }
-  if (typeof activity.running_for === "number") {
+  if (typeof runFor === "number") {
     parts.push(t("job.activity.runningFor",
-                 { d: formatDuration(activity.running_for) }));
+                 { d: formatDuration(runFor) }));
   }
   node.textContent = parts.join(" · ") || t("job.activity.working");
-  if (typeof activity.seconds_since_progress === "number"
-      && activity.seconds_since_progress >= STALL_WARN_SECONDS) {
+
+  if (pastTimeout) {
+    // Evidence, not a guess: a full read timeout has already elapsed.
+    node.classList.add("stalled");
+    node.textContent += " · "
+      + t("job.activity.pastTimeout", { t: formatDuration(timeout) });
+  } else if (idleWarn && attemptElapsed === null) {
+    // Nothing produced and no attempt detail at all (an engine that writes no
+    // progress.json): say what is actually known.
     node.classList.add("stalled");
     node.textContent += " · " + t("job.activity.stalled");
+  } else if (idleWarn) {
+    // An attempt is in flight and still inside its timeout: informative, not
+    // alarming — that is what a legitimately slow page looks like.
+    node.classList.add("waiting");
+    node.textContent += " · " + t("job.activity.waiting", {
+      d: formatDuration(attemptElapsed), t: formatDuration(timeout) });
   }
 }
 

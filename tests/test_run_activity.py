@@ -164,3 +164,37 @@ def test_api_jobs_exposes_activity(client, tmp_path, monkeypatch):
     assert entry["activity"]["progress"]["attempt"] == 1
     assert entry["activity"]["progress"]["page"] == 187
     assert entry["activity"]["seconds_since_progress"] >= 99
+
+
+def test_fresh_retry_does_not_inherit_the_age_of_old_results(tmp_path,
+                                                             monkeypatch):
+    """The bug seen live: retrying the single missing page of a book whose last
+    page finished hours (in fact days) ago reported "no new page for 9 h 39 min"
+    41 s into the run, and flagged the endpoint as stalled before the first
+    attempt could possibly have returned.
+
+    The idle clock must be clamped to the CURRENT run, and the card must be told
+    that no page has completed yet in this run."""
+    job = _mk_job(tmp_path, monkeypatch, run_started_at=time.time() - 41)
+    _write_page_result(job, 190, age_seconds=9 * 3600)   # a result from before
+
+    act = ocr_service.run_activity(JOB)
+    assert act["progress_this_run"] is False
+    assert 40 <= act["seconds_since_progress"] <= 50      # not 9 hours
+    assert 40 <= act["running_for"] <= 50
+    # The raw fact is still reported, for anyone who wants it.
+    assert act["last_progress_at"] is not None
+
+
+def test_progress_during_this_run_drives_the_idle_clock(tmp_path, monkeypatch):
+    """Once a page finishes during the run, the idle clock measures from that
+    page — so a run that produced something and then went quiet is still
+    reported honestly."""
+    job = _mk_job(tmp_path, monkeypatch, run_started_at=time.time() - 3600)
+    _write_page_result(job, 190, age_seconds=9 * 3600)    # old result
+    _write_page_result(job, 191, age_seconds=30)          # finished this run
+
+    act = ocr_service.run_activity(JOB)
+    assert act["progress_this_run"] is True
+    assert 29 <= act["seconds_since_progress"] <= 35
+    assert 3595 <= act["running_for"] <= 3610

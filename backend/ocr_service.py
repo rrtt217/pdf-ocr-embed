@@ -393,13 +393,20 @@ def run_activity(job_id: str) -> dict:
         pass
     now = time.time()
     started = job.get("run_started_at")
+    started = started if isinstance(started, (int, float)) else None
+    # The idle clock must NEVER count time from before this run started: retrying
+    # one missing page on a book whose last page finished days ago used to
+    # announce "no new page for 9 h 39 min" 41 s into the retry (measured live).
+    # Progress means "a page got a result during THIS run", so the reference is
+    # the later of the newest result and the run start.
+    reference = max(newest or 0.0, started or 0.0)
     activity = {
         "pages_done": int(job.get("pages_done") or 0),
         "num_pages": int(job.get("num_pages") or 0),
         "last_progress_at": newest or None,
-        "seconds_since_progress": (now - newest) if newest else None,
-        "running_for": (now - started)
-        if isinstance(started, (int, float)) else None,
+        "progress_this_run": bool(newest and started and newest >= started),
+        "seconds_since_progress": (now - reference) if reference else None,
+        "running_for": (now - started) if started else None,
         "progress": _read_run_progress(job)
         if job.get("status") in _LIVE_STATUSES else None,
     }
