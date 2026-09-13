@@ -127,12 +127,30 @@
       </div>
       <div id="panes">
         <div id="editor-pane" class="pane">
-          <h3 data-i18n="workspace.blockTitle">Editable text blocks</h3>
+          <div class="pane-head">
+            <h3 data-i18n="workspace.blockTitle">Editable text blocks</h3>
+            <!-- Save state of the page being edited (P0-1): edits are persisted
+                 per page, so "did my correction stick?" is always visible. -->
+            <span id="save-state" class="save-state"></span>
+          </div>
           <div class="conf-toolbar">
-            <label class="inline-check"><input id="conf-filter" type="checkbox" />
-              <span data-i18n="editor.confLowOnly">Low confidence only</span></label>
-            <label class="inline-label"><span data-i18n="editor.confThreshold">Threshold</span>
-              <input id="conf-threshold" type="number" min="1" max="100" step="1" value="60" /></label>
+            <span id="conf-controls">
+              <label class="inline-check"><input id="conf-filter" type="checkbox" />
+                <span data-i18n="editor.confLowOnly">Low confidence only</span></label>
+              <label class="inline-label"><span data-i18n="editor.confThreshold">Threshold</span>
+                <input id="conf-threshold" type="number" min="1" max="100" step="1" value="60" /></label>
+            </span>
+            <!-- Shown instead of the confidence controls when the engine reports
+                 no confidence at all (the unlimited API does not). -->
+            <label class="inline-label hidden" id="block-filter-row">
+              <span data-i18n="editor.filterLabel">Show</span>
+              <select id="block-filter">
+                <option value="all" data-i18n="editor.filter.all">All blocks</option>
+                <option value="nontext" data-i18n="editor.filter.nontext">Non-body blocks</option>
+                <option value="image" data-i18n="editor.filter.image">Images only</option>
+                <option value="empty" data-i18n="editor.filter.empty">Empty text only</option>
+              </select>
+            </label>
             <span id="conf-count" class="hint"></span>
           </div>
           <div id="blocks"></div>

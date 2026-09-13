@@ -280,6 +280,22 @@ main { padding: 20px; max-width: 1200px; margin: 0 auto; }
 }
 .pane h3 { margin: 0 0 12px; font-size: 15px; }
 
+/* Editor pane head: title on the left, the page's save state on the right.
+   Edits are persisted per page (P0-1), so "did my correction stick?" needs a
+   permanent, quiet answer instead of a transient toast. */
+.pane-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.pane-head h3 { margin: 0; }
+.save-state { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.save-state.saved { color: var(--ok-text); }
+.save-state.dirty { color: var(--danger-text); }
+.save-state.error { color: var(--danger-text); font-weight: 600; }
+
 #blocks { display: flex; flex-direction: column; gap: 10px; }
 .block {
   border: 1px solid var(--border);
@@ -698,6 +714,21 @@ details.export-opts > label {
 }
 .conf-toolbar input[type=number] { width: 64px; }
 .conf-toolbar .hint { margin: 0; }
+/* The confidence controls and the no-confidence fallback filter share this row
+   (P0-4); the inline-label must stay a row here — the global `label` rule is a
+   column, which stacked "Threshold" above its input. */
+.conf-toolbar .inline-label { flex-direction: row; align-items: center; gap: 8px; }
+.conf-toolbar .inline-label select { width: auto; }
+#conf-controls { display: inline-flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* Unsaved-edit dot on a page tab (P0-1). */
+.page-tab.dirty::after {
+  content: "●";
+  font-size: 0.6em;
+  margin-left: 5px;
+  vertical-align: middle;
+  color: var(--accent);
+}
+.page-tab.active.dirty::after { color: var(--accent-fg); }
 .conf-badge {
   font-size: 0.75em; padding: 1px 6px; border-radius: 8px;
   border: 1px solid transparent; white-space: nowrap;

@@ -37,6 +37,7 @@ const PREFS = {
   zoom: "pdfocr.ui.zoom",
   confFilter: "pdfocr.ui.confFilter",
   confThreshold: "pdfocr.ui.confThreshold",
+  blockFilter: "pdfocr.ui.blockFilter",
   optimize: "pdfocr.ui.optimize",
   outputType: "pdfocr.ui.outputType",
 };
@@ -62,6 +63,9 @@ const state = {
   logTimer: null,
   confFilter: false,   // show only low-confidence blocks in the editor
   confThreshold: 60,   // 1..100 — blocks below are flagged low-confidence
+  // Fallback review filter for engines that report no confidence at all:
+  // all | empty | image | nontext (see matchesBlockFilter).
+  blockFilter: "all",
   exportLlm: { blocks: false, outline: false },  // export LLM post-processing options
   exportImages: "none",  // markdown image embedding: none | zip | base64
   exportSplit: false,    // markdown: one file per chapter, packed as a ZIP
@@ -94,10 +98,173 @@ function jobHasConfData() {
   return !!sel && sel.pages.some((pg) => (pg.blocks || [])
     .some((b) => confPct(b) !== null));
 }
+
+/* ---------- review filter for engines without confidence (P0-4) ----------
+   The unlimited engine writes no `conf` into the block sidecar, so the
+   low-confidence filter can never match anything on a job it produced.
+   Instead of leaving a dead switch in the pane, fall back to a filter built
+   from data every engine provides, and say so in the hint. */
+const BLOCK_FILTERS = {
+  all: () => true,
+  empty: (b) => !String(b.text || b.caption || "").trim(),
+  image: (b) => String(b.kind || "") === "image",
+  nontext: (b) => String(b.kind || "text") !== "text",
+};
+
+function matchesBlockFilter(block) {
+  const fn = BLOCK_FILTERS[state.blockFilter] || BLOCK_FILTERS.all;
+  return fn(block);
+}
+
+/* The confidence controls only make sense when the engine reports confidence;
+   otherwise the block-type filter takes their place. */
+function updateReviewControls() {
+  const hasConf = jobHasConfData();
+  const confBox = $("#conf-controls");
+  const filterRow = $("#block-filter-row");
+  if (confBox) confBox.classList.toggle("hidden", !hasConf);
+  if (filterRow) {
+    filterRow.classList.toggle("hidden", hasConf);
+    const box = $("#block-filter");
+    if (box && box.value !== state.blockFilter) box.value = state.blockFilter;
+  }
+}
+
 function setStatus(code, cls) {
   const elx = $("#conn-status");
   elx.textContent = t("status." + code);
   elx.className = "pill" + (cls ? " " + cls : "");
+}
+
+/* ---------- edit persistence (P0-1) ----------
+   Block edits live in this JS object first, but they must not STOP here: the
+   editor used to keep corrections in memory only, so they neither survived a
+   reload nor reached the embedded PDF.  Every edit funnels through
+   markDirty(), which queues a debounced save of the current page to
+   POST /api/pages/{job}/{page_index} — the edit phase that writes the block
+   sidecar and regenerates that page's hOCR, which is exactly what finalize
+   renders into the text layer.  Leaving a page, switching jobs and embedding
+   all flush first, so a correction cannot be silently dropped on its way into
+   the output PDF.
+   `sel.rev` counts edits per page so a slow response can never mark a NEWER
+   edit as saved. */
+const SAVE_DEBOUNCE_MS = 800;
+
+function pageKeyOf(page) {
+  return page && page.page_index != null ? page.page_index : -1;
+}
+
+function dirtyPageCount() {
+  const sel = state.sel;
+  return sel && sel.dirtyPages ? sel.dirtyPages.size : 0;
+}
+
+/* The "saved / unsaved / saving / failed" indicator in the editor pane head. */
+function updateSaveState() {
+  const box = $("#save-state");
+  if (!box) return;
+  const sel = state.sel;
+  let cls = "save-state";
+  let text = "";
+  if (!sel) {
+    text = "";
+  } else if (sel.saveError) {
+    cls += " error";
+    text = t("editor.saveFailedShort");
+    box.title = t("editor.saveFailed", { msg: sel.saveError });
+  } else if (sel.saving) {
+    cls += " saving";
+    text = t("editor.saving");
+  } else if (dirtyPageCount()) {
+    cls += " dirty";
+    text = t("editor.unsaved", { n: dirtyPageCount() });
+  } else if (sel.pages && sel.pages.length) {
+    cls += " saved";
+    text = t("editor.saved");
+  }
+  if (!sel || !sel.saveError) box.removeAttribute("title");
+  box.className = cls;
+  box.textContent = text;
+}
+
+/* Page tabs carry a dot while their page still has unsaved edits. */
+function refreshTabDots() {
+  const sel = state.sel;
+  if (!sel) return;
+  $$("#page-tabs .page-tab").forEach((tab, i) => {
+    const pg = sel.pages[i];
+    tab.classList.toggle("dirty", !!(pg && sel.dirtyPages.has(pageKeyOf(pg))));
+  });
+}
+
+/* Mark the page being edited as changed and queue its save. */
+function markDirty() {
+  const sel = state.sel;
+  if (!sel) return;
+  const page = currentPage();
+  sel.embedded = false;
+  if (page) {
+    const key = pageKeyOf(page);
+    sel.dirtyPages.add(key);
+    sel.rev[key] = (sel.rev[key] || 0) + 1;
+  }
+  sel.saveError = "";
+  updateSaveState();
+  refreshTabDots();
+  scheduleSave();
+}
+
+function scheduleSave() {
+  const sel = state.sel;
+  if (!sel || !dirtyPageCount()) return;
+  if (sel.saveTimer) clearTimeout(sel.saveTimer);
+  sel.saveTimer = setTimeout(() => { saveDirtyPages(); }, SAVE_DEBOUNCE_MS);
+}
+
+async function savePage(page) {
+  const sel = state.sel;
+  if (!sel || !page) return true;
+  const key = pageKeyOf(page);
+  const rev = sel.rev[key] || 0;
+  sel.saving = true;
+  updateSaveState();
+  try {
+    await api(`/api/pages/${sel.jobId}/${page.page_index}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        page_index: page.page_index,
+        blocks: cloneBlocks(page.blocks),
+      }),
+    });
+    // Only clear the flag when nothing changed while the request was in flight.
+    if ((sel.rev[key] || 0) === rev) sel.dirtyPages.delete(key);
+    sel.saveError = "";
+    return true;
+  } catch (e) {
+    sel.saveError = e && e.message ? e.message : String(e);
+    return false;
+  } finally {
+    sel.saving = false;
+    updateSaveState();
+    refreshTabDots();
+  }
+}
+
+/* Save every page with pending edits.  Returns false when a save failed so
+   callers that are about to consume the pages (embed) can refuse to continue
+   instead of rendering a PDF without the user's corrections. */
+async function saveDirtyPages() {
+  const sel = state.sel;
+  if (!sel || !dirtyPageCount()) return true;
+  if (sel.saveTimer) { clearTimeout(sel.saveTimer); sel.saveTimer = null; }
+  const pending = sel.pages.filter((p) => p && sel.dirtyPages.has(pageKeyOf(p)));
+  let ok = true;
+  for (const page of pending) {
+    if (!(await savePage(page))) ok = false;
+  }
+  if (!ok) toast(t("editor.saveFailed", { msg: sel.saveError }), "error");
+  return ok;
 }
 
 /* ---------- theme (light / dark / auto) ---------- */
@@ -1049,6 +1216,8 @@ async function clearJob(jobId) {
 
 /* ---------- selected-job editor ---------- */
 async function selectJob(jobId) {
+  // Leaving the previous job: flush its pending edits before dropping them.
+  if (dirtyPageCount()) await saveDirtyPages();
   state.sel = {
     jobId, pages: [], pageIndex: 0, embedded: false,
     // (#6) per-session editor extras shared across pages/handlers:
@@ -1056,6 +1225,10 @@ async function selectJob(jobId) {
     undoStack: [],       // snapshots of page.blocks before structural edits
     drawMode: false,     // "draw a new block on the overlay" mode
     pendingDraw: null,   // live rectangle while drawing a new block
+    // (P0-1) edit persistence: pages with unsaved edits, their revision
+    // counters, the debounce timer, the in-flight flag and the last error.
+    dirtyPages: new Set(), rev: {}, saveTimer: null, saving: false,
+    saveError: "",
   };
   const job = jobById(jobId);
   const label = $("#editing-job");
@@ -1087,6 +1260,8 @@ function setSelectedJob(sel) {
 async function refreshSelectedPages() {
   const sel = state.sel;
   if (!sel) return;
+  // Fresh server data would overwrite unsaved edits — flush them first (P0-1).
+  if (dirtyPageCount()) await saveDirtyPages();
   try {
     const data = await api(`/api/pages/${sel.jobId}`);
     const pages = (data.pages || []).filter(Boolean);
@@ -1132,6 +1307,7 @@ function renderTabs() {
     // the actual page.
     const pageNo = (pg.page_index ?? 0) + 1;
     const tab = el("button", "page-tab" + (i === sel.pageIndex ? " active" : ""), String(pageNo));
+    if (sel.dirtyPages && sel.dirtyPages.has(pageKeyOf(pg))) tab.classList.add("dirty");
     const low = pageLowConfCount(pg);
     if (low) {
       tab.appendChild(el("span", "tab-badge", String(low)));
@@ -1140,7 +1316,7 @@ function renderTabs() {
     tab.title = low
       ? tip + " · " + t("editor.confPageBadge", { n: low, p: state.confThreshold })
       : tip;
-    tab.onclick = () => { sel.pageIndex = i; renderTabs(); renderPage(); };
+    tab.onclick = () => { goToPage(i); };
     wrap.appendChild(tab);
   });
   $("#btn-prev").disabled = sel.pageIndex === 0;
@@ -1168,6 +1344,8 @@ function renderPage() {
 
   // Prune stale block selections when page/blocks change (#6).
   sanitizeSelection();
+  updateReviewControls();
+  updateSaveState();
 
   // Editor blocks (+ block-ops toolbar: Merge / Add block / Undo)
   const blocksBox = $("#blocks");
@@ -1176,23 +1354,36 @@ function renderPage() {
   if (!page.blocks || page.blocks.length === 0) {
     blocksBox.appendChild(el("div", "", t("editor.noBlocks")));
   }
+  // Confidence review and the no-confidence fallback filter are mutually
+  // exclusive: only one of them can be active for a given engine (P0-4).
+  const hasConf = jobHasConfData();
+  const onlyLowConf = hasConf && state.confFilter;
+  const onlyFiltered = !hasConf && state.blockFilter !== "all";
   let visibleBlocks = 0;
   (page.blocks || []).forEach((block, bi) => {
-    if (state.confFilter && !isLowConf(block)) return;
+    if (onlyLowConf && !isLowConf(block)) return;
+    if (onlyFiltered && !matchesBlockFilter(block)) return;
     visibleBlocks++;
     blocksBox.appendChild(buildBlockEditor(block, bi));
   });
-  if (state.confFilter && visibleBlocks === 0
+  if (onlyLowConf && visibleBlocks === 0
       && page.blocks && page.blocks.length) {
     blocksBox.appendChild(el("div", "embed-hint",
       t("editor.confNoLowOnPage", { p: state.confThreshold })));
   }
+  if (onlyFiltered && visibleBlocks === 0
+      && page.blocks && page.blocks.length) {
+    blocksBox.appendChild(el("div", "embed-hint", t("editor.filterNone")));
+  }
 
-  // Confidence summary line
+  // Confidence summary line (or the filter's block count when the engine
+  // reports no confidence at all).
   const count = $("#conf-count");
   if (count) {
-    if (!jobHasConfData()) {
-      count.textContent = t("editor.confNoData");
+    if (!hasConf) {
+      count.textContent = state.blockFilter === "all"
+        ? t("editor.confNoData")
+        : t("editor.filterCount", { n: visibleBlocks, total: (page.blocks || []).length });
     } else {
       const total = state.sel.pages.reduce((n, pg) => n + pageLowConfCount(pg), 0);
       count.textContent = total
@@ -1294,8 +1485,7 @@ function buildBlockEditor(block, bi) {
     const page = sel.pages[sel.pageIndex];
     const target = page.blocks[bi];
     if (target) target.text = e.target.value;
-    sel.embedded = false;
-    setStatus("dirty", "running");
+    markDirty();
   };
 
   // (#6) per-block ops row: Split (at textarea caret) + delete.
@@ -1315,14 +1505,19 @@ function buildBlockEditor(block, bi) {
     pushUndo();
     sel.pages[sel.pageIndex].blocks.splice(bi, 1);
     if (sel.selection) sel.selection.indices.delete(bi);
-    sel.embedded = false;
-    setStatus("dirty", "running");
+    markDirty();
     renderPage();
   };
   opsRow.appendChild(del);
 
   // (#6) arrow-key bbox nudge when this block editor is focused.
   wrapper.addEventListener("keydown", (e) => {
+    // Arrow keys belong to the caret while the block's textarea has focus —
+    // otherwise typing a correction cannot move the cursor at all (the bbox
+    // would shift 1px instead).  Nudging stays available when the block card
+    // itself is focused.
+    const tag = (e.target.tagName || "").toLowerCase();
+    if (tag === "textarea" || tag === "input" || tag === "select") return;
     const moves = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
     const mv = moves[e.key];
     if (!mv) return;
@@ -1342,8 +1537,7 @@ function buildBlockEditor(block, bi) {
       b.bbox[0] + mv[0] * step, b.bbox[1] + mv[1] * step,
       b.bbox[2] + mv[0] * step, b.bbox[3] + mv[1] * step,
     ], page);
-    sel.embedded = false;
-    setStatus("dirty", "running");
+    markDirty();
     updateBlockCoords(bi);
     drawOverlay(page);
   });
@@ -1363,8 +1557,7 @@ function buildBlockEditor(block, bi) {
   fsSlider.oninput = () => {
     block.font_scale = parseFloat(fsSlider.value);
     fsVal.textContent = block.font_scale.toFixed(2) + "×";
-    if (state.sel) state.sel.embedded = false;
-    setStatus("dirty", "running");
+    markDirty();
   };
   // Reset to auto
   const fsReset = el("button", "small", t("editor.auto"));
@@ -1373,8 +1566,7 @@ function buildBlockEditor(block, bi) {
     block.font_scale = 1.0;
     fsSlider.value = "1.0";
     fsVal.textContent = "1.00×";
-    if (state.sel) state.sel.embedded = false;
-    setStatus("dirty", "running");
+    markDirty();
   };
   fsRow.appendChild(fsLabel);
   fsRow.appendChild(fsSlider);
@@ -1419,8 +1611,7 @@ function undoLast() {
     return;
   }
   page.blocks = cloneBlocks(snap.blocks);
-  sel.embedded = false;
-  setStatus("dirty", "running");
+  markDirty();
   renderPage();
   toast(t("editor.undoDone"), "success");
 }
@@ -1524,8 +1715,7 @@ function mergeSelected() {
   const newBlocks = blocks.filter((_, i) => !indices.includes(i));
   newBlocks.push(merged);
   page.blocks = newBlocks;
-  sel.embedded = false;
-  setStatus("dirty", "running");
+  markDirty();
   sel.selection = { pageIndex: sel.pageIndex, indices: new Set([newBlocks.length - 1]) };
   toast(t("editor.mergeDone", { n: chosen.length }), "success");
   renderPage();
@@ -1561,8 +1751,7 @@ function splitBlock(bi) {
   }
   pushUndo();
   page.blocks = [...blocks.slice(0, bi), ...parts, ...blocks.slice(bi + 1)];
-  sel.embedded = false;
-  setStatus("dirty", "running");
+  markDirty();
   sel.selection = { pageIndex: sel.pageIndex, indices: new Set([bi, bi + 1]) };
   toast(t("editor.splitDone"), "success");
   renderPage();
@@ -1723,8 +1912,7 @@ function overlayPointerUp() {
       });
       sel.selection = { pageIndex: sel.pageIndex, indices: new Set([page.blocks.length - 1]) };
       sel.drawMode = false;
-      sel.embedded = false;
-      setStatus("dirty", "running");
+      markDirty();
       toast(t("editor.blockAdded"), "success");
     }
     sel.pendingDraw = null;
@@ -1736,8 +1924,7 @@ function overlayPointerUp() {
     if (changed(b, st.origin)) {
       sel.undoStack.push({ pageIndex: st.pageIndex, blocks: st.snapshot });
       if (sel.undoStack.length > 50) sel.undoStack.shift();
-      sel.embedded = false;
-      setStatus("dirty", "running");
+      markDirty();
     }
     renderPage();
   }
@@ -1747,6 +1934,14 @@ function overlayPointerUp() {
 async function embed() {
   const sel = state.sel;
   if (!sel || !sel.pages.length) return;
+  // Finalize renders the pages stored on the SERVER, so every pending edit must
+  // be persisted first; otherwise the output would silently lack the
+  // corrections the user just made (P0-1).  saveDirtyPages() already reports a
+  // failure through a toast, so only the inline status is set here.
+  if (!(await saveDirtyPages())) {
+    $("#embed-status").textContent = t("editor.saveFailedShort");
+    return;
+  }
   $("#btn-embed").disabled = true;
   $("#embed-status").textContent = t("embed.busy");
   // Output options: ocrmypdf's finalize stage applies optimization; the text
@@ -2132,14 +2327,27 @@ function stopLogPolling() {
 }
 
 /* ---------- wire up ---------- */
+/* Page switch with a save flush first: the page being left must not lose its
+   edits (P0-1).  Every navigation path (tabs, arrows, keyboard) goes here. */
+async function goToPage(index) {
+  const sel = state.sel;
+  if (!sel || index < 0 || index >= sel.pages.length || index === sel.pageIndex) {
+    return;
+  }
+  if (dirtyPageCount()) await saveDirtyPages();
+  sel.pageIndex = index;
+  renderTabs();
+  renderPage();
+}
+
 function prevPage() {
   const s = state.sel;
-  if (s && s.pageIndex > 0) { s.pageIndex--; renderTabs(); renderPage(); }
+  if (s && s.pageIndex > 0) goToPage(s.pageIndex - 1);
 }
 
 function nextPage() {
   const s = state.sel;
-  if (s && s.pageIndex < s.pages.length - 1) { s.pageIndex++; renderTabs(); renderPage(); }
+  if (s && s.pageIndex < s.pages.length - 1) goToPage(s.pageIndex + 1);
 }
 
 /* Re-render dynamic parts after a locale switch (static markup is handled by
@@ -2195,6 +2403,13 @@ async function init() {
     const thrBox = $("#conf-threshold");
     if (thrBox) thrBox.value = String(Math.round(savedThr));
   }
+  // Fallback review filter (engines that report no confidence) — P0-4.
+  const savedFilter = getPref(PREFS.blockFilter, "all");
+  if (BLOCK_FILTERS[savedFilter]) {
+    state.blockFilter = savedFilter;
+    const filterBox = $("#block-filter");
+    if (filterBox) filterBox.value = savedFilter;
+  }
 
   // --- output option preferences (optimize / output type) ---
   const savedOpt = getPref(PREFS.optimize, "0");
@@ -2209,8 +2424,10 @@ async function init() {
   }
 
   // 有任务运行时关闭标签页 → 浏览器原生关闭确认提示（任意一个任务在跑都会提示）。
+  // 有未保存的页面编辑时同样拦截：以前只在任务运行时提示，改完字直接关页会静默丢失。
   window.addEventListener("beforeunload", (e) => {
-    if (!anyRunning()) return;
+    if (!anyRunning() && !dirtyPageCount()) return;
+    if (dirtyPageCount()) saveDirtyPages();   // best effort; the debounce may not have fired yet
     e.preventDefault();
     e.returnValue = "";
   });
@@ -2276,6 +2493,15 @@ async function init() {
     renderTabs();
     renderPage();
   };
+  // Fallback review filter, used when the engine reports no confidence (P0-4).
+  const blockFilterBox = $("#block-filter");
+  if (blockFilterBox) {
+    blockFilterBox.onchange = () => {
+      state.blockFilter = BLOCK_FILTERS[blockFilterBox.value] ? blockFilterBox.value : "all";
+      setPref(PREFS.blockFilter, state.blockFilter);
+      renderPage();
+    };
+  }
 
   // --- output option controls (persist only; read at embed time) ---
   $("#opt-optimize").onchange = () => setPref(PREFS.optimize, $("#opt-optimize").value || "0");

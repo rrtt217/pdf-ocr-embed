@@ -7,6 +7,9 @@ every recognized page and the job can be finalized without re-uploading.
 from __future__ import annotations
 
 import json
+import shutil
+
+import pytest
 
 from backend import ocr_service
 from backend.ocrmypad import parser as parser_mod
@@ -85,6 +88,88 @@ def test_update_page_persists_and_restore_roundtrip(monkeypatch, tmp_path):
     hocr = (ocr_service._job_dir(job["job_id"]) / "hocr" /
             "000001_ocr_hocr.hocr").read_text(encoding="utf-8")
     assert "edited text" in hocr
+
+
+def _write_page_metadata(job, page_no: int):
+    """The per-page ``<pageno>_hocr.json`` that the OCR phase leaves behind.
+
+    Finalize keys off it: without this file ocrmypdf's hOCR->PDF pipeline
+    treats the page as "no OCR was performed" and grafts nothing, which is
+    exactly how a page can look done in the editor yet embed an empty text
+    layer.  It points at the hOCR in place, so a regenerated (edited) hOCR is
+    picked up without touching this file.
+    """
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    hdir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "pageno": page_no - 1,
+        "pdf_page_from_image": None,
+        "hocr": str(hdir / f"{page_no:06d}_ocr_hocr.hocr"),
+        "textpdf": None,
+        "orientation_correction": 0,
+        "ocr_tree": None,
+    }
+    path = hdir / f"{page_no:06d}_hocr.json"
+    path.write_text(json.dumps(meta), encoding="utf-8")
+    return path
+
+
+def _finalize_available() -> bool:
+    """The finalize entry point this test exercises: ocrmypdf's hOCR -> PDF
+    renderer.  It is a private API (see AGENTS.md), pinned by requirements.txt
+    and re-verified after upgrades, so probe for the function itself rather
+    than for a class name that moves between versions."""
+    try:
+        import ocrmypdf.api
+    except Exception:  # noqa: BLE001 — ocrmypdf not installed at all
+        return False
+    return hasattr(ocrmypdf.api, "_hocr_to_ocr_pdf")
+
+
+@pytest.mark.skipif(not _finalize_available(),
+                    reason="ocrmypdf finalize toolchain unavailable")
+def test_edited_page_reaches_the_embedded_pdf(monkeypatch, tmp_path):
+    """P0-1 acceptance: the WebUI's save call (POST /api/pages/{job}/{i}) writes
+    the block sidecar and regenerates that page's hOCR, and finalize renders
+    THAT hOCR into the text layer — so a user correction must be extractable
+    from the output PDF.
+
+    This pins the SERVER half of the edit path (including the per-page
+    `<pageno>_hocr.json` that finalize keys off — without it the page embeds an
+    empty text layer even though the editor shows it as done).  The browser
+    half — that app.js actually calls this route — is guarded coarsely in
+    tests/test_frontend_edit_wiring.py.
+    """
+    from backend import pdf_processing
+
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    # 240x480 pt == exactly 1000x2000 px at the sidecar's 300 dpi, so the
+    # rendered text lands inside the page box.
+    job = ocr_service.create_job('doc.pdf', make_pdf(pages=1, width=240.0,
+                                                    height=480.0))
+    _write_sidecar(job, 1, "originalmarker")
+    ocr_service._set(job["job_id"], status='done', num_pages=1, pages_done=1)
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    # ocrmypdf's hOCR pipeline stages a copy of the input as
+    # <hocr_dir>/origin.pdf; finalize grafts the text layer onto THAT file.
+    assert job.get("pdf_path"), "create_job must record the uploaded PDF"
+    shutil.copyfile(job["pdf_path"], hdir / "origin.pdf")
+    ocr_service._ensure_hocr_files(job["job_id"])
+    _write_page_metadata(job, 1)
+
+    first, _stats = ocr_service.embed_job(job["job_id"])
+    assert "originalmarker" in pdf_processing.extract_text(first, 0)
+
+    # Exactly what the browser now POSTs before embedding.
+    ocr_service.update_page(job["job_id"], 0, {"blocks": [
+        {"kind": "text", "bbox": [100, 100, 900, 200],
+         "text": "correctedmarker"}]})
+
+    second, _stats2 = ocr_service.embed_job(job["job_id"])
+    text = pdf_processing.extract_text(second, 0)
+    assert "correctedmarker" in text
+    assert "originalmarker" not in text
+    ocr_service.clear_job(job["job_id"])
 
 
 def test_restore_normalizes_crashed_status(monkeypatch, tmp_path):
