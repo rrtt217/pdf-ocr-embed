@@ -974,9 +974,11 @@ def embed_job(job_id: str, overrides: Optional[dict] = None,
                 f"Page(s) {','.join(str(n) for n in missing)} have no OCR "
                 "result — run OCR first")
 
-    # Ensure every recognized page has an hOCR file (edits regenerate theirs
-    # in update_page; a sidecar without a matching hOCR — e.g. written by an
-    # engine that emits no hOCR — is materialized from the sidecar blocks).
+    # Ensure every recognized page is finalize-ready: an hOCR file (edits
+    # regenerate theirs in update_page; a sidecar without a matching hOCR — e.g.
+    # written by an engine that emits no hOCR — is materialized from the sidecar
+    # blocks) AND ocrmypdf's per-page marker, without which finalize silently
+    # skips the page and embeds no text layer for it.
     _ensure_hocr_files(job_id)
 
     overrides = dict(overrides or {})
@@ -1038,33 +1040,52 @@ def embed_job(job_id: str, overrides: Optional[dict] = None,
 
 
 def _ensure_hocr_files(job_id: str) -> None:
-    """Materialize any missing per-page hOCR from its block sidecar.
+    """Make every counted page FINALIZE-READY: hOCR **and** ocrmypdf's marker.
 
     Engines that write hOCR natively (Tesseract, the unlimited plugin) never
-    hit this; a sidecar without a matching hOCR (an engine that emits only
-    the normalized sidecar) gets its hOCR generated from the sidecar blocks
-    so finalize can render it.
+    need the first half; a sidecar without a matching hOCR (an engine that emits
+    only the normalized sidecar) gets its hOCR generated from the sidecar blocks.
+
+    The second half is the part that is easy to miss: ocrmypdf's hOCR->PDF
+    pipeline does not discover pages by scanning for hOCR files — it iterates its
+    own page list and, per page, requires ``<n>_hocr.json``, otherwise it assumes
+    "no OCR was performed on this page" and grafts nothing.  A page can lose that
+    marker (killed between the engine writing the sidecar and ocrmypdf writing
+    its marker; a crash during a re-run) while still counting as done and being
+    editable, so without this repair it would silently embed NO text layer —
+    exactly the "looks finished, no searchable text" failure this app exists to
+    prevent.
     """
     job = get_job(job_id)
     if job is None:
         return
     hdir = Path(job["hocr_dir"])
     for page_no in page_store.page_numbers(hdir):
-        if page_store.hocr_path(hdir, page_no).exists():
-            continue
-        page = page_store.load_page(hdir, page_no)
-        if page is None:
-            continue
-        try:
-            dpi = page_store.read_sidecar_dpi(hdir, page_no)
-            page_store.hocr_path(hdir, page_no).write_text(
-                page_store.blocks_to_hocr(int(page.get("width") or 0),
-                                          int(page.get("height") or 0),
-                                          page.get("blocks", []),
-                                          dpi=dpi, ppageno=page_no - 1),
-                encoding="utf-8")
-        except (OSError, ValueError):
-            log.exception("ensure_hocr_files: page %s failed", page_no)
+        hocr_file = page_store.hocr_path(hdir, page_no)
+        if not hocr_file.exists():
+            page = page_store.load_page(hdir, page_no)
+            if page is None:
+                continue
+            try:
+                dpi = page_store.read_sidecar_dpi(hdir, page_no)
+                hocr_file.write_text(
+                    page_store.blocks_to_hocr(int(page.get("width") or 0),
+                                              int(page.get("height") or 0),
+                                              page.get("blocks", []),
+                                              dpi=dpi, ppageno=page_no - 1),
+                    encoding="utf-8")
+            except (OSError, ValueError):
+                log.exception("ensure_hocr_files: page %s failed", page_no)
+                continue
+        if not page_store.hocr_meta_path(hdir, page_no).exists():
+            try:
+                page_store.write_hocr_meta(
+                    hdir, page_no,
+                    image_pdf=hdir / f"{page_no:06d}_visible.pdf")
+                log.info("page %s: wrote the missing finalize marker", page_no)
+            except OSError:
+                log.exception("ensure_hocr_files: page %s marker failed",
+                              page_no)
 
 
 # --- page previews -----------------------------------------------------------

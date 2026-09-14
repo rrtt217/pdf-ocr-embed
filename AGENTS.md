@@ -146,6 +146,19 @@ the single most important invariant to preserve.
   which `load_page` rebuilds from it); a sidecar counts only for a page with
   NO hOCR at all; a half-written file of either kind is not a result. Pinned
   by `tests/test_job_resume.py` and `tests/test_page_store_inventory.py`.
+- **A counted page must also be FINALIZE-READY**: ocrmypdf's hOCR→PDF pipeline
+  does not discover pages by scanning the folder — per page it requires
+  ocrmypdf's own marker `<hocr_dir>/<pageno>_hocr.json` and otherwise assumes
+  "no OCR was performed", grafting NOTHING. So a page can count as done, open
+  in the editor, and still embed an empty text layer (measured on a real page:
+  0 chars without the marker, 94 with it). `ocr_service._ensure_hocr_files()`
+  — called by every embed — repairs both halves for every counted page: it
+  materializes a missing hOCR from the sidecar (`page_store.blocks_to_hocr`)
+  and writes a missing marker (`page_store.write_hocr_meta`, in ocrmypdf's own
+  shape). Anything that creates a page result must go through that repair.
+  Pinned by `tests/test_job_persistence.py::
+  test_sidecar_only_page_is_repaired_and_embeds_its_text` and
+  `::test_missing_finalize_marker_is_repaired_for_an_existing_hocr`.
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `logs/`, `build/`,
   `dist/`, `.venv/`, `backend/ocr_config.toml`) are gitignored. Never commit
   keys or large sample PDFs.

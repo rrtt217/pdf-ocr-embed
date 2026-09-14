@@ -190,11 +190,19 @@ DOM 实测（`getBoundingClientRect` / `getComputedStyle`）+ 端到端接口反
   守住"不要在没有渲染支持的情况下把字号控件加回来"。
   若将来要让字号真生效，做法是让 `blocks_to_hocr` 按 `font_scale` 缩放该块的行 bbox，
   并同时把控件加回来（测试会要求两者一起做）。
-- **finalize 的隐藏前置条件**：`<pageno>_hocr.json`（OCR 阶段写入）不存在时，
+- **finalize 的隐藏前置条件 → 已修（本轮）**：`<pageno>_hocr.json`（OCR 阶段写入）不存在时，
   ocrmypdf 的 hOCR→PDF 管线会认为"这一页没做过 OCR"并**什么都不渲染**——
   页面在编辑器里看起来正常、进度也计入完成，但嵌入出来没有文字层。
-  写测试时踩到的，已固化在 `tests/test_job_persistence.py::_write_page_metadata` 里；
-  如果将来出现"某页没有文字层"的报告，这是第一个该查的地方。
+  写测试时踩到，随后确认这是真缺口：`_ensure_hocr_files` 会为"只有 sidecar"的页补出 hOCR，
+  却不补这个标记，而页清单是**故意认可** sidecar-only 状态的（崩溃正好可以停在这两步之间）。
+  修法：`_ensure_hocr_files` 现在让每个计为完成的页都 **finalize-ready**——
+  缺 hOCR 就从 sidecar 生成（原有行为），缺标记就按 ocrmypdf 自己的格式补写
+  （`page_store.write_hocr_meta`；路径与形状由真实 finalize 测试钉住）。
+  **真实数据反证**（用你作业第 1–2 页的真实 hOCR + 真实 origin.pdf）：删掉第 1 页标记后
+  直接跑管线 → 第 1 页 **0 字符**；走 `embed_job`（触发修复）→ 第 1 页 **94 字符**且含预期文本。
+  回归测试 `test_sidecar_only_page_is_repaired_and_embeds_its_text`、
+  `test_missing_finalize_marker_is_repaired_for_an_existing_hocr`（去掉修复即双双失败）；
+  不变量已写进 `AGENTS.md`。
 - **编辑过一页的副作用**：`update_page` 会用 `blocks_to_hocr()` 重写该页 hOCR，
   而它是"每行一个整行宽的 word"，插件原本是"每词一个 word"——文字内容一致，
   但**被编辑页的文字层选中粒度会变粗**（按行而非按词）。这是编辑路径固有行为，

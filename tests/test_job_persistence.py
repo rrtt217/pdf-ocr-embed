@@ -529,20 +529,18 @@ def test_mixed_engine_job_embeds_every_page(monkeypatch, tmp_path):
 
 @pytest.mark.skipif(not _finalize_available(),
                     reason="ocrmypdf finalize toolchain unavailable")
-def test_sidecar_only_page_without_metadata_embeds_nothing(monkeypatch, tmp_path):
-    """Documents a REAL gap, not a desired behaviour.
+def test_sidecar_only_page_is_repaired_and_embeds_its_text(monkeypatch,
+                                                           tmp_path):
+    """A page left as sidecar-only must still get a text layer.
 
-    ``_ensure_hocr_files`` materializes a missing hOCR from the block sidecar so
-    finalize can render it — but finalize does not discover pages from the hOCR
-    folder: ocrmypdf's hOCR->PDF pipeline keys off the per-page
-    ``<pageno>_hocr.json`` that the OCR phase writes, and skips every page
-    without one ("no OCR was performed on this page").  A page left as
-    sidecar-only (a crash between the engine writing the sidecar and ocrmypdf
-    writing its marker; the inventory deliberately accepts that state) therefore
-    counts as done, shows up in the editor, and still embeds NO text layer.
+    The state is legitimate and reachable: the page was killed between the
+    engine writing its block sidecar and ocrmypdf writing the per-page marker
+    ``<n>_hocr.json`` (a crash during a re-run does the same), and the page
+    inventory deliberately counts it as done.
 
-    If this test ever starts failing because the page DID get text, the gap has
-    been closed and this test should be rewritten as the positive case.
+    Before the repair, ``_ensure_hocr_files`` materialized the hOCR from the
+    sidecar but not the marker — and finalize discovers pages through the MARKER,
+    so the page counted as done, opened in the editor, and embedded NOTHING.
     """
     from backend import pdf_processing
 
@@ -552,18 +550,47 @@ def test_sidecar_only_page_without_metadata_embeds_nothing(monkeypatch, tmp_path
     hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
     hdir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(job["pdf_path"], hdir / "origin.pdf")
-    _write_sidecar(job, 1, "sidecaronlymarker")     # no hOCR, no _hocr.json
+    _write_sidecar(job, 1, "sidecaronlymarker")     # no hOCR, no marker
     ocr_service._set(job["job_id"], status='done', num_pages=1, pages_done=1)
 
-    # The inventory counts the page (sidecar-only is a legitimate state) and the
-    # hOCR gets materialized for finalize...
+    # Sidecar-only counts as done, and the embed path repairs the whole chain.
     assert page_store.page_numbers(hdir) == [1]
-    ocr_service._ensure_hocr_files(job["job_id"])
+    out, _stats = ocr_service.embed_job(job["job_id"])
+
     assert page_store.hocr_path(hdir, 1).exists()
+    assert "sidecaronlymarker" in pdf_processing.extract_text(out, 0)
+    ocr_service.clear_job(job["job_id"])
+
+
+@pytest.mark.skipif(not _finalize_available(),
+                    reason="ocrmypdf finalize toolchain unavailable")
+def test_missing_finalize_marker_is_repaired_for_an_existing_hocr(monkeypatch,
+                                                                 tmp_path):
+    """The safety net: a page whose hOCR is present but whose marker was lost
+    (deleted, or never written by an interrupted re-run) is repaired instead of
+    silently embedding an empty page."""
+    from backend import pdf_processing
+
+    _use_tmp_dirs(monkeypatch, tmp_path)
+    job = ocr_service.create_job('doc.pdf', make_pdf(pages=2, width=240.0,
+                                                    height=480.0))
+    hdir = ocr_service._job_dir(job["job_id"]) / "hocr"
+    hdir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(job["pdf_path"], hdir / "origin.pdf")
+    _write_sidecar(job, 1, "firstmarker")
+    _write_sidecar(job, 2, "secondmarker")
+    ocr_service._ensure_hocr_files(job["job_id"])
+    _write_page_metadata(job, 1)
+    _write_page_metadata(job, 2)
+    ocr_service._set(job["job_id"], status='done', num_pages=2, pages_done=2)
+
+    # Page 2 loses its marker while keeping its hOCR (the interrupted re-run
+    # shape).  Everything else still says "done".
+    page_store.hocr_meta_path(hdir, 2).unlink()
+    assert page_store.page_numbers(hdir) == [1, 2]
 
     out, _stats = ocr_service.embed_job(job["job_id"])
-    text = pdf_processing.extract_text(out, 0)
-    assert "sidecaronlymarker" not in text, (
-        "the gap is closed — turn this into a positive assertion "
-        "(the page must embed its text)")
+    assert "firstmarker" in pdf_processing.extract_text(out, 0)
+    assert "secondmarker" in pdf_processing.extract_text(out, 1), (
+        "a page that counts as done must never embed an empty text layer")
     ocr_service.clear_job(job["job_id"])

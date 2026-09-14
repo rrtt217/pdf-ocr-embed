@@ -58,6 +58,46 @@ def progress_path(job_dir: Path) -> Path:
     return Path(job_dir) / "progress.json"
 
 
+def hocr_meta_path(hocr_dir: Path, page_no: int) -> Path:
+    """ocrmypdf's per-page marker (``000001_hocr.json``).
+
+    The hOCR->PDF pipeline does NOT discover pages by scanning for hOCR files:
+    it keys off this marker per page, and treats a page without one as "no OCR
+    was performed", silently grafting nothing.  A counted page that lacks it is
+    therefore a page that embeds no text layer — repaired by
+    ``ocr_service._ensure_hocr_files``.
+    """
+    return Path(hocr_dir) / f"{int(page_no):06d}_hocr.json"
+
+
+def write_hocr_meta(hocr_dir: Path, page_no: int,
+                    image_pdf: Optional[Path] = None) -> Path:
+    """Write the per-page marker finalize requires, in ocrmypdf's own shape.
+
+    Mirrors what the OCR phase writes after a page finishes (its
+    ``HOCRResult.to_json``): the renderer needs a parseable document whose
+    ``pageno`` is right, but ``hocr``/``pdf_page_from_image`` are filled the same
+    way production does (a ``{"Path": ...}`` wrapper) so the file is
+    indistinguishable from an engine-written one.
+
+    Private-API coupling: pinned by ``tests/test_job_persistence.py``, which runs
+    a REAL finalize and asserts the page's text is extractable afterwards.
+    """
+    meta = {
+        "pageno": int(page_no) - 1,
+        "pdf_page_from_image": (
+            {"Path": str(Path(image_pdf))}
+            if image_pdf is not None and Path(image_pdf).exists() else None),
+        "hocr": {"Path": str(hocr_path(hocr_dir, page_no))},
+        "textpdf": None,
+        "orientation_correction": 0,
+        "ocr_tree": None,
+    }
+    path = hocr_meta_path(hocr_dir, page_no)
+    path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
 # --- cancel flag (service -> engine, via the filesystem) ---------------------
 
 # Cancellation is an EXCLUSIVE capability of the unlimited engine plugin: the
@@ -127,8 +167,12 @@ def _hocr_complete(hocr_file: Path) -> bool:
         timeout / empty page) has no closing tag but is a finished page,
         whereas an empty file with no marker is just tesseract creating it.
     """
-    marker = hocr_file.with_name(hocr_file.name.replace(
-        "_ocr_hocr.hocr", "_hocr.json"))
+    try:
+        marker = hocr_meta_path(hocr_file.parent,
+                                int(hocr_file.name.split("_", 1)[0]))
+    except ValueError:      # non-conforming name: keep the name-swap fallback
+        marker = hocr_file.with_name(hocr_file.name.replace(
+            "_ocr_hocr.hocr", "_hocr.json"))
     try:
         size = hocr_file.stat().st_size
     except OSError:
