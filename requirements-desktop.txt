@@ -23,3 +23,11 @@ PyGObject>=3.50; sys_platform == "linux"
 
 # Freezing the app into a double-clickable bundle (Python 3.14 needs >=6.15).
 pyinstaller>=6.15
+
+# Windows only: the system tray (backend.tray_win).  pystray drives
+# Shell_NotifyIcon from its own message-loop thread; Pillow — its one
+# dependency — is already in the dependency tree (ocrmypdf needs it).
+pystray>=0.19; sys_platform == "win32"
+
+# macOS needs no extra tray dependency: backend.tray_mac builds an NSStatusItem
+# on the pyobjc stack pywebview already requires there.

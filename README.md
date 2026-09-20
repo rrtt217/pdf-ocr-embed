@@ -347,14 +347,17 @@ python packaging/build.py --clean --with-tesseract   # 捆绑 tesseract + eng/ch
   `tesseract.source` 会显示 `bundled` 还是 `system`。不加该参数则退回依赖系统 tesseract。
 - **原生窗口**用 pywebview 渲染系统 WebView（WebView2 / WKWebView / WebKit2GTK）。
   若 pywebview 缺失或后端起不来，会**退回系统浏览器**而不是失败。
-- **后台运行（系统托盘，Linux）**：托盘可用时，**关闭窗口 = 隐藏窗口而不是退出**，
+- **后台运行（系统托盘，三平台）**：托盘可用时，**关闭窗口 = 隐藏窗口而不是退出**，
   OCR 任务继续在服务进程里跑；托盘菜单提供 *显示主窗口 / 在浏览器中打开 / 退出*，
   鼠标悬停能看到实时进度（如 `PDF OCR Embed · 第 187/224 页`）。首次隐藏会弹一条
   系统通知，避免「窗口不见了」被误认为崩溃。**托盘建不起来时行为与以前完全一致
   （关窗即退出）**——绝不让窗口藏起来又找不回来。开关：`--no-tray` 强制关闭该行为，
   `--tray` 显式要求；`--no-window`（无窗口）不建托盘。
-  实现见 `backend/tray.py`（AppIndicator / StatusNotifier），研究结论与各平台路线见
-  [`TRAY_RESEARCH.md`](TRAY_RESEARCH.md)。Windows/macOS 尚未实现。
+  实现见 `backend/tray.py`（统一入口）+ 各平台后端 `tray_gtk.py`（Linux，
+  AppIndicator/StatusNotifier）、`tray_win.py`（Windows，pystray）、
+  `tray_mac.py`（macOS，pyobjc `NSStatusItem`）；可行性研究与实测结论见
+  [`TRAY_RESEARCH.md`](TRAY_RESEARCH.md)。Windows 用例需安装 `pystray`
+  （`requirements-desktop.txt` 已带平台标记，Pillow 已在依赖树里）；macOS 零新增依赖。
 - **退出按钮**：由 `desktop.py` 启动时，WebUI 页头会多出一个 **Quit** 按钮
   （`/api/health` 的 `desktop: true`），调用 `POST /api/app/quit`——浏览器回退模式下
   这是唯一的退出方式。该接口要求自定义请求头，且 CORS 只允许 loopback 源，
@@ -405,6 +408,7 @@ pdf-ocr-embed/
 │   ├── batch.py                # ZIP 打包（流式）
 │   ├── cleanup.py              # 临时文件清理
 │   ├── logging_config.py       # 日志（打包后额外落文件）
+│   ├── tray.py                 # 系统托盘统一入口 + 各平台后端（tray_gtk / tray_win / tray_mac）
 │   └── cli.py                  # 无头 CLI（python -m backend.cli）
 ├── desktop.py                  # 桌面入口（freeze_support + 窗口 + 退出清理）
 ├── packaging/                  # 桌面打包（PyInstaller spec / 构建脚本 / 说明）
@@ -413,7 +417,7 @@ pdf-ocr-embed/
 │   ├── style.css
 │   ├── app.js
 │   └── i18n.js                 # 英文 / 中文双语界面
-├── tests/                      # pytest 测试（406 项）
+├── tests/                      # pytest 测试（541 项）
 ├── requirements-dev.txt        # 开发依赖（pytest）
 ├── requirements.txt
 ├── config.example.toml

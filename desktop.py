@@ -17,12 +17,13 @@ This is the script PyInstaller freezes into the double-clickable app.  It:
 **Background running.**  The OCR phase lives in the server process on daemon
 threads, so the window is only a view: closing it used to quit (and cancel the
 job), which made "start it and let it work" impossible.  When a system tray can
-be created (``backend/tray.py``; Linux/GTK today), closing the window now
-**hides** it instead and the tray offers show / open-in-browser / quit — with
-the live page progress in its tooltip.  This is deliberately conditional: if no
-tray could be created, closing still quits exactly as before, because a hidden
-window with no tray would be unreachable.  ``--no-tray`` forces the old
-behaviour, ``--tray`` asks for the tray explicitly.
+be created (``backend/tray.py``: Linux/AppIndicator, Windows/pystray,
+macOS/NSStatusItem), closing the window now **hides** it instead and the tray
+offers show / open-in-browser / quit — with the live page progress in its
+tooltip.  This is deliberately conditional: if no tray could be created,
+closing still quits exactly as before, because a hidden window with no tray
+would be unreachable.  ``--no-tray`` forces the old behaviour, ``--tray`` asks
+for the tray explicitly.
 
 **Exiting must always work.**  A quit can arrive from four directions — the
 window being closed, the UI's Quit button, Ctrl-C, or ``SIGTERM`` — and each
@@ -224,8 +225,10 @@ def _tray_status() -> str:
 def _show_window(window) -> None:
     """Bring the window back from hidden/minimized.
 
-    Both calls are pywebview's ``glib.idle_add`` wrappers, so this is safe from
-    the tray's thread; show() maps the window, restore() raises and focuses it.
+    pywebview's window methods marshal to the GUI thread themselves (GTK:
+    ``glib.idle_add``, Windows: ``Invoke``, macOS: ``callAfter``), so this is
+    safe from the tray's thread; show() maps the window, restore() raises and
+    focuses it.
     """
     for action in ("show", "restore"):
         try:

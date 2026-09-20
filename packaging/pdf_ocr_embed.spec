@@ -94,6 +94,14 @@ try:
     hiddenimports += collect_submodules("webview")
 except ImportError:
     pass
+# pystray is optional too (the Windows tray backend imports it dynamically in
+# backend.tray_win, which static analysis cannot see).
+try:
+    import pystray  # noqa: F401
+
+    hiddenimports += collect_submodules("pystray")
+except ImportError:
+    pass
 
 # --- exclusions --------------------------------------------------------------
 # Nothing in this app needs a GUI toolkit, a test runner or a plotting stack;

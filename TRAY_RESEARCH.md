@@ -8,10 +8,16 @@
 
 ## 0. 结论（TL;DR）
 
-> **实施状态（2026-09-20）**：阶段一（Linux）**已实现并实机验证**——`backend/tray.py` +
-> `desktop.py` 的关窗语义 + `frontend/tray.png` + `--tray/--no-tray`。
-> 实测：真实桌面应用启动后托盘项注册进宿主（7 → 8 项），Quit 后随进程消失（回到 7）、退出码 0。
-> Windows/macOS 未实现（见 §3.2/§3.3）。下面保留研究时的原始结论。
+> **实施状态（2026-09-20）**：三个平台**均已实现**——`backend/tray.py`（统一入口）+
+> `backend/tray_gtk.py` / `tray_win.py` / `tray_mac.py` + `desktop.py` 的关窗语义 +
+> `frontend/tray.png` + `--tray/--no-tray`。
+> 阶段一（Linux）**已实机验证**：真实桌面应用启动后托盘项注册进宿主（7 → 8 项），
+> Quit 后随进程消失（回到 7）、退出码 0。
+> 阶段二/三（Windows/macOS）在源码层面完成并验证：pywebview 三平台后端的关窗否决
+> 与 hide/show 逐行读过源码（见 §3.2/§3.3），pystray 0.19.5 的 `run_detached`/
+> `stop`/跨线程 `title` 也逐行读过；接线契约（菜单顺序、selector 名、主线程 marshal、
+> target 保留、ready 超时）用假模块测试钉住（`tests/test_tray.py`，三平台共 29 项）。
+> **托盘图标是否真的可见、菜单点击、关窗后的隐藏与恢复，仍需 Windows/macOS 真机确认。**
 
 **可行。** 三平台都能做到"关窗不退出、留在托盘、随时回来"，而且：
 
@@ -115,36 +121,72 @@ NEW items registered by our process: [':1.5932/org/ayatana/NotificationItem/pdf_
   `com.canonical.dbusmenu`）：零系统依赖、理论最稳，但要自己写 ~200 行菜单协议，建议只在不想依赖
   libayatana 时才走。
 
-### 3.2 Windows（仅文档，本机无法验证）
+### 3.2 Windows（已实现：pystray；源码层面验证）
 
-- 窗口后端是 `webview/platforms/winforms.py`，`create_window/hide/show` 都在（实测源码），
-  所以"取消关闭 + 隐藏"在 pywebview 层面没问题；`edgechromium.py` 只是内嵌浏览器控件，不是窗口后端。
-- 托盘两条路：
-  1. **pystray**（新依赖，只有 `pystray` 本身；它需要的 Pillow 12.3.0 已经在依赖树里，
-     因为 ocrmypdf 依赖 Pillow）——代码量最小；
-  2. **ctypes 直接 `Shell_NotifyIcon`**——零新增依赖，但需要自己建 message-only 窗口 + WndProc，
-     代码量大约 150-200 行。
-- pywebview 在 Windows 上本来就依赖 `pythonnet`（实测 pywebview 元数据），所以进程里已有 .NET；
-  但我们**不建议**把托盘塞进 WinForms 消息循环，独立线程 + 自己的消息循环更干净。
+> ✅ **2026-09-20 更新：已用 pystray 实现**（`backend/tray_win.py`），依赖标记
+> `sys_platform == "win32"` 进 `requirements-desktop.txt`，spec 里按需收集
+> `collect_submodules("pystray")`（动态导入，静态分析看不到）。
 
-### 3.3 macOS（仅文档，本机无法验证）
+pywebview 6.2.1 的 winforms 后端（逐行读过源码，与 Linux 完全同构）：
 
-- pywebview 在 macOS 上依赖 `pyobjc-core/Cocoa/Quartz/WebKit`（实测其 `Requires-Dist`），
-  所以 **`NSStatusItem` 通常不需要新增依赖**。
-- **不要用 pystray**：它在 macOS 需要占用**主线程**跑 Cocoa 事件循环，而 pywebview 的 Cocoa 循环
-  已经在主线程 → 直接冲突（pystray 官方也说明 `run_detached` 在 macOS 不可用）。
-  `NSStatusItem` 反而是最顺的：它挂在既有的 `NSApplication` run loop 上。
-- 细节：窗口隐藏后 Dock 图标仍在；若要"纯菜单栏应用"，需要
-  `NSApp.setActivationPolicy_(NSApplicationActivationPolicyAccessory)`，并在显示窗口时
-  `activateIgnoringOtherApps_(True)`——属于打磨项。
+- `on_closing`：`should_cancel = self.closing.set(); if should_cancel: args.Cancel = True`
+  —— **同样的字面量 `False` 否决**，`desktop.py` 的关窗逻辑不用改；
+- `hide()`/`show()` 内部 `self.Invoke(...)` marshal 到 UI 线程——从托盘线程调用安全。
+
+pystray 0.19.5（逐行读过源码，实现里要遵守的契约）：
+
+- `run_detached(setup)` = `threading.Thread(target=self._run).start()`——Win32 消息循环
+  跑在**独立线程**；`setup` 回调在消息窗口就绪后才触发（`_mark_ready()` 之后）；
+- **自定义 setup 必须自己设 `visible = True`**——默认 setup 只在不传 setup 时生效；
+- 若循环线程在就绪前死掉，`setup` 永远不会跑 → 必须 ready-wait + 超时，超时即"没有托盘"；
+- `stop()` 发 `WM_STOP` 后 join setup 线程（上限 `SETUP_THREAD_TIMEOUT = 5s`）；
+- `title` 更新 = `Shell_NotifyIcon(NIM_MODIFY, NIF_TIP)`——全局 API，跨线程安全；
+- `notify()` = `NIF_INFO` 气泡（Windows 10+ 自动转 toast）；`HAS_NOTIFICATION = True`；
+- 图标经 `serialized_image(..., 'ICO')` + `LR_DEFAULTSIZE` 由 Windows 定尺寸，
+  64×64 的 PNG 直接可用（官方示例就是 64×64）；
+- **左键激活标了 `default` 的菜单项** → "显示主窗口"既是首项又是点击动作。
+
+### 3.3 macOS（已实现：pyobjc NSStatusItem；源码层面验证）
+
+> ✅ **2026-09-20 更新：已用 pyobjc `NSStatusItem` 实现**（`backend/tray_mac.py`），
+> 零新增依赖——pywebview 在 macOS 本来就依赖 pyobjc。
+
+pywebview 6.2.1 的 cocoa 后端（逐行读过源码，与 Linux 完全同构）：
+
+- `should_close`：`should_cancel = window.events.closing.set(); if should_cancel: return Foundation.NO`
+  —— **同样的字面量 `False` 否决**；
+- `hide()`/`show()`（以及 `set_title`/`destroy`）全部经 `AppHelper.callAfter(...)`
+  marshal 到主线程——**这就是我们要用的主线程 marshal 通道**，同一进程同一库。
+
+pystray 在 macOS 确实不可用（逐行读过 `_darwin.py` 实锤）：
+
+- `run_detached()` 只做 `self._mark_ready()`，**根本不跑循环**——托盘会"创建成功但永远
+  没有事件循环"；它的循环必须在主线程跑 `run()`，与 pywebview 的主线程 Cocoa 循环冲突；
+- 它的 `_notify` 用 `osascript`——我们自己的 `tray_mac.notify` 也用同一条通道
+  （`subprocess.run(["osascript", "-e", ...])`，字符串做 AppleScript 转义，best-effort）。
+
+`NSStatusItem` 实现要点：
+
+- **每个 AppKit 调用都必须在主线程**——统一经 `AppHelper.callAfter(fn, *args)` marshal，
+  需要结果时配 `threading.Event` + 超时（镜像 GTK 的 `idle_add` + wait 模式）；
+- 菜单：`NSStatusItem.setMenu_(menu)` → 左键直接弹菜单；每项
+  `NSMenuItem.initWithTitle_action_keyEquivalent_(标题, selector, "")` +
+  `setTarget_(target)`，selector 是 pyobjc 自动映射的 `showWindow:` 等；
+- **`NSMenuItem.target` 不被 AppKit retain**（unsafe_unretained）——target 对象必须
+  在 Python 侧持有（`Tray` 实例保存引用），否则菜单点了没反应；
+- tooltip/进度：`status_item.button().setTitle_` + `setToolTip_`（10.10+ 的
+  `NSStatusBarButton`；更老系统退回 `setTitle_`）；
+- 图标：`NSImage.initWithContentsOfFile_` + `setSize_((18, 18))`（菜单栏尺寸）；
+- 退出时 `NSStatusBar.removeStatusItem_(item)`——必须在 `window.destroy()` 之前
+  （`desktop._watch_for_quit` 的顺序已经保证），且 marshal 后**有界等待**完成。
 
 ### 3.4 小结对照表
 
 | 平台 | 窗口 hide/show | 托盘实现 | 新增依赖 | 验证状态 |
 | --- | --- | --- | --- | --- |
 | Linux | ✅ gtk | `AyatanaAppIndicator3`（回退 `AppIndicator3`） | 无（PyGObject 已是桌面版硬依赖） | **本机实测可用** |
-| Windows | ✅ winforms | pystray 或 ctypes Shell_NotifyIcon | 前者 +1 包 | 未验证（源码层面成立） |
-| macOS | ✅ cocoa | pyobjc `NSStatusItem` | 通常 0 | 未验证（依赖已在树上） |
+| Windows | ✅ winforms | pystray（`run_detached` 消息循环线程） | +1 包（`sys_platform=="win32"`，Pillow 已在树上） | 已实现；源码+假模块测试验证，真机待确认 |
+| macOS | ✅ cocoa | pyobjc `NSStatusItem` | 通常 0 | 已实现；源码+假模块测试验证，真机待确认 |
 
 ---
 
@@ -210,9 +252,9 @@ EXE/COLLECT 也没有 `icon=`）。
 | 阶段 | 内容 | 成本 | 可验证性 |
 | --- | --- | --- | --- |
 | **一（Linux 可用）** | `backend/tray.py` + GTK 实现 + `desktop.py` 关窗语义 + `--tray/--no-tray` + 图标 + 进度提示 | **0.5–1 天** | ✅ **已完成**：注册可自动验证（§6），交互仍需人工确认 |
-| **二（Windows）** | pystray 实现（或 ctypes），spec 的 hiddenimports | +0.5–1 天 | 需 Windows 真机 |
-| **三（macOS）** | `NSStatusItem` + accessory 策略打磨 | +0.5–1 天 | 需 macOS 真机 |
-| **可选** | 首次隐藏时发一条系统通知（`Notify` typelib 本机存在）；启动最小化到托盘；开机自启 | +0.5 天 | 人工 |
+| **二（Windows）** | pystray 实现（或 ctypes），spec 的 hiddenimports | +0.5–1 天 | ✅ **已完成**（2026-09-20）：假模块测试钉住接线契约；真机交互待确认 |
+| **三（macOS）** | `NSStatusItem` + accessory 策略打磨 | +0.5–1 天 | ✅ **已完成**（2026-09-20）：假模块测试钉住接线契约；真机交互待确认 |
+| **可选** | 首次隐藏时发一条系统通知（✅ 已做：Linux libnotify / Windows 托盘气泡 / macOS osascript）；启动最小化到托盘；开机自启 | +0.5 天 | 人工 |
 
 ---
 
@@ -261,10 +303,11 @@ EXE/COLLECT 也没有 `icon=`）。
 
 ## 8. 需要你决定的问题
 
-1. **目标平台**：✅ 已定——**先只做 Linux**（Windows/macOS 留待后续）。
+1. **目标平台**：✅ 已定——先 Linux，后 Windows/macOS（现在三平台都已实现）。
 2. **默认行为**：✅ 已定——**能建就建**，建不起来就维持"关窗即退出"。
-3. **关窗 vs 退出的语义**：关窗=隐藏（我的建议），而 WebUI 的"退出"按钮=彻底退出——同意吗？
-4. **Windows 是否接受新增 `pystray` 依赖**（否则我改用 ctypes 自己写，代码多但零依赖）？
-5. **托盘要不要显示进度**（tooltip 里 `第 187/224 页`）？我建议要，这是"后台运行"最有用的部分。
+3. **关窗 vs 退出的语义**：✅ 已定——关窗=隐藏，而 WebUI 的"退出"按钮=彻底退出。
+4. **Windows 是否接受新增 `pystray` 依赖**：✅ 已定——**用 pystray**（纯 Python，
+   Pillow 已在依赖树里；Win32 消息循环由久经考验的库处理，好过手写不可测试的 ctypes）。
+5. **托盘要不要显示进度**：✅ 已定——要（tooltip 里 `第 187/224 页`）。
 6. **要不要顺带做开机自启**（Linux: systemd user unit / autostart；Windows: 启动项；macOS: Login Item）——
    这是独立的一件事，可以单列。

@@ -1,16 +1,21 @@
-"""System tray for the desktop build (phase 1: Linux / GTK).
+"""System tray for the desktop build — the platform-agnostic facade.
 
 The desktop app is a local server plus a window, and the OCR phase runs in the
 *server* process on daemon threads — so "keep working in the background" only
 needs two things a window cannot provide: **closing the window must not quit**,
-and **there must be a way back**.  This module supplies the second half on
-Linux.
+and **there must be a way back**.  This module supplies the second half on all
+three desktop platforms, through per-platform backends:
+
+``backend.tray_gtk``  Linux — AppIndicator (Ayatana first, old namespace
+                      fallback) over the same GTK stack ``requirements-desktop.txt``
+                      installs for the window.
+``backend.tray_win``  Windows — pystray, which drives ``Shell_NotifyIcon`` from
+                      its own message-loop thread (``Icon.run_detached``).
+``backend.tray_mac``  macOS — pyobjc ``NSStatusItem`` hanging off the
+                      ``NSApplication`` loop pywebview already runs.
 
 Why not pywebview's own tray: pywebview 6.2.1 has no tray API at all (no
-``Tray``, no ``tray=`` on ``webview.start``, no tray code in the package).  The
-icon is therefore created against the desktop's StatusNotifier host through
-AppIndicator — Ayatana first, the older namespace as a fallback — which is the
-same GTK stack ``requirements-desktop.txt`` already installs for the window.
+``Tray``, no ``tray=`` on ``webview.start``, no tray code in the package).
 
 **Everything here is best-effort.**  A missing library, a desktop without a
 tray host (e.g. GNOME without the AppIndicator extension) or a broken session
@@ -18,25 +23,22 @@ bus must leave the app behaving *exactly* as before: ``create_tray`` returns
 ``None`` and ``desktop`` keeps "closing the window quits".  Never the other way
 round — a hidden window with no tray would be unreachable.
 
-Threading: the indicator is created on the GTK main loop (we marshal it with
-``GLib.idle_add`` and wait), because that is the loop that serves its D-Bus
-menu.  Menu actions then run on their own daemon threads, and the window calls
-they make are pywebview's ``glib.idle_add`` wrappers, so nothing blocks or
-touches GTK from the wrong thread.
+Threading contract shared by every backend: the icon is created on the
+platform's GUI thread (marshalled there and waited for), menu actions run on
+their own daemon threads (:func:`run_off_gui_thread`), and the window calls
+they make are pywebview's marshalled wrappers — so nothing blocks or touches
+the GUI from the wrong thread.
 """
 from __future__ import annotations
 
 import logging
+import sys
 import threading
+import weakref
 from pathlib import Path
 from typing import Callable, Optional
 
 log = logging.getLogger(__name__)
-
-#: How long to wait for the GUI thread to hand back a created indicator.
-CREATE_TIMEOUT = 5.0
-#: Tray tooltip refresh interval (ms).
-STATUS_INTERVAL_MS = 5000
 
 #: Menu labels.  The WebUI is bilingual; the tray is native, so it follows the
 #: process locale (``locale.getlocale()`` — not an environment variable).
@@ -108,94 +110,10 @@ def status_text(jobs, locale_name: Optional[str] = None) -> str:
     return f"{_APP_NAME} · {detail}"
 
 
-def _indicator():
-    """The AppIndicator module, or None when unavailable."""
-    try:
-        import gi
-
-        gi.require_version("Gtk", "3.0")
-    except Exception:  # noqa: BLE001 - no PyGObject/GTK at all
-        return None
-    for namespace in ("AyatanaAppIndicator3", "AppIndicator3"):
-        try:
-            gi.require_version(namespace, "0.1")
-            module = __import__("gi.repository", fromlist=[namespace])
-            return getattr(module, namespace)
-        except Exception:  # noqa: BLE001 - try the next namespace
-            continue
-    return None
-
-
-def available() -> bool:
-    """True when a tray icon can probably be created here."""
-    return _indicator() is not None
-
-
-class Tray:
-    """A live tray icon.  Create it with :func:`create_tray`."""
-
-    def __init__(self, indicator, module, *, title: str, labels: dict,
-                 status_provider: Optional[Callable[[], str]] = None):
-        from gi.repository import GLib
-
-        self._GLib = GLib
-        self._indicator = indicator
-        self._module = module
-        self._labels = labels
-        self._status_provider = status_provider
-        self._source_id = None
-        self._closed = False
-        indicator.set_title(title)
-        self.update_status()
-
-    # -- status ---------------------------------------------------------------
-    def update_status(self) -> None:
-        """Refresh the tooltip from the caller's status provider."""
-        if self._closed or self._status_provider is None:
-            return
-        try:
-            text = self._status_provider()
-        except Exception:  # noqa: BLE001 - the tooltip must never break the app
-            log.debug("tray status provider failed", exc_info=True)
-            return
-        if text:
-            try:
-                self._indicator.set_title(text)
-            except Exception:  # noqa: BLE001
-                log.debug("could not update the tray tooltip", exc_info=True)
-
-    def _tick(self) -> bool:
-        self.update_status()
-        return not self._closed
-
-    def _start_ticking(self) -> None:
-        try:
-            self._source_id = self._GLib.timeout_add(STATUS_INTERVAL_MS, self._tick)
-        except Exception:  # noqa: BLE001 - a live tooltip is a bonus, not a need
-            log.debug("could not start the tray status timer", exc_info=True)
-
-    # -- teardown -------------------------------------------------------------
-    def shutdown(self) -> None:
-        """Hide the icon.  Safe to call twice, never raises."""
-        if self._closed:
-            return
-        self._closed = True
-        if self._source_id is not None:
-            try:
-                self._GLib.source_remove(self._source_id)
-            except Exception:  # noqa: BLE001
-                pass
-            self._source_id = None
-        try:
-            self._indicator.set_status(self._module.IndicatorStatus.PASSIVE)
-        except Exception:  # noqa: BLE001
-            log.debug("could not retire the tray icon", exc_info=True)
-
-
-def _run_off_gui_thread(action: Callable[[], None]) -> None:
+def run_off_gui_thread(action: Callable[[], None]) -> None:
     """Run a menu action on a daemon thread.
 
-    The GTK main loop must stay responsive, and a quit waits (briefly) for the
+    The GUI main loop must stay responsive, and a quit waits (briefly) for the
     jobs to stop, so nothing a menu does may block the loop.
     """
     def runner() -> None:
@@ -207,6 +125,30 @@ def _run_off_gui_thread(action: Callable[[], None]) -> None:
     threading.Thread(target=runner, name="tray-action", daemon=True).start()
 
 
+# --- platform dispatch --------------------------------------------------------
+
+#: The tray created most recently, as a weak reference: the hide-notice
+#: notification routes through it on platforms without libnotify (Windows).
+#: A weak reference because the owner (``desktop``) calls ``shutdown()`` on it;
+#: a dead one must never be used again.
+_last_tray: Optional["weakref.ReferenceType"] = None
+
+
+def _backend():
+    """The platform's tray backend module (imported lazily)."""
+    if sys.platform == "darwin":
+        from backend import tray_mac
+
+        return tray_mac
+    if sys.platform.startswith("win"):
+        from backend import tray_win
+
+        return tray_win
+    from backend import tray_gtk
+
+    return tray_gtk
+
+
 def create_tray(
     *,
     title: str,
@@ -216,102 +158,61 @@ def create_tray(
     on_quit: Callable[[], None],
     status_provider: Optional[Callable[[], str]] = None,
     locale_name: Optional[str] = None,
-) -> Optional[Tray]:
+):
     """Create the tray icon, or return None when it cannot be done.
 
-    Never raises: every failure path (no GTK, no AppIndicator, no display, no
-    session bus, a host that ignores us) ends in ``None`` so the caller keeps
-    its default behaviour.
+    Never raises: every failure path (no backend, no display, a host that
+    ignores us) ends in ``None`` so the caller keeps its default behaviour.
     """
-    module = _indicator()
-    if module is None:
-        log.info("no tray support: GTK/AppIndicator is unavailable")
-        return None
-    icon = Path(icon_path)
-    if not icon.exists():
-        log.warning("tray icon missing at %s; not creating a tray", icon)
-        return None
-
+    global _last_tray
     try:
-        from gi.repository import GLib, Gtk
-    except Exception:  # noqa: BLE001
-        log.info("no tray support: GTK is not importable")
+        backend = _backend()
+    except Exception:  # noqa: BLE001 - no tray may never break the app
+        log.warning("could not load the tray backend", exc_info=True)
         return None
-
-    labels = tray_labels(locale_name)
-    result: dict = {}
-    done = threading.Event()
-
-    def _build() -> bool:
-        try:
-            if result.get("tray") is not None:
-                return False        # already built (a late idle callback)
-            if not Gtk.init_check(None)[0]:
-                log.info("no tray support: no usable display")
-                return False
-            menu = Gtk.Menu()
-            for label, action in (
-                (labels["show"], on_show),
-                (labels["browser"], on_open_browser),
-                (labels["quit"], on_quit),
-            ):
-                item = Gtk.MenuItem(label=label)
-                item.connect("activate", lambda _w, fn=action: _run_off_gui_thread(fn))
-                menu.append(item)
-            menu.show_all()
-
-            indicator = module.Indicator.new(
-                "pdf-ocr-embed", str(icon),
-                module.IndicatorCategory.APPLICATION_STATUS)
-            indicator.set_status(module.IndicatorStatus.ACTIVE)
-            indicator.set_menu(menu)
-            tray = Tray(indicator, module, title=title, labels=labels,
-                        status_provider=status_provider)
-            tray._start_ticking()
-            result["tray"] = tray
-            return False
-        except Exception:  # noqa: BLE001 - any failure -> no tray
-            log.warning("could not create the tray icon", exc_info=True)
-            return False
-        finally:
-            done.set()
-
     try:
-        GLib.idle_add(_build)      # must be created by the GTK main loop
+        tray = backend.create_tray(
+            title=title, icon_path=icon_path, on_show=on_show,
+            on_open_browser=on_open_browser, on_quit=on_quit,
+            status_provider=status_provider, locale_name=locale_name)
     except Exception:  # noqa: BLE001
-        log.warning("could not schedule tray creation", exc_info=True)
+        log.warning("the tray backend failed; continuing without a tray",
+                    exc_info=True)
         return None
-    if not done.wait(CREATE_TIMEOUT):
-        # Nothing served the idle callback: there is no GTK main loop, so the
-        # icon would exist without a working menu.  No tray is better than a
-        # dead one (the caller then keeps "closing quits").
-        log.warning("no GTK main loop answered within %.0fs; no tray",
-                    CREATE_TIMEOUT)
-        return None
-    tray = result.get("tray")
     if tray is not None:
-        log.info("system tray icon created")
+        try:
+            _last_tray = weakref.ref(tray)
+        except TypeError:  # pragma: no cover - every Tray is weakref-able
+            _last_tray = None
     return tray
+
+
+def available() -> bool:
+    """True when a tray icon can probably be created here."""
+    try:
+        return bool(_backend().available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def notify(title: str, body: str = "") -> bool:
     """Best-effort desktop notification (used when the window hides).
 
-    Returns False when libnotify/its typelib is not available — the caller must
+    Returns False when the platform has no usable channel — the caller must
     treat that as "no notification", never as an error.
     """
-    try:
-        import gi
+    if sys.platform == "darwin":
+        from backend import tray_mac
 
-        gi.require_version("Notify", "0.7")
-        from gi.repository import Notify
-    except Exception:  # noqa: BLE001
+        return tray_mac.notify(title, body)
+    if sys.platform.startswith("win"):
+        tray = _last_tray() if _last_tray is not None else None
+        if tray is not None:
+            try:
+                return bool(tray.notify(title, body))
+            except Exception:  # noqa: BLE001
+                log.debug("tray notification failed", exc_info=True)
         return False
-    try:
-        if not Notify.is_initted():
-            Notify.init(title or _APP_NAME)
-        Notify.Notification.new(title, body or "", None).show()
-        return True
-    except Exception:  # noqa: BLE001
-        log.debug("desktop notification failed", exc_info=True)
-        return False
+    from backend import tray_gtk
+
+    return tray_gtk.notify(title, body)
