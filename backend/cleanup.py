@@ -20,6 +20,12 @@ Settings (via ``backend.config.resolve()``, from ``backend/ocr_config.toml``):
 Deletion safety:
   - Every path referenced by a live job (`pdf_path`, `hocr_dir`,
     `previews_dir`, `embedded_path`) is excluded up front.
+  - A job that exists ON DISK also protects itself, even when this process does
+    not know it: `uploads/<id>.pdf` and `work/<id>/` reference each other.  Two
+    instances sharing the runtime directories (or any process with a different
+    registry view) must not collect each other's jobs — losing the upload breaks
+    retry/finalize, and losing the work dir throws away the OCR results.  A job
+    is dropped explicitly, by ``clear_job`` removing both halves.
   - Symlinks are never followed or removed.
   - ``force`` only relaxes the *age* rule — referenced files are still kept.
 """
@@ -46,11 +52,18 @@ UPLOAD_DIR = paths.UPLOAD_DIR
 
 # Work dirs hold per-job folders; the other two areas are scanned recursively.
 AREAS = ("work", "output", "uploads")
-_AREA_DIRS = {
-    "work": WORK_DIR,
-    "output": OUTPUT_DIR,
-    "uploads": UPLOAD_DIR,
-}
+
+
+def _area_dirs() -> Dict[str, Path]:
+    """The scan roots, resolved at CALL time.
+
+    Deliberately not a module-level dict: ``WORK_DIR``/``OUTPUT_DIR``/
+    ``UPLOAD_DIR`` get patched — by tests, and by anything that runs this app
+    against a different runtime directory — and an import-time snapshot kept
+    scanning the ORIGINAL locations no matter what.  That is how a second
+    process once collected the first one's uploads.
+    """
+    return {"work": WORK_DIR, "output": OUTPUT_DIR, "uploads": UPLOAD_DIR}
 
 DEFAULT_MAX_AGE_HOURS = 168.0   # 7 days
 DEFAULT_INTERVAL_HOURS = 6.0
@@ -76,16 +89,42 @@ def interval_hours() -> float:
     return _num(resolve().get("cleanup_interval_hours"), DEFAULT_INTERVAL_HOURS)
 
 
+def on_disk_job_paths() -> set:
+    """Paths of jobs that exist ON DISK, whether or not this process knows them.
+
+    ``uploads/<id>.pdf`` and ``work/<id>/`` reference each other: the UI restores
+    jobs from disk, "retry"/"finalize" need the upload, and the work dir holds
+    the OCR results.  A process whose registry does not contain the job (a second
+    instance, or one started against different work dirs) would otherwise see
+    both halves as garbage and delete them once they are older than the age
+    limit.  Only a pair counts: a lone half is what an interrupted ``clear_job``
+    or a failed upload leaves behind, and that is real garbage.
+    """
+    refs: set = set()
+    try:
+        if not WORK_DIR.exists() or not UPLOAD_DIR.exists():
+            return refs
+        work_ids = {p.name for p in WORK_DIR.iterdir() if p.is_dir()}
+        uploads = {p.stem: p for p in UPLOAD_DIR.glob("*.pdf")}
+        for job_id in work_ids & set(uploads):
+            refs.add(str((WORK_DIR / job_id).resolve()))
+            refs.add(str(uploads[job_id].resolve()))
+    except OSError:
+        log.debug("could not enumerate the on-disk jobs", exc_info=True)
+    return refs
+
+
 def referenced_paths() -> set:
     """Absolute paths of everything live jobs still need (never cleaned)."""
     from backend import ocr_service
+
     refs = set()
     for job in ocr_service.all_jobs():
         for key in ("pdf_path", "hocr_dir", "previews_dir", "embedded_path"):
             p = job.get(key)
             if p:
                 refs.add(str(Path(p).resolve()))
-    return refs
+    return refs | on_disk_job_paths()
 
 
 def _dir_size(path: Path) -> int:
@@ -133,7 +172,7 @@ def _scan() -> Dict[str, dict]:
     refs = referenced_paths()
     areas: Dict[str, dict] = {}
     for area in AREAS:
-        base = _AREA_DIRS[area]
+        base = _area_dirs()[area]
         recursive = area != "work"
         referenced_items, unreferenced = [], []
         for child in _children(base, recursive):
