@@ -345,8 +345,16 @@ python packaging/build.py --clean --with-tesseract   # 捆绑 tesseract + eng/ch
   `TESSDATA_PREFIX`。**因此用户无需安装任何东西**——实测把系统 tesseract 从
   `PATH` 完全移除后，打包版仍能完成整条 OCR 流水线。`/api/health` 的
   `tesseract.source` 会显示 `bundled` 还是 `system`。不加该参数则退回依赖系统 tesseract。
-- **原生窗口**用 pywebview 渲染系统 WebView（WebView2 / WKWebView / WebKit2GTK）；
-  关闭窗口即退出。若 pywebview 缺失或后端起不来，会**退回系统浏览器**而不是失败。
+- **原生窗口**用 pywebview 渲染系统 WebView（WebView2 / WKWebView / WebKit2GTK）。
+  若 pywebview 缺失或后端起不来，会**退回系统浏览器**而不是失败。
+- **后台运行（系统托盘，Linux）**：托盘可用时，**关闭窗口 = 隐藏窗口而不是退出**，
+  OCR 任务继续在服务进程里跑；托盘菜单提供 *显示主窗口 / 在浏览器中打开 / 退出*，
+  鼠标悬停能看到实时进度（如 `PDF OCR Embed · 第 187/224 页`）。首次隐藏会弹一条
+  系统通知，避免「窗口不见了」被误认为崩溃。**托盘建不起来时行为与以前完全一致
+  （关窗即退出）**——绝不让窗口藏起来又找不回来。开关：`--no-tray` 强制关闭该行为，
+  `--tray` 显式要求；`--no-window`（无窗口）不建托盘。
+  实现见 `backend/tray.py`（AppIndicator / StatusNotifier），研究结论与各平台路线见
+  [`TRAY_RESEARCH.md`](TRAY_RESEARCH.md)。Windows/macOS 尚未实现。
 - **退出按钮**：由 `desktop.py` 启动时，WebUI 页头会多出一个 **Quit** 按钮
   （`/api/health` 的 `desktop: true`），调用 `POST /api/app/quit`——浏览器回退模式下
   这是唯一的退出方式。该接口要求自定义请求头，且 CORS 只允许 loopback 源，

@@ -111,15 +111,94 @@ def test_the_quit_watcher_destroys_the_window(monkeypatch):
 
 
 def test_closing_the_window_requests_a_quit():
-    """The closing handler must ASK to quit and must not cancel the close."""
+    """Without a tray, closing the window quits — exactly as it always did.
+
+    Calls the REAL handler (``desktop._make_closing_handler``): the previous
+    version of this test re-implemented the handler inline, so it would not
+    have noticed a change in desktop.py.
+    """
+    log: list = []
+    window = _FakeWindow(log)
+    handler = desktop._make_closing_handler(window, hide_on_close=False)
+
+    assert handler() is True                      # allow the close
+    assert lifecycle.is_quit_requested() is True
+    assert log == []                              # hiding never happened
+
+
+def test_closing_with_a_tray_hides_and_keeps_running(monkeypatch):
+    """With a tray, closing must HIDE and must NOT quit: the OCR job keeps
+    running in the server, and the tray is the way back."""
+    log: list = []
+    window = _FakeWindow(log)
+    window.hide = lambda: log.append("hide")
+    handler = desktop._make_closing_handler(window, hide_on_close=True)
+
+    assert handler() is False                     # literal False cancels the close
+    assert log == ["hide"]
+    assert lifecycle.is_quit_requested() is False
+
+
+def test_hiding_is_announced_once(monkeypatch):
+    """A window that vanishes silently reads as a crash: say it once."""
+    from backend import tray as tray_mod
+
+    notices: list = []
+    monkeypatch.setattr(tray_mod, "notify",
+                        lambda title, body: notices.append((title, body)) or True)
+    log: list = []
+    window = _FakeWindow(log)
+    window.hide = lambda: log.append("hide")
+    handler = desktop._make_closing_handler(window, hide_on_close=True)
+
+    handler()
+    handler()
+    handler()
+    assert len(notices) == 1
+    assert log == ["hide", "hide", "hide"]
+
+
+def test_a_window_that_cannot_hide_still_quits(monkeypatch):
+    """If hiding fails we must not stay alive invisibly: fall back to a quit."""
     log: list = []
     window = _FakeWindow(log)
 
-    # Register the handler the way _watch_for_quit does, then fire it.
-    def _on_closing() -> bool:
-        lifecycle.request_quit(timeout=1.0)
-        return True
+    def boom() -> None:
+        raise RuntimeError("no window system")
 
-    window.events.closing += _on_closing
-    assert window.events.closing.handlers[0]() is True
+    window.hide = boom
+    handler = desktop._make_closing_handler(window, hide_on_close=True)
+
+    assert handler() is True                      # allow the close
     assert lifecycle.is_quit_requested() is True
+
+
+@pytest.mark.parametrize("tray_available,tray_requested,expected", [
+    (True, True, True),        # a tray exists and was wanted -> hide
+    (False, True, False),      # wanted, but none could be created -> quit
+    (True, False, False),      # --no-tray -> quit
+    (False, False, False),     # nothing to hide to -> quit
+])
+def test_should_hide_on_close(tray_available, tray_requested, expected):
+    """The rule that protects the user from an unreachable hidden window:
+    the exit behaviour only changes when a tray really exists."""
+    assert desktop._should_hide_on_close(
+        tray_available=tray_available, tray_requested=tray_requested) is expected
+
+
+def test_tray_status_is_built_from_the_job_list(monkeypatch):
+    from backend import ocr_service
+
+    monkeypatch.setattr(ocr_service, "list_jobs", lambda: [
+        {"status": "running", "pages_done": 5, "num_pages": 9}])
+    assert "5/9" in desktop._tray_status()
+
+
+def test_tray_status_survives_a_broken_job_list(monkeypatch):
+    from backend import ocr_service
+
+    def boom():
+        raise RuntimeError("registry gone")
+
+    monkeypatch.setattr(ocr_service, "list_jobs", boom)
+    assert desktop._tray_status() == ""

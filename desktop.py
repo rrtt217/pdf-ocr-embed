@@ -14,6 +14,16 @@ This is the script PyInstaller freezes into the double-clickable app.  It:
 4. on exit, gracefully stops any running OCR job (the project's ``cancel``
    flag contract) and shuts the server down.
 
+**Background running.**  The OCR phase lives in the server process on daemon
+threads, so the window is only a view: closing it used to quit (and cancel the
+job), which made "start it and let it work" impossible.  When a system tray can
+be created (``backend/tray.py``; Linux/GTK today), closing the window now
+**hides** it instead and the tray offers show / open-in-browser / quit — with
+the live page progress in its tooltip.  This is deliberately conditional: if no
+tray could be created, closing still quits exactly as before, because a hidden
+window with no tray would be unreachable.  ``--no-tray`` forces the old
+behaviour, ``--tray`` asks for the tray explicitly.
+
 **Exiting must always work.**  A quit can arrive from four directions — the
 window being closed, the UI's Quit button, Ctrl-C, or ``SIGTERM`` — and each
 one has to end the process even while a minutes-long OCR job is in flight.
@@ -180,33 +190,141 @@ def _browser_mode(url: str) -> None:
     _serve_until_quit()
 
 
-def _watch_for_quit(window) -> None:
+# --- system tray (background running) ----------------------------------------
+
+def _tray_icon_path():
+    """The bundled tray/window icon (read-only asset inside the bundle)."""
+    from backend import paths
+
+    return paths.resource_dir() / "frontend" / "tray.png"
+
+
+def _should_hide_on_close(*, tray_available: bool, tray_requested: bool) -> bool:
+    """True when closing the window must HIDE it instead of quitting.
+
+    Pure on purpose (unit-tested): the rule is "only change the exit behaviour
+    when a tray really exists", so a failed tray can never leave the user with
+    a hidden, unreachable window.
+    """
+    return bool(tray_available and tray_requested)
+
+
+def _tray_status() -> str:
+    """Tooltip text for the tray: what the server is doing right now."""
+    from backend import ocr_service, tray as tray_mod
+
+    try:
+        jobs = ocr_service.list_jobs()
+    except Exception:  # noqa: BLE001 - a broken status must not break the tray
+        log.debug("could not read the job list for the tray", exc_info=True)
+        return ""
+    return tray_mod.status_text(jobs)
+
+
+def _show_window(window) -> None:
+    """Bring the window back from hidden/minimized.
+
+    Both calls are pywebview's ``glib.idle_add`` wrappers, so this is safe from
+    the tray's thread; show() maps the window, restore() raises and focuses it.
+    """
+    for action in ("show", "restore"):
+        try:
+            getattr(window, action)()
+        except Exception:  # noqa: BLE001 - a stuck GUI must not stop the app
+            log.debug("window.%s() failed", action, exc_info=True)
+
+
+def _create_tray(window, url: str):
+    """Create the tray icon, or return None (never raises).
+
+    Must run after ``webview.start`` brought the GUI loop up: the indicator is
+    built on the GTK main loop, which is the loop serving its D-Bus menu.
+    """
+    from backend import lifecycle, tray as tray_mod
+
+    def _quit_from_tray() -> None:
+        # Same bounded teardown as every other quit door.
+        lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
+
+    return tray_mod.create_tray(
+        title=WINDOW_TITLE,
+        icon_path=_tray_icon_path(),
+        on_show=lambda: _show_window(window),
+        on_open_browser=lambda: __import__("webbrowser").open(url),
+        on_quit=_quit_from_tray,
+        status_provider=_tray_status,
+    )
+
+
+def _make_closing_handler(window, *, hide_on_close: bool):
+    """Build the window's ``closing`` handler.
+
+    The return value is a veto flag, and pywebview only honours the *literal*
+    ``False`` (``Event.set()`` counts ``v is False``).  GTK then cancels the
+    delete-event, i.e. the window stays open — which is what hiding to the tray
+    needs.  Returning ``True`` lets the close go through, ending the GUI loop.
+
+    Extracted from ``_watch_for_quit`` so the decision is unit-tested against
+    the real code path instead of a copy of it.
+    """
+    from backend import lifecycle, tray as tray_mod
+
+    state = {"noticed": False}
+
+    def _on_closing() -> bool:
+        if hide_on_close:
+            # Closing the window is NOT a quit any more: hide it and let the
+            # server (and any running OCR job) carry on in the background.
+            try:
+                window.hide()
+            except Exception:  # noqa: BLE001 - fall through to a real quit
+                log.warning("could not hide the window", exc_info=True)
+                lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
+                return True
+            if not state["noticed"]:
+                # Tell the user once where the app went: a window that vanishes
+                # silently reads as "it crashed".
+                state["noticed"] = True
+                title, body = tray_mod.hidden_notice()
+                tray_mod.notify(title, body)
+            return False      # literal False CANCELS the close (pywebview)
+        lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
+        return True
+
+    return _on_closing
+
+
+def _watch_for_quit(window, url: str = "", *, want_tray: bool = False) -> None:
     """Close the native window on quit, from the thread that owns it.
 
     Called by ``webview.start(func=...)`` *after* the GUI loop is running, so
     this thread is not the loop itself but the window API is live.  Destroying
     the window is what makes the GUI loop return; without it a Quit pressed in
     the UI (or Ctrl-C) would stop the server but leave the window on screen.
-    """
-    import webview
 
+    This is also where the tray is created, because the window's closing
+    behaviour depends on whether it worked out: with a tray, closing hides the
+    window and the app keeps running; without one, closing quits (as it always
+    did).
+    """
     from backend import lifecycle
 
-    # Closing the window is itself a quit (the flag makes the main thread
-    # continue its teardown instead of blocking in webview.start forever).
-    # The handler must return True: pywebview CANCELS a close whose handler
-    # returned a falsy value, which would leave a dead window on screen.
-    def _on_closing() -> bool:
-        lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
-        return True
+    tray = _create_tray(window, url) if want_tray else None
+    hide_on_close = _should_hide_on_close(tray_available=tray is not None,
+                                         tray_requested=want_tray)
+    if want_tray and tray is None:
+        log.info("no system tray available; closing the window will quit")
 
     try:
-        window.events.closing += _on_closing
+        window.events.closing += _make_closing_handler(
+            window, hide_on_close=hide_on_close)
     except Exception:  # noqa: BLE001 - older pywebview, or no event support
         log.debug("could not subscribe to the window closing event",
                   exc_info=True)
 
     lifecycle.wait_for_quit()
+    if tray is not None:
+        tray.shutdown()
     try:
         window.destroy()
     except Exception:  # noqa: BLE001 - a stuck GUI must not stop the exit
@@ -227,6 +345,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gui", default=None,
                         help="force a pywebview backend (e.g. gtk, qt); "
                              "default: GTK on Linux when usable, else auto")
+    tray_group = parser.add_mutually_exclusive_group()
+    tray_group.add_argument("--tray", action="store_true",
+                            help="keep running in the system tray when the "
+                                 "window is closed (default when a tray is "
+                                 "available)")
+    tray_group.add_argument("--no-tray", action="store_true",
+                            help="never create a tray icon; closing the window "
+                                 "quits (the pre-tray behaviour)")
     args = parser.parse_args(argv)
 
     from backend import lifecycle, paths
@@ -253,10 +379,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     want_window = args.window or (not args.no_window and not args.browser)
+    # "Background running" is opt-out, not opt-in: try the tray unless the user
+    # said no.  Whether it actually changes the close behaviour depends on the
+    # tray really being created (see _should_hide_on_close).
+    want_tray = not args.no_tray
     if want_window and not args.window and not _display_available():
         log.info("no DISPLAY/Wayland session detected; using the browser")
         args.browser = True
         want_window = False
+
+    if want_tray and not want_window:
+        log.info("no native window, so no tray (the WebUI in the browser is "
+                 "unaffected; --no-window means headless on purpose)")
 
     window = _create_window(server.url) if want_window else None
     started_windowed = window is not None
@@ -280,10 +414,16 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 import webview
 
+                icon = _tray_icon_path()
                 # blocks until the last window is closed; the watcher closes
                 # it when a quit is requested from the UI or a signal
-                webview.start(lambda: _watch_for_quit(window),
-                              gui=_preferred_gui(args.gui))
+                webview.start(
+                    lambda: _watch_for_quit(window, server.url,
+                                            want_tray=want_tray),
+                    gui=_preferred_gui(args.gui),
+                    # The same icon also becomes the window/taskbar icon.
+                    icon=str(icon) if icon.exists() else None,
+                )
             except Exception as exc:  # noqa: BLE001 - GUI backend unavailable
                 log.warning("native window failed to start (%s); "
                             "falling back to the system browser", exc)

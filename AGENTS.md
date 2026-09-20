@@ -108,6 +108,12 @@ the single most important invariant to preserve.
   `stop_server()` (which also arms the hard-exit deadline),
   `exit_soon()` / `force_exit_now()` (the `os._exit` backstop) and
   `make_signal_handler()` (first signal = graceful, second = immediate).
+  A fifth door exists in the desktop build: the **system tray**
+  (`backend/tray.py`), whose Quit item calls the same `lifecycle.request_quit`
+  and therefore the same bounded teardown. One rule comes with it: closing the
+  window may only HIDE it (background running) when a tray was really created —
+  otherwise the close must quit as before, or the window becomes unreachable
+  (`desktop._should_hide_on_close`, pinned by `tests/test_desktop.py`).
   Two rules that are easy to break: never set uvicorn's
   `timeout_graceful_shutdown` back to `None` (the SSE streams the WebUI holds
   open then keep `stop()` waiting until the OCR run ends), and never arm the
@@ -159,6 +165,14 @@ the single most important invariant to preserve.
   Pinned by `tests/test_job_persistence.py::
   test_sidecar_only_page_is_repaired_and_embeds_its_text` and
   `::test_missing_finalize_marker_is_repaired_for_an_existing_hocr`.
+- **Temp-file cleanup must never collect a job that still exists**: a file is
+  protected when a live job references it AND when its job exists on disk
+  (`uploads/<id>.pdf` + `work/<id>/` reference each other). The registry alone
+  is not enough — a second process (or one with different runtime dirs) would
+  otherwise delete a complete job's upload and work dir; that really happened
+  once. The scan roots are resolved at CALL time (`cleanup._area_dirs()`), never
+  captured at import, so patching the dirs actually redirects the sweep.
+  Pinned by `tests/test_cleanup.py`.
 - Runtime artifacts (`output/`, `work/`, `uploads/`, `logs/`, `build/`,
   `dist/`, `.venv/`, `backend/ocr_config.toml`) are gitignored. Never commit
   keys or large sample PDFs.
@@ -196,6 +210,7 @@ backend/
   lifecycle.py            # desktop mode flag + quit state (the WebUI Quit button)
   shutdown.py             # bounded quit for every entry point (jobs, server, deadline, signals)
   bundled_tools.py        # put the bundled Tesseract on PATH/LD_LIBRARY_PATH/TESSDATA_PREFIX
+  tray.py                 # system tray (Linux/AppIndicator) + status text for background running
   pdf_processing.py       # the ONLY PDF-library seam (pypdfium2: previews/geometry/text)
   validation.py           # post-embed coverage report
   batch.py                # ZIP packaging (streamed)
