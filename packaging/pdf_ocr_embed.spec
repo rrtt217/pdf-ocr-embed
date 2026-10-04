@@ -36,6 +36,71 @@ datas = [
 # OCRmyPDF ships small runtime data; harmless when empty.
 datas += collect_data_files("ocrmypdf")
 
+# --- GI typelibs PyInstaller's hooks do not collect ---------------------------
+# PyGObject's hooks collect typelibs per gi namespace, but there is no hook for
+# WebKit2 (the native window) or for the tray's AppIndicator3/Notify — and a
+# frozen app cannot see the *system* typelibs of another distro either, because
+# the fallback search paths are compiled into the build host's girepository
+# (Debian layout on the runner vs /usr/lib64 on Fedora).  A missing typelib is
+# silent: pywebview logs "Namespace WebKit2 not available" and the app falls
+# back to the browser — which happened in the wild.  Collect the import-time
+# dependency closure too (WebKit2 needs its own Soup/JavaScriptCore typelibs).
+#
+# typelibs ONLY, never the shared libraries: libwebkit2gtk is a multiprocess
+# stack (WebKitWebProcess/WebKitNetworkProcess helpers), and bundling just the
+# library without them makes WebKit look for the helpers next to the bundle —
+# a blank webview is worse than the browser fallback.  The webkit/appindicator
+# *libraries* stay documented system runtime deps (README, desktop section);
+# each feature degrades on its own: no library -> browser window / no tray.
+def _gi_typelib_closure(module, version, seen=None):
+    """The typelib of a gi namespace plus its dependencies' typelibs."""
+    seen = seen if seen is not None else set()
+    found = []
+    try:
+        from PyInstaller.utils.hooks.gi import GiModuleInfo
+
+        info = GiModuleInfo(module, version)
+        if not info.available or not info.typelib:
+            return found
+        name = f"{module}-{version}"
+        if name in seen:
+            return found
+        seen.add(name)
+        found.append((info.typelib, "gi_typelibs"))
+        for dep in info.dependencies:
+            dep_name, _, dep_version = dep.rpartition("-")
+            found += _gi_typelib_closure(dep_name, dep_version, seen)
+    except Exception as exc:  # noqa: BLE001 - degrade exactly like before
+        print(f"[spec] could not query GI module {module}-{version}: {exc}")
+    return found
+
+
+def _first_available(*candidates):
+    for module, version in candidates:
+        found = _gi_typelib_closure(module, version)
+        if found:
+            return found
+    return []
+
+
+# The window: WebKit2GTK (4.1 preferred — exactly pywebview's require() order).
+_webkit = _first_available(("WebKit2", "4.1"), ("WebKit2", "4.0"))
+datas += _webkit
+# The tray: Ayatana first, then the old namespace (backend/tray_gtk.py's
+# order), plus libnotify for the hide notice.
+_indicator = _first_available(("AyatanaAppIndicator3", "0.1"),
+                              ("AppIndicator3", "0.1"))
+datas += _indicator + _first_available(("Notify", "0.7"))
+if _webkit:
+    print(f"[spec] bundling WebKit2 typelib closure ({len(_webkit)} file(s))")
+else:
+    print("[spec] WARNING: no WebKit2 typelib on this build host — the frozen "
+          "app will fall back to the system browser (install "
+          "gir1.2-webkit2-4.1 for the native window)")
+if not _indicator:
+    print("[spec] WARNING: no AppIndicator typelib on this build host — the "
+          "frozen app will have no system tray (closing the window quits)")
+
 # --- optional bundled Tesseract ----------------------------------------------
 # Staged by `python packaging/bundle_tesseract.py`, which the build runs with
 # --with-tesseract.  Installing the program + its shared libraries + language

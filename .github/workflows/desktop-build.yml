@@ -92,8 +92,15 @@ jobs:
         continue-on-error: true
         run: |
           sudo apt-get update
+          # The tray's GIR packages are a bonus and absent on some runners —
+          # check they exist first, because apt aborts the whole (set -e)
+          # step, including the pywebview install, on a missing package name.
+          tray_pkgs=""
+          for p in gir1.2-ayatanaappindicator3-0.1 gir1.2-appindicator3-0.1; do
+            apt-cache show "$p" >/dev/null 2>&1 && tray_pkgs="$tray_pkgs $p"
+          done
           sudo apt-get install -y \
-            libgirepository1.0-dev libcairo2-dev pkg-config gir1.2-webkit2-4.1
+            libgirepository1.0-dev libcairo2-dev pkg-config gir1.2-webkit2-4.1 $tray_pkgs
           pip install "pywebview[gtk]"
 
       # A host Tesseract is only the *source* we copy from; the app ships its
@@ -132,6 +139,23 @@ jobs:
       # With Tesseract present we also run the FULL pipeline on this OS:
       # upload -> OCRmyPDF -> tesseract -> invisible text layer -> download,
       # asserting the produced PDF is actually searchable.
+      # WebKit2 is this project's silent-failure mode: PyInstaller has no hook
+      # for that gi namespace (the spec collects the typelib closure itself),
+      # and a runner that lost the best-effort GTK step above would STILL build
+      # — quietly, browser-only.  Fail loudly instead of shipping an artifact
+      # without a native window.
+      - name: Verify the bundle has the window + tray typelibs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if ! compgen -G "dist/pdf-ocr-embed/_internal/gi_typelibs/WebKit2-*.typelib" >/dev/null; then
+            echo "::error::No WebKit2 typelib in the bundle — the frozen app would fall back to the browser. Check the 'Linux native window — GTK stack' step; a failure there lands here."
+            exit 1
+          fi
+          if ! compgen -G "dist/pdf-ocr-embed/_internal/gi_typelibs/*ppIndicator3-*.typelib" >/dev/null; then
+            echo "::warning::No AppIndicator typelib in the bundle — the frozen Linux app has no system tray (closing the window quits)."
+          fi
+
       - name: Smoke test the bundle
         shell: bash
         run: |

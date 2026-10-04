@@ -30,7 +30,9 @@ for macOS `.app` bundles.
 
 `desktop.py` renders the UI in the OS webview through
 [pywebview](https://pywebview.flowrl.com/) (WebView2 / WKWebView /
-WebKit2GTK). Closing the window quits the app.
+WebKit2GTK). When a system tray icon can be created (`backend/tray.py`:
+AppIndicator / pystray / NSStatusItem) closing the window HIDES the app to
+the tray; without a tray — and with `--no-tray` — closing quits as before.
 
 If pywebview is missing or its backend cannot start, the app **falls back to
 the system browser** rather than failing. To cover that case — and to give the
@@ -43,10 +45,16 @@ needed to send it.
 Whichever way you exit, running OCR jobs are stopped through the project's own
 `cancel`-flag contract first, so no completed pages are lost.
 
-On Linux the native window needs system GTK/WebKit at runtime — for the
-*packaged* build these are bundled, but a source checkout needs
-`python3-gobject` + `webkit2gtk4.1` (Fedora) / `python3-gi` +
-`gir1.2-webkit2-4.1` (Debian).
+On Linux the packaged build bundles the GTK shared libraries and — PyInstaller
+has **no collection hook** for them — the GI *typelibs* (introspection data)
+of WebKit2 and the tray namespaces: the typelib search paths are compiled into
+the *build host's* girepository, so without bundling, a frozen app on another
+distro silently falls back to the browser.  What stays a **system runtime
+dependency** is the WebKit *library* itself (`libwebkit2gtk-4.1` plus its
+`WebKitWebProcess` helper): bundling the library without its multiprocess
+helpers yields a blank webview — worse than the browser fallback.  A source
+checkout needs both halves: `python3-gobject` + `webkit2gtk4.1` (Fedora) /
+`python3-gi` + `gir1.2-webkit2-4.1` (Debian).
 
 `--gui <backend>` overrides the choice (e.g. `--gui qt`), for a machine whose
 GTK/WebKit stack is unusable. Note that only **GTK is bundled**; see below.
@@ -232,12 +240,16 @@ binary headless, asserts the frontend and `/api/health` answer, that the
 confirmation header, and that the process then exits 0 — so a bundle that
 merely built but cannot run still fails the job.
 
-The Linux job installs the GTK stack as a `continue-on-error` step: if
-PyGObject/WebKit cannot be set up on the runner, the bundle is still produced and
-the app falls back to the system browser. On `ubuntu-latest` it succeeds — the
-step pulls **PyGObject 3.50.0** through `pywebview[gtk]` (the pin that matches
-the runner's `girepository-1.0`), so the Linux artifact does carry the native
-window. Windows (WebView2) and macOS (WKWebView) need no extra system packages.
+The Linux job installs the GTK stack as a `continue-on-error` step, but the
+build may no longer ship *quietly* without a window: a verification step fails
+the job when `dist/…/_internal/gi_typelibs/WebKit2-*.typelib` is missing —
+that silent downgrade is exactly how the first Actions artifact shipped
+browser-only despite the runner installing `gir1.2-webkit2-4.1`. On
+`ubuntu-latest` the step succeeds — it pulls **PyGObject 3.50.0** through
+`pywebview[gtk]` (the pin that matches the runner's `girepository-1.0`) — and
+the spec bundles the WebKit2 / AppIndicator typelib closures, so the Linux
+artifact carries both the native window and the system tray. Windows
+(WebView2) and macOS (WKWebView) need no extra system packages.
 
 ### Verified on GitHub Actions
 
