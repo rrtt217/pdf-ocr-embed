@@ -91,13 +91,15 @@ datas += _webkit
 _indicator = _first_available(("AyatanaAppIndicator3", "0.1"),
                               ("AppIndicator3", "0.1"))
 datas += _indicator + _first_available(("Notify", "0.7"))
+import sys as _sys  # noqa: E402 - the warnings below are Linux-only noise
+
 if _webkit:
     print(f"[spec] bundling WebKit2 typelib closure ({len(_webkit)} file(s))")
-else:
+elif _sys.platform.startswith("linux"):
     print("[spec] WARNING: no WebKit2 typelib on this build host — the frozen "
           "app will fall back to the system browser (install "
           "gir1.2-webkit2-4.1 for the native window)")
-if not _indicator:
+if not _indicator and _sys.platform.startswith("linux"):
     print("[spec] WARNING: no AppIndicator typelib on this build host — the "
           "frozen app will have no system tray (closing the window quits)")
 
