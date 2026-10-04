@@ -89,6 +89,13 @@ jobs:
         if: runner.os != 'Linux'
         run: pip install pywebview
 
+      # The Windows tray backend is a runtime dynamic import (the spec can only
+      # collect what is installed) — without pystray the artifact silently
+      # ships tray-less, the same failure mode as the missing WebKit typelib.
+      - name: Install the tray backend (Windows)
+        if: runner.os == 'Windows'
+        run: pip install "pystray>=0.19"
+
       # Linux needs GTK + WebKit2GTK and a matching PyGObject.  This is the one
       # genuinely fragile part (girepository-1.0 vs 2.0 across distros), so it is
       # best-effort: if it fails the bundle is still built and the app simply

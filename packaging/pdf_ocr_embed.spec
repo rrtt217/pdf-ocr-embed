@@ -160,13 +160,21 @@ try:
 except ImportError:
     pass
 # pystray is optional too (the Windows tray backend imports it dynamically in
-# backend.tray_win, which static analysis cannot see).
+# backend.tray_win, which static analysis cannot see).  A Windows build host
+# without it produces a tray-less bundle — say so loudly; CI installs it
+# explicitly and greps for the bundled line.
 try:
     import pystray  # noqa: F401
 
     hiddenimports += collect_submodules("pystray")
+    print("[spec] bundling pystray (the Windows tray backend)")
 except ImportError:
-    pass
+    import sys
+
+    if sys.platform.startswith("win"):
+        print("[spec] WARNING: pystray is not installed on this Windows build "
+              "host — the bundle will have no system tray (closing the "
+              "window quits).  pip install -r requirements-desktop.txt")
 
 # --- exclusions --------------------------------------------------------------
 # Nothing in this app needs a GUI toolkit, a test runner or a plotting stack;
