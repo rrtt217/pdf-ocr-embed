@@ -72,7 +72,7 @@ from a source checkout (verified: a Qt window opens and the app runs with
 
 | | GTK / WebKit2GTK | Qt / PyQt6-WebEngine |
 | --- | --- | --- |
-| Bundle size | **209 MB** | **795 MB** (measured) — PyQt6 alone is 494 MB |
+| Bundle size | **192 MB** | **795 MB** (measured) — PyQt6 alone is 494 MB |
 | Licence of the Python bindings | PyGObject is **LGPL-2.1+** | PyQt6 is **GPL-3.0-only** (or commercial from Riverbank) |
 | Collected by PyInstaller automatically | yes | **no** — qtpy picks its binding dynamically, so PyInstaller reports every `PyQt6.*` module as missing |
 | Frozen build | works | `qtpy.QtBindingsNotFoundError: No Qt bindings could be found`, then silently falls back to GTK |
@@ -189,8 +189,8 @@ binaries by absolute path.
 
 ## Bundle size
 
-**~175 MB** on Linux without Tesseract, **~209 MB** with it
-(`--with-tesseract`: ~34 MB of staged program + libraries + `eng`/`chi_sim`,
+**~157 MB** on Linux without Tesseract, **~192 MB** with it
+(`--with-tesseract`: ~35 MB of staged program + libraries + `eng`/`chi_sim`,
 plus PyInstaller's own copies).  Two spec passes keep this down: it prunes the
 **entire** GTK data tree the PyGObject hook collects (`share/icons/` — the
 Adwaita icon theme alone was 238 MB uncompressed — and `share/locale/`,
@@ -249,15 +249,19 @@ confirmation header, and that the process then exits 0 — so a bundle that
 merely built but cannot run still fails the job.
 
 The Linux job installs the GTK stack as a `continue-on-error` step, but the
-build may no longer ship *quietly* without a window: a verification step fails
-the job when `dist/…/_internal/gi_typelibs/WebKit2-*.typelib` is missing —
-that silent downgrade is exactly how the first Actions artifact shipped
-browser-only despite the runner installing `gir1.2-webkit2-4.1`. On
-`ubuntu-latest` the step succeeds — it pulls **PyGObject 3.50.0** through
-`pywebview[gtk]` (the pin that matches the runner's `girepository-1.0`) — and
-the spec bundles the WebKit2 / AppIndicator typelib closures, so the Linux
-artifact carries both the native window and the system tray. Windows
-(WebView2) and macOS (WKWebView) need no extra system packages.
+build may no longer ship *quietly* without a window.  Its verification step
+fails the job on **either** half of the policy:
+`dist/…/_internal/gi_typelibs/WebKit2-*.typelib` must EXIST (the missing
+typelib is how the first Actions artifact shipped browser-only despite the
+runner installing `gir1.2-webkit2-4.1`), and a top-level
+`libglib-2.0.so*`/`libgtk-3.so*` must NOT (a vendored GTK runtime is how the
+second one died on `undefined symbol: g_sort_array` on a Fedora user machine
+— an Ubuntu-built glib shadowing the system one under the system WebKit; see
+“the GUI runtime belongs to the system” above).  On `ubuntu-latest` the step
+succeeds — it pulls **PyGObject 3.50.0** through `pywebview[gtk]` (the pin
+that matches the runner's `girepository-1.0`) — so the Linux artifact carries
+both the native window and the system tray, all typelibs, no runtime.
+Windows (WebView2) and macOS (WKWebView) need no extra system packages.
 
 ### Verified on GitHub Actions
 
@@ -266,7 +270,7 @@ Every push builds all three platforms and then **runs a real OCR job on each**:
 | Job | Result | Tesseract staged | Artifact |
 | --- | --- | --- | --- |
 | Test suite | ✅ ~40 s | — | pytest on clean `ubuntu-latest` + Python 3.14 |
-| Build linux-x86_64 | ✅ ~2 m | 54 files | **152 MB** zipped (GTK + Tesseract) |
+| Build linux-x86_64 | ✅ ~2 m | 54 files | **135 MB** zipped (typelibs + Tesseract, no GUI runtime) |
 | Build windows-x86_64 | ✅ ~4 m | 73 files | **136 MB** (Tesseract, system WebView2) |
 | Build macos-arm64 | ✅ ~1.5 m | 15 files | **69 MB** (Tesseract, system WKWebView) |
 
@@ -296,7 +300,19 @@ cannot run still fails the job. (The Tesseract *install* and the GTK step are
 bundle, just one that needs a system Tesseract / falls back to the browser.)
 
 Remaining gap: the **native window** is not exercised in CI (the runners have no
-interactive session), so that part is verified on Linux only.
+interactive session).  The decisive check is therefore manual — and it is the
+one that actually reproduces the user scenario, an **Ubuntu-built bundle on a
+different distro** (a Fedora desktop):
+
+```bash
+gh run download <run-id> -n pdf-ocr-embed-linux-x86_64 -D /tmp/artifact
+/tmp/artifact/pdf-ocr-embed        # window + tray via the SYSTEM WebKit stack;
+                                   # WebKitWebProcess must appear, exit 0 on Quit
+```
+
+Every shared-library warning from the `WebKit*Process` helpers about paths
+inside `_internal/` is a leak of the class that shipped two broken artifacts —
+fix it, do not shrug at it.
 
 Inspect a run with the GitHub CLI:
 
