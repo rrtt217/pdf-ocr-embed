@@ -15,16 +15,27 @@ _ENV_VARS = ("PATH", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "TESSDATA_PREFIX")
 
 
 @pytest.fixture(autouse=True)
-def _clean_state(monkeypatch):
-    """Restore the real environment and the activation flag after each test."""
+def _clean_state():
+    """Restore the real environment and the activation flag after each test.
+
+    The restore must be DIRECT (``os.environ``), never via ``monkeypatch``:
+    a monkeypatch call made *inside a teardown* records the current value —
+    which is the polluted one — as its undo target, so monkeypatch's own
+    teardown then puts the fake bundle's paths right back.  Measured on the
+    ubuntu runner: later tests in the SAME pytest process ran the real
+    ``tesseract`` with ``LD_LIBRARY_PATH`` aimed at this module's truncated
+    stub libraries ("file too short").  It stayed green on hosts whose tesseract
+    carries a legacy ``DT_RPATH`` (the loader searches it BEFORE
+    ``LD_LIBRARY_PATH``) — a classic machine-dependent pass.
+    """
     saved = {name: os.environ.get(name) for name in _ENV_VARS}
     bundled_tools.reset()
     yield
     for name, value in saved.items():
         if value is None:
-            monkeypatch.delenv(name, raising=False)
+            os.environ.pop(name, None)
         else:
-            monkeypatch.setenv(name, value)
+            os.environ[name] = value
     bundled_tools.reset()
 
 
@@ -118,3 +129,19 @@ def test_describe_reports_a_system_tesseract(monkeypatch, tmp_path):
     assert info["bundled"] is False
     assert info["bundled_path"] is None
     assert info["source"] in ("system", "missing")
+
+
+# --- environment hygiene -------------------------------------------------------
+# Last test of the module ON PURPOSE: it runs in this process right after every
+# activation test above and fails if any of them leaked the fake bundle into
+# the real environment (the leak made the REAL tesseract load the fake stub
+# libraries in later test files — see _clean_state).  It cannot live in a
+# separate file: the pollution is exactly "what the next test in this process
+# inherits".
+
+def test_no_fake_bundle_path_survives_into_the_process() -> None:
+    for name in _ENV_VARS:
+        for entry in (os.environ.get(name) or "").split(os.pathsep):
+            # pytest's tmp roots all live under "pytest-of-<user>".
+            assert "pytest-of-" not in entry, (
+                f"{name} still points at a test temp dir: {entry}")
