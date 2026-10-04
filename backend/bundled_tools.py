@@ -88,6 +88,35 @@ def _prepend_env(name: str, value: str) -> None:
     os.environ[name] = value + os.pathsep + current if current else value
 
 
+def scrub_bundle_library_path() -> None:
+    """Remove the PyInstaller bundle directory from the dynamic linker path.
+
+    The frozen bootstrap puts ``_internal`` on ``LD_LIBRARY_PATH`` so a
+    SPAWN OF THE FROZEN EXE finds its libraries — but this app never spawns
+    itself; it spawns system/staged programs (WebKit's helper processes,
+    Tesseract, OCRmyPDF sidecars) and every one of them would then resolve
+    ITS OWN libraries from our bundle first.  Measured on an Ubuntu-built
+    bundle running on Fedora: the system WebKitWebProcess/WebKitNetworkProcess
+    loaded ``libexpat``/``libpcre2`` out of ``_internal`` (loader warnings —
+    the same distro-mix class that once killed glib).  Python's own
+    libraries are already loaded (RPATH, by the bootloader) before anything
+    spawns, so dropping the entry is a pure gain.  The staged Tesseract's
+    entry from :func:`activate` is a DIFFERENT directory and stays.
+    """
+    if os.name == "nt" or not paths.is_frozen():
+        return
+    var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+    bundle = str(paths.resource_dir().resolve())
+    parts = os.environ.get(var, "").split(os.pathsep)
+    kept = [p for p in parts if p and str(Path(p).resolve()) != bundle]
+    if len(kept) == len(parts):
+        return
+    if kept:
+        os.environ[var] = os.pathsep.join(kept)
+    else:
+        os.environ.pop(var, None)
+
+
 def activate() -> bool:
     """Put the bundled Tesseract ahead of anything on the system.
 

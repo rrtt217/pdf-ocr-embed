@@ -367,11 +367,19 @@ def main(argv: list[str] | None = None) -> int:
                                  "quits (the pre-tray behaviour)")
     args = parser.parse_args(argv)
 
-    from backend import lifecycle, paths
+    from backend import bundled_tools, lifecycle, paths
     from backend.logging_config import setup_logging
 
     setup_logging()
     lifecycle.set_desktop_mode(True)
+    # The frozen bootstrap puts _internal on LD_LIBRARY_PATH — for a spawn
+    # of the exe, which this app never does.  What it DOES spawn is the
+    # system's WebKit helpers (plus Tesseract/sidecars), and they would all
+    # resolve their own libraries from our bundle first (measured: an
+    # Ubuntu-built bundle's WebKitWebProcess pulled libexpat/libpcre2 out
+    # of _internal).  Scrub the leak; activate()'s Tesseract entry is a
+    # different directory and stays.
+    bundled_tools.scrub_bundle_library_path()
     # Ctrl-C (console launch) and SIGTERM (session manager, `kill`) become a
     # clean quit instead of an abrupt interpreter interrupt; the hard-exit
     # deadline is armed when that quit starts, never at startup.

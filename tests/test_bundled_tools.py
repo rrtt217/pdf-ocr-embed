@@ -6,6 +6,7 @@ the layout and the environment manipulation are pinned with a fake bundle.
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -129,6 +130,33 @@ def test_describe_reports_a_system_tesseract(monkeypatch, tmp_path):
     assert info["bundled"] is False
     assert info["bundled_path"] is None
     assert info["source"] in ("system", "missing")
+
+
+def test_scrub_bundle_library_path_only_removes_the_bundle_dir(tmp_path,
+                                                                monkeypatch):
+    """The frozen bootstrap leaks ``_internal`` into every SPAWNED child —
+    measured on an Ubuntu-built bundle: the SYSTEM WebKitWebProcess loaded
+    libexpat/libpcre2 from it.  The scrub removes that one entry and keeps
+    everything else (the staged Tesseract's lib dir among them)."""
+    bundle = tmp_path / "_internal"
+    bundle.mkdir()
+    tess_libs = tmp_path / "tesseract" / "lib"
+    var = ("DYLD_LIBRARY_PATH" if sys.platform == "darwin"
+           else "LD_LIBRARY_PATH")
+    monkeypatch.setattr(bundled_tools.paths, "is_frozen", lambda: True)
+    monkeypatch.setattr(bundled_tools.paths, "resource_dir", lambda: bundle)
+    monkeypatch.setenv(var, os.pathsep.join([str(bundle), str(tess_libs)]))
+    bundled_tools.scrub_bundle_library_path()
+    assert os.environ[var] == str(tess_libs)
+
+
+def test_scrub_is_a_noop_outside_a_frozen_app(tmp_path, monkeypatch):
+    var = ("DYLD_LIBRARY_PATH" if sys.platform == "darwin"
+           else "LD_LIBRARY_PATH")
+    monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(bundled_tools.paths, "is_frozen", lambda: False)
+    bundled_tools.scrub_bundle_library_path()
+    assert var not in os.environ
 
 
 # --- environment hygiene -------------------------------------------------------
