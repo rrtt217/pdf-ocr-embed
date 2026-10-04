@@ -165,6 +165,14 @@ jobs:
             echo "::error::No WebKit2 typelib in the bundle — the frozen app would fall back to the browser. Check the 'Linux native window — GTK stack' step; a failure there lands here."
             exit 1
           fi
+          # And the GUI RUNTIME must NOT be in it: a vendored glib/GTK (built
+          # on this Ubuntu runner) clashes with the system WebKit the typelibs
+          # load — measured: "undefined symbol: g_sort_array" on Fedora.
+          if compgen -G "dist/pdf-ocr-embed/_internal/libglib-2.0.so*" >/dev/null \
+             || compgen -G "dist/pdf-ocr-embed/_internal/libgtk-3.so*" >/dev/null; then
+            echo "::error::The bundle vendors a GTK/GLib runtime — the spec's _drop_gui_runtime step must have regressed (see _GUI_RUNTIME_PREFIXES)."
+            exit 1
+          fi
           if ! compgen -G "dist/pdf-ocr-embed/_internal/gi_typelibs/*ppIndicator3-*.typelib" >/dev/null; then
             echo "::warning::No AppIndicator typelib in the bundle — the frozen Linux app has no system tray (closing the window quits)."
           fi

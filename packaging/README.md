@@ -45,19 +45,24 @@ needed to send it.
 Whichever way you exit, running OCR jobs are stopped through the project's own
 `cancel`-flag contract first, so no completed pages are lost.
 
-On Linux the packaged build bundles the GTK shared libraries and — PyInstaller
-has **no collection hook** for them — the GI *typelibs* (introspection data)
-of WebKit2 and the tray namespaces: the typelib search paths are compiled into
-the *build host's* girepository, so without bundling, a frozen app on another
-distro silently falls back to the browser.  What stays a **system runtime
-dependency** is the WebKit *library* itself (`libwebkit2gtk-4.1` plus its
-`WebKitWebProcess` helper): bundling the library without its multiprocess
-helpers yields a blank webview — worse than the browser fallback.  A source
-checkout needs both halves: `python3-gobject` + `webkit2gtk4.1` (Fedora) /
-`python3-gi` + `gir1.2-webkit2-4.1` (Debian).
+On Linux the packaged build bundles **only the GI typelibs** (introspection
+data — PyInstaller has no collection hook for the WebKit2/tray namespaces, and
+typelib search paths are compiled into the *build host's* girepository, so
+without them a frozen app on another distro silently falls back to the
+browser).  The GUI **runtime** — glib, GTK, Cairo, X/Wayland, and the WebKit
+library with its `WebKitWebProcess` helper — is the **system's**.  Two
+measured reasons: bundling `libwebkit2gtk` without its multiprocess helpers
+yields a blank webview; and a vendored GTK stack (built on the Ubuntu runner)
+clashes with the system WebKit the typelibs load — a system libgstreamer
+newer than the bundled glib died on `undefined symbol: g_sort_array`.
+Any machine that has WebKit2GTK has the rest by definition (WebKit depends
+on it).  A source checkout needs the same stack installed:
+`python3-gobject` + `webkit2gtk4.1` (Fedora) / `python3-gi` +
+`gir1.2-webkit2-4.1` (Debian).
 
 `--gui <backend>` overrides the choice (e.g. `--gui qt`), for a machine whose
-GTK/WebKit stack is unusable. Note that only **GTK is bundled**; see below.
+GTK/WebKit stack is unusable. Note that **no part of the GUI runtime is
+bundled** — typelibs only; see below.
 
 ### Why GTK and not Qt
 
@@ -67,7 +72,7 @@ from a source checkout (verified: a Qt window opens and the app runs with
 
 | | GTK / WebKit2GTK | Qt / PyQt6-WebEngine |
 | --- | --- | --- |
-| Bundle size | **242 MB** | **795 MB** (measured) — PyQt6 alone is 494 MB |
+| Bundle size | **209 MB** | **795 MB** (measured) — PyQt6 alone is 494 MB |
 | Licence of the Python bindings | PyGObject is **LGPL-2.1+** | PyQt6 is **GPL-3.0-only** (or commercial from Riverbank) |
 | Collected by PyInstaller automatically | yes | **no** — qtpy picks its binding dynamically, so PyInstaller reports every `PyQt6.*` module as missing |
 | Frozen build | works | `qtpy.QtBindingsNotFoundError: No Qt bindings could be found`, then silently falls back to GTK |
@@ -88,11 +93,12 @@ dist/pdf-ocr-embed/
     ├── config.example.toml
     ├── libpdfium.so       # pypdfium2 (rendering/geometry/text)
     ├── pikepdf.libs/…     # libqpdf (page deletion)
-    ├── libgtk-3.so.0 …    # GTK/WebKit for the native window
+    ├── gi_typelibs/…      # GTK/WebKit introspection data (window + tray)
     └── …                  # Python runtime + the rest of the deps
+                           # (no GTK/WebKit runtime libs — the system's are used)
 ```
 
-~142 MB on Linux.  Ship it inside an installer (Inno Setup / MSI on Windows,
+~175 MB on Linux (without Tesseract).  Ship it inside an installer (Inno Setup / MSI on Windows,
 `.dmg` on macOS, AppImage / `.deb` on Linux) for the "double-click an app"
 experience.
 
@@ -183,14 +189,16 @@ binaries by absolute path.
 
 ## Bundle size
 
-**~199 MB** on Linux without Tesseract, **~242 MB** with it (`--with-tesseract`:
-~35 MB of staged program + libraries + `eng`/`chi_sim`, plus PyInstaller's own
-copies).  PyInstaller's PyGObject hook collects the **entire** GTK data tree;
-the spec prunes `share/icons/` (the Adwaita icon theme alone was 238 MB
-uncompressed) and `share/locale/` because the UI is drawn inside the webview and
-GTK only renders the window frame.  That one filter takes the bundle from
-**458 MB to 199 MB** with the window still working.  If size matters, the next
-candidates are `uvloop` (15 MB) and the GTK theme/fontconfig data.
+**~175 MB** on Linux without Tesseract, **~209 MB** with it
+(`--with-tesseract`: ~34 MB of staged program + libraries + `eng`/`chi_sim`,
+plus PyInstaller's own copies).  Two spec passes keep this down: it prunes the
+**entire** GTK data tree the PyGObject hook collects (`share/icons/` — the
+Adwaita icon theme alone was 238 MB uncompressed — and `share/locale/`,
+because the UI is drawn inside the webview and GTK only renders the window
+frame), and it drops the GUI runtime libraries, which the system provides
+anyway (see “the GUI runtime belongs to the system” above; the hash-suffixed
+libraries vendored by Pillow are NOT touched).  If size matters, the next
+candidate is `uvloop` (15 MB).
 
 ## Verified
 

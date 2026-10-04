@@ -19,6 +19,7 @@ Two things this spec is deliberate about:
   and the app requests the plugin by dotted name instead — collecting both
   would make pluggy register the same module twice.
 """
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import (collect_data_files, collect_submodules,
@@ -224,6 +225,74 @@ def _prune_gtk_data(toc):
 
 
 a.datas = _prune_gtk_data(a.datas)
+
+# --- Linux: the GUI runtime belongs to the SYSTEM ------------------------------
+# PyGObject's hooks drag the build host's entire GTK stack (glib, gtk, pango,
+# cairo, X…) into the bundle.  The window then mixes that Ubuntu-built runtime
+# with the *system* WebKit the typelibs point at — and glib is the symbol bomb
+# every GUI library resolves against: a system libgstreamer newer than the
+# bundled glib died with "undefined symbol: g_sort_array" on Fedora against an
+# Ubuntu-built bundle, straight back to the browser.  Any machine with
+# WebKit2GTK (the documented window dependency) has glib/GTK/X/Wayland by
+# definition — WebKit depends on them — so shipping that runtime buys zero
+# portability and costs a distro mismatch.  Drop it.  libgirepository STAYS:
+# only PyGObject's own extension module loads it, no system GUI library ever
+# resolves against it, and it must match the bundled _gi build.
+_GUI_RUNTIME_PREFIXES = (
+    # GLib core — every GUI consumer resolves its symbols against the copy
+    # loaded FIRST; that must be the system's.
+    "libglib-2.0.so", "libgobject-2.0.so", "libgio-2.0.so",
+    "libgmodule-2.0.so", "libgthread-2.0.so",
+    # GTK and its widget/font/plumbing stack
+    "libgtk-3.so", "libgtk-4.so", "libgdk-3.so", "libgdk-4.so",
+    "libgdk_pixbuf-2.0.so", "libgailutil", "libglycin",
+    "libatk-", "libatspi.so", "libcloudproviders.so", "libepoxy.so",
+    "libpango", "libcairo", "libharfbuzz.so", "libharfbuzz-gobject.so",
+    "libharfbuzz-subset.so", "libgraphite2.so", "libfribidi.so",
+    "libthai.so", "libdatrie.so", "libfontconfig.so", "libfreetype.so",
+    "libpixman-1.so", "libwmf",
+    # tray / notify / WebKit-side runtime (same system-provides policy)
+    "libayatana-appindicator", "libappindicator", "libnotify-",
+    "libsoup", "libpsl.so", "libnghttp2.so", "libjavascriptcoregtk",
+    "libwebkit2gtk", "libjson-glib",
+    # X11 / Wayland / GL plumbing
+    "libX", "libxcb", "libxkbcommon.so", "libwayland", "libEGL.so",
+    "libGL.so", "libGLX.so", "libGLESv2.so", "libGLdispatch.so",
+    "libdrm.so", "libgbm.so", "libglapi.so",
+    # gio/gvfs/dconf integration dragged in along with the stack
+    "libgvfscommon.so", "libproxy", "libpxbackend", "libdconf",
+    "libsystemd.so", "libudev.so", "libmount.so", "libblkid.so",
+    "libselinux.so", "libsepol.so", "libsemanage.so", "libtinysparql",
+    "libduktape", "libevent-",
+)
+
+
+def _drop_gui_runtime(toc):
+    """Linux only: no bundled GTK/GLib/X runtime — the system's is the one
+    the (system) WebKit links against.  Matches top-level library names, so
+    the hash-suffixed copies vendored by PIL stay untouched."""
+    if not sys.platform.startswith("linux"):
+        return toc
+    kept, dropped = [], 0
+    for entry in toc:
+        dest = str(entry[0]).replace("\\", "/")
+        name = dest.rsplit("/", 1)[-1]
+        # Fedora collects ".libfoo.so.N.hmac" sidecars with their libraries.
+        bare = name[1:] if (name.startswith(".")
+                            and name.endswith(".hmac")) else name
+        if dest.startswith(("gio_modules/", "lib/gdk-pixbuf/")):
+            dropped += 1
+            continue
+        if bare.startswith(_GUI_RUNTIME_PREFIXES):
+            dropped += 1
+            continue
+        kept.append(entry)
+    print(f"[spec] dropped {dropped} bundled GUI runtime file(s) — the "
+          "window uses the system's GTK/WebKit stack")
+    return kept
+
+
+a.binaries = _drop_gui_runtime(a.binaries)
 
 pyz = PYZ(a.pure)
 

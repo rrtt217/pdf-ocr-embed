@@ -69,3 +69,29 @@ def test_workflow_tray_packages_cannot_abort_the_gtk_step():
                      re.DOTALL).group(0)
     assert "apt-cache show" in step
     assert "gir1.2-webkit2-4.1" in step
+
+
+def test_spec_drops_the_bundled_gui_runtime():
+    """Real incident #2: the hook-collected Ubuntu-built glib in the bundle
+    shadowed the system glib, and the system libgstreamer (loaded by the
+    system WebKit) died on ``undefined symbol: g_sort_array`` — back to the
+    browser.  The GUI runtime must come from the system (which has it, since
+    it has WebKit); the spec drops it after Analysis, Linux only."""
+    assert "_GUI_RUNTIME_PREFIXES" in SPEC
+    for must_drop in ("libglib-2.0.so", "libgtk-3.so", "libpango",
+                      "libcairo", "libgio-2.0.so", "libayatana-appindicator"):
+        assert f'"{must_drop}"' in SPEC, must_drop
+    body = SPEC[SPEC.index("def _drop_gui_runtime"):]
+    assert 'sys.platform.startswith("linux")' in body      # not on win/mac
+    assert "a.binaries = _drop_gui_runtime(a.binaries)" in SPEC
+    # libgirepository must NOT be dropped: only _gi loads it, and it has to
+    # match the bundled PyGObject build (distros may ship only 1.0 or 2.0).
+    assert "libgirepository" not in SPEC[SPEC.index("_GUI_RUNTIME_PREFIXES"):
+                                         SPEC.index("def _drop_gui_runtime")]
+
+
+def test_workflow_fails_a_bundle_that_vendors_the_gui_runtime():
+    check = re.search(r"Verify the bundle.*?::error::The bundle vendors.*?\n",
+                      WORKFLOW, re.DOTALL)
+    assert check, "the workflow must reject a bundle that still vendors GTK"
+    assert "libglib-2.0.so" in check.group(0)
