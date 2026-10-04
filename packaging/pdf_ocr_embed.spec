@@ -19,6 +19,7 @@ Two things this spec is deliberate about:
   and the app requests the plugin by dotted name instead — collecting both
   would make pluggy register the same module twice.
 """
+import re
 import sys
 from pathlib import Path
 
@@ -253,8 +254,7 @@ _GUI_RUNTIME_PREFIXES = (
     "libpixman-1.so", "libwmf",
     # tray / notify / WebKit-side runtime (same system-provides policy)
     "libayatana-appindicator", "libappindicator", "libnotify-",
-    "libsoup", "libpsl.so", "libnghttp2.so", "libjavascriptcoregtk",
-    "libwebkit2gtk", "libjson-glib",
+    "libsoup", "libjavascriptcoregtk", "libwebkit2gtk", "libjson-glib",
     # X11 / Wayland / GL plumbing
     "libX", "libxcb", "libxkbcommon.so", "libwayland", "libEGL.so",
     "libGL.so", "libGLX.so", "libGLESv2.so", "libGLdispatch.so",
@@ -267,10 +267,34 @@ _GUI_RUNTIME_PREFIXES = (
 )
 
 
+# PyInstaller also binary-analyses the STAGED ``tesseract/bin/tesseract``,
+# so that binary's whole library closure lands a second, LOOSE copy of
+# itself at the top of _internal/ — libtesseract, libleptonica, and curl's
+# own chain (gnutls/krb5/ldap/ssh/…).  Nothing loads them: the staged
+# binary resolves against ``tesseract/lib/`` (bundled_tools'
+# LD_LIBRARY_PATH + its $ORIGIN/../lib RUNPATH, closure completeness pinned
+# by the smoke test).  Left loose they are dead weight AND loader leaks —
+# their distro-only deps (libevent via ldap, libudev via fido2, libselinux
+# via krb5 — measured) resolve OUTSIDE the bundle, which is exactly what
+# the smoke test's loader-isolation check fails on.
+_TESSERATE_LOOSE_PREFIXES = (
+    "libtesseract", "libleptonica", "libcurl", "libldap", "liblber",
+    "libgnutls", "libnettle", "libhogweed", "libgmp", "libidn2",
+    "libunistring", "libp11-kit", "libtasn1", "libssh", "libfido2",
+    "libcbor", "libsasl2", "libnghttp2", "libnghttp3", "libngtcp2",
+    "libpsl", "libkrb5", "libk5crypto", "libgssapi_krb5", "libcom_err",
+)
+
+_HASHED_SUFFIX = re.compile(r"-[0-9a-f]{8}\.so")
+
+
 def _drop_gui_runtime(toc):
     """Linux only: no bundled GTK/GLib/X runtime — the system's is the one
-    the (system) WebKit links against.  Matches top-level library names, so
-    the hash-suffixed copies vendored by PIL stay untouched."""
+    the (system) WebKit links against — and no loose Tesseract closure.
+
+    Prefix matching is TOP-LEVEL only (no ``/`` in the dest): the staged
+    ``tesseract/lib/`` closure and every packaged data directory must
+    survive."""
     if not sys.platform.startswith("linux"):
         return toc
     kept, dropped = [], 0
@@ -280,15 +304,25 @@ def _drop_gui_runtime(toc):
         # Fedora collects ".libfoo.so.N.hmac" sidecars with their libraries.
         bare = name[1:] if (name.startswith(".")
                             and name.endswith(".hmac")) else name
+        # NEVER touch hash-suffixed libraries (``libfoo-1a2b3c4d.so.6``):
+        # they are wheels' vendored copies deduped by PyInstaller — PIL
+        # really does vendor libxcb/libjpeg/libfreetype, and dropping them
+        # takes PIL down with the OCR pipeline (measured, via the smoke
+        # test).  The Linux GUI stack always arrives under its clean system
+        # name, so the prefixes still match exactly what this function means.
+        if _HASHED_SUFFIX.search(bare):
+            kept.append(entry)
+            continue
         if dest.startswith(("gio_modules/", "lib/gdk-pixbuf/")):
             dropped += 1
             continue
-        if bare.startswith(_GUI_RUNTIME_PREFIXES):
+        if "/" not in dest and bare.startswith(
+                _GUI_RUNTIME_PREFIXES + _TESSERATE_LOOSE_PREFIXES):
             dropped += 1
             continue
         kept.append(entry)
-    print(f"[spec] dropped {dropped} bundled GUI runtime file(s) — the "
-          "window uses the system's GTK/WebKit stack")
+    print(f"[spec] dropped {dropped} bundled GUI-runtime/loose-closure "
+          "file(s) — the window uses the system's GTK/WebKit stack")
     return kept
 
 

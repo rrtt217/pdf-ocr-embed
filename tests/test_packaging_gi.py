@@ -90,6 +90,38 @@ def test_spec_drops_the_bundled_gui_runtime():
                                          SPEC.index("def _drop_gui_runtime")]
 
 
+def test_gui_runtime_drop_spares_hash_suffixed_libraries():
+    """Measured via the smoke test: the prefix list also matched PyInstaller's
+    DEDUP-renamed copies (``libxcb-ad31f5a3.so.1.1.0`` — Pillow really does
+    vendor libxcb), and dropping them took ``PIL.Image`` down with the whole
+    OCR pipeline.  Hashed names must be spared BEFORE the prefix match."""
+    body = SPEC[SPEC.index("def _drop_gui_runtime"):]
+    hashed = body.index("_HASHED_SUFFIX.search")
+    prefix = body.index("bare.startswith(")
+    assert hashed < prefix
+    assert "-[0-9a-f]{8}" in SPEC
+
+
+def test_loose_library_drop_is_top_level_only():
+    """The staged Tesseract ships its own closure under ``tesseract/lib/`` —
+    and the loose top-level duplicates (libtesseract, libcurl, …) carry
+    distro-only deps that leak the loader outside the bundle (measured:
+    libevent via ldap, libudev via fido2, libselinux via krb5).  Dropping
+    them by name must be TOP-LEVEL-only, or the drop kills the staged
+    closure it is meant to duplicate."""
+    body = SPEC[SPEC.index("def _drop_gui_runtime"):]
+    guard = body.index('"/" not in dest')
+    match = body.index("bare.startswith(")
+    assert guard < match
+    for loose in ("libtesseract", "libcurl", "libgnutls", "libkrb5"):
+        assert f'"{loose}"' in SPEC
+    # codecs PIL/PDF stacks rely on stay bundled
+    table = SPEC[SPEC.index("_GUI_RUNTIME_PREFIXES"):
+                 SPEC.index("_HASHED_SUFFIX")]
+    for must_keep in ("libjpeg", "libpng", "libz.so"):
+        assert f'"{must_keep}' not in table, must_keep
+
+
 def test_workflow_fails_a_bundle_that_vendors_the_gui_runtime():
     check = re.search(r"Verify the bundle.*?::error::The bundle vendors.*?\n",
                       WORKFLOW, re.DOTALL)
