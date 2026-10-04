@@ -267,6 +267,12 @@ def _make_closing_handler(window, *, hide_on_close: bool):
     delete-event, i.e. the window stays open — which is what hiding to the tray
     needs.  Returning ``True`` lets the close go through, ending the GUI loop.
 
+    A quit in progress always wins: ``_watch_for_quit`` ends the GUI loop with
+    ``window.destroy()``, which on GTK/Cocoa *re-enters* this handler — hiding
+    then would veto our own destruction, the loop would never return, and the
+    user who pressed Quit would get a "still running" notice instead of an
+    exit (measured: the hard-exit backstop was the only thing that ended it).
+
     Extracted from ``_watch_for_quit`` so the decision is unit-tested against
     the real code path instead of a copy of it.
     """
@@ -275,7 +281,7 @@ def _make_closing_handler(window, *, hide_on_close: bool):
     state = {"noticed": False}
 
     def _on_closing() -> bool:
-        if hide_on_close:
+        if hide_on_close and not lifecycle.is_quit_requested():
             # Closing the window is NOT a quit any more: hide it and let the
             # server (and any running OCR job) carry on in the background.
             try:
@@ -291,8 +297,11 @@ def _make_closing_handler(window, *, hide_on_close: bool):
                 title, body = tray_mod.hidden_notice()
                 tray_mod.notify(title, body)
             return False      # literal False CANCELS the close (pywebview)
-        lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
-        return True
+        if not lifecycle.is_quit_requested():
+            # Re-requesting would re-run the teardown hooks on the GUI thread
+            # while the loop is already being torn down (see docstring above).
+            lifecycle.request_quit(timeout=QUIT_REQUEST_TIMEOUT)
+        return True           # allow the close (a quit, or our own destroy)
 
     return _on_closing
 

@@ -139,6 +139,22 @@ def test_closing_with_a_tray_hides_and_keeps_running(monkeypatch):
     assert lifecycle.is_quit_requested() is False
 
 
+def test_closing_during_a_quit_never_hides():
+    """The quit path ends the GUI loop with ``window.destroy()``, and GTK/Cocoa
+    re-enter the closing handler while destroying.  Hiding at that moment would
+    veto our OWN destruction — the Quit button would announce "still running"
+    and only the hard-exit backstop would end the process (this really
+    happened, hidden behind exit code 0)."""
+    log: list = []
+    window = _FakeWindow(log)
+    window.hide = lambda: log.append("hide")
+    handler = desktop._make_closing_handler(window, hide_on_close=True)
+
+    lifecycle.request_quit(timeout=1.0)     # a quit is already in flight
+    assert handler() is True                # our destroy must go through
+    assert log == []                        # no hide, no fake "background" mode
+
+
 def test_hiding_is_announced_once(monkeypatch):
     """A window that vanishes silently reads as a crash: say it once."""
     from backend import tray as tray_mod

@@ -115,7 +115,13 @@ the single most important invariant to preserve.
   comes with it: closing the window may only HIDE it (background running) when
   a tray was really created — otherwise the close must quit as before, or the
   window becomes unreachable (`desktop._should_hide_on_close`, pinned by
-  `tests/test_desktop.py`). Two rules for the backends: `create_tray` must
+  `tests/test_desktop.py`).  And the closing handler must let a quit that is
+  already in flight THROUGH (`lifecycle.is_quit_requested()`): GTK/Cocoa
+  *re-enter* `closing` while `window.destroy()` runs, and hiding there would
+  veto our own teardown — the GUI loop never returns and the user who pressed
+  Quit gets a "still running" notice (this really shipped, masked by the
+  hard-exit backstop's exit code 0; pinned by `tests/test_desktop.py`).
+  Two rules for the backends: `create_tray` must
   NEVER raise and must return `None` on every failure path (no library, no
   display, no run loop — the caller then keeps "closing quits"), and every
   GUI-toolkit call must be marshalled to the GUI thread (`GLib.idle_add` /
